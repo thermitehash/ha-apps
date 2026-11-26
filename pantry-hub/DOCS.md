@@ -96,6 +96,20 @@ a change (for example, the unit was already consumed by hand), it's marked
 failed and listed in the web UI with a **Retry** button. Nothing is dropped
 silently.
 
+Two rules keep counts honest when things go wrong:
+
+- **Item left before its add reached Grocy** (Grocy was down, or you retry
+  a failed add later): before an add is replayed, Pantry Hub checks the
+  item is still in the pantry. If that arrival has already departed, the
+  add and its consume are both cancelled (net zero) and logged.
+- **Consume that may or may not have reached Grocy**, with no stock entry
+  id to check (for example an "already in stock" item, see below): it's
+  never sent twice. It's marked **review** (counted as failed, plus the
+  `review` attribute on `sensor.pantry_hub_grocy_queue`, and listed in the
+  resync report). In the web UI, choose **Consume now** if Grocy didn't
+  take it, or **Dismiss** if it did. Pantry Hub prefers one unit too many
+  in Grocy over one too few.
+
 ## Linking tags
 
 See [docs/tagging.md](https://github.com/thermitehash/ha-apps/blob/main/docs/tagging.md).
@@ -109,12 +123,22 @@ Linking alone doesn't change Grocy stock. When the item goes into the pantry,
 its arrival adds it. If the tag was already sitting in the pantry when you
 linked it, the add happens right away, once.
 
+### Already in stock
+
+Tagging something Grocy already counts (stock that was on the shelf before
+you started)? Link it with **already in stock**: tick the checkbox in the
+web UI's Link form, or send `"in_stock": true` in the station's barcode or
+tag message. The add for its current arrival (or the next one, if the tag
+isn't in the pantry right now) is skipped. When it leaves, one unit is
+still consumed at the Pantry location. Every later arrival is added
+normally. Off by default.
+
 ### MQTT topics
 
 | Topic | Direction | Payload |
 |---|---|---|
-| `pantry_hub/linking/<station>/barcode` | station → hub | `{"barcode": "...", "ts": ...}` |
-| `pantry_hub/linking/<station>/tag` | station → hub | `{"epc": "...", "rssi": -45.2, "ts": ...}` |
+| `pantry_hub/linking/<station>/barcode` | station → hub | `{"barcode": "...", "ts": ..., "in_stock"?: true}` |
+| `pantry_hub/linking/<station>/tag` | station → hub | `{"epc": "...", "rssi": -45.2, "ts": ..., "in_stock"?: true}` |
 | `pantry_hub/linking/<station>/result` | hub → station | `{"status": "linked\|unknown_barcode\|tag_already_linked\|timeout\|error", "product": "...", "message": "..."}` |
 | `pantry_hub/events` | hub → anyone | `{"event_type": "arrived\|departed", "epc", "product", "product_id", "linked", "ts"}` |
 | `pantry_hub/state` | hub → HA (retained) | sensor values |
@@ -127,7 +151,7 @@ linked it, the add happens right away, once.
 | `binary_sensor.pantry_hub_reader_online` | A datagram from the reader within `reader_offline_after_s` (or a TCP probe answer). Attributes: datagram/tag/bad-frame/dropped-source counters. |
 | `sensor.pantry_hub_present_tags` | Tags in the pantry (present or briefly missing). |
 | `sensor.pantry_hub_unlinked_tags` | Unlinked tags currently in the pantry. |
-| `sensor.pantry_hub_grocy_queue` | Grocy changes waiting. Attributes: `failed`, `online`, `last_error`. |
+| `sensor.pantry_hub_grocy_queue` | Grocy changes waiting. Attributes: `failed` (includes review), `review`, `online`, `last_error`. |
 | `sensor.pantry_hub_last_link` | Product of the most recent link; attributes: EPC, barcode, station, time. |
 | `sensor.pantry_hub_resync_differences` | Products whose Grocy pantry amount differs from the linked tags present, after the last resync. |
 | `event.pantry_hub_item` | `arrived` / `departed`, with product and EPC. |
@@ -139,7 +163,8 @@ duplicate them.
 ## Web UI
 
 Open **Pantry Hub** in the sidebar. It shows status, links (unlink, or
-relink by barcode or by Grocy product id written as `#12`), unlinked tags,
+relink by barcode or by Grocy product id written as `#12`, optionally "already
+in stock"), unlinked tags,
 barcodes that need a Grocy product, failed operations, and the last resync.
 It's only reachable through Home Assistant ingress.
 

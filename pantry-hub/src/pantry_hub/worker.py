@@ -16,6 +16,12 @@ Rules:
   sent more than once gets a delayed duplicate check (``verify_after``,
   persisted): stock entries carrying the same op marker beyond the one the
   hub tracks are consumed again, by stock entry id, and logged.
+* Before an add is replayed, the EPC's presence is checked: if that arrival
+  has already departed (e.g. Grocy was down, or a failed add is retried
+  later), the add and its consume are both cancelled (net zero) and logged.
+* A consume that may have reached Grocy but has no stock entry id to check
+  is never resent (double-consume is worse than under-consume): it is
+  failed for review, with "consume now" / "dismiss" in the web UI.
 * Grocy rejecting a request (4xx) marks the op ``failed``. Failed ops stay in
   the journal, are counted in ``sensor.pantry_hub_grocy_queue`` and are
   shown in the web UI with a retry button. Nothing is dropped silently.
@@ -248,6 +254,8 @@ class GrocyWorker:
             keep = op.stock_entry_id
             if keep is None and mine:
                 keep = mine[0].stock_id
+            if op.resolution == "cancelled":
+                keep = None  # the add was cancelled: no unit should stay
             for extra in (e for e in mine if e.stock_id != keep):
                 await self.backend.consume(
                     op.product_id,
@@ -272,6 +280,12 @@ class GrocyWorker:
 
     async def _do_add(self, op: Op, ambiguous: bool) -> bool:
         note = op_note(op)
+        pres = await self.store.presence(op.epc)
+        if pres is not None and (
+            pres.cycle > op.cycle
+            or (pres.cycle == op.cycle and pres.state == "departed")
+        ):
+            return await self._cancel_departed(op, ambiguous, note)
         if ambiguous:
             # An earlier attempt may still land in Grocy after this one.
             await self.store.schedule_verify(
@@ -297,6 +311,52 @@ class GrocyWorker:
         await self._done(op, stock_id)
         return False
 
+    async def _cancel_departed(self, op: Op, ambiguous: bool, note: str) -> bool:
+        """Cancel the add and its consume: the item left before the add was replayed."""
+        if ambiguous:
+            for entry in await self.backend.entries(op.product_id):
+                if entry.note == note:
+                    # It did reach Grocy: keep it; the queued consume removes it.
+                    await self._done(op, entry.stock_id)
+                    return False
+            # A late landing is still possible: check again later, keep nothing.
+            await self.store.schedule_verify(
+                op.id, self.verify_clock() + self.verify_after
+            )
+        consume_id = await self.store.cancel_cycle(op, self.clock())
+        self.backoff.reset()
+        _LOGGER.info(
+            "%s (EPC %s) left the pantry before its add (op %d) reached Grocy; "
+            "cancelled the add%s (net zero)",
+            op.product_name or f"product {op.product_id}",
+            op.epc,
+            op.id,
+            f" and its consume (op {consume_id})" if consume_id else "",
+        )
+        self._changed()
+        return False
+
+    async def consume_now(self, op_id: int) -> Op:
+        """Web UI: a person confirmed a review op's consume never reached Grocy."""
+        op = await self.store.get_op(op_id)
+        if op is None or not op.needs_review:
+            raise ValueError(f"op {op_id} is not waiting for review")
+        await self.backend.consume(
+            op.product_id, stock_entry_id=None, location_id=op.location_id
+        )
+        await self.store.resolve_review(op.id, "consumed_manually", self.clock())
+        _LOGGER.info("Op %d consumed by hand from the web UI", op.id)
+        self._changed()
+        return op
+
+    async def dismiss(self, op_id: int) -> bool:
+        """Web UI: a person decided a review op's consume did reach Grocy."""
+        done = await self.store.resolve_review(op_id, "dismissed", self.clock())
+        if done:
+            _LOGGER.info("Op %d dismissed from review", op_id)
+            self._changed()
+        return done
+
     async def _do_consume(self, op: Op, ambiguous: bool) -> bool:
         add_op = await self.store.get_op(op.add_op_id) if op.add_op_id else None
         if add_op is not None and add_op.status == "failed":
@@ -311,11 +371,16 @@ class GrocyWorker:
                 return False
             ambiguous = False
         elif ambiguous:
-            _LOGGER.warning(
-                "Op %d may have reached Grocy but has no stock entry id to check; "
-                "sending again",
-                op.id,
+            # Can't tell whether it reached Grocy; never risk a double consume.
+            msg = (
+                "consume may have reached Grocy but there is no stock entry id to "
+                "check; review it (consume now / dismiss)"
             )
+            await self.store.mark_review(op.id, msg, self.clock())
+            self.last_error = msg
+            _LOGGER.warning("Op %d (%s): %s", op.id, op.epc, msg)
+            self._changed()
+            return False
         await self.store.mark_sending(op.id)
         await self.backend.consume(
             op.product_id, stock_entry_id=stock_id, location_id=op.location_id

@@ -86,23 +86,23 @@ async def test_worker_adds_then_consumes_the_same_unit(store: Store) -> None:
 
 async def test_queue_replays_in_order_after_outage(store: Store) -> None:
     backend = MemoryBackend()
-    backend.add_product(1, "Beans")
-    backend.add_product(2, "Rice")
-    await link(store, "AAAA", 1, "Beans")
-    await link(store, "BBBB", 2, "Rice")
-    await store.apply_arrival("AAAA", T0, 1)
-    await store.apply_arrival("BBBB", T0, 1)
-    await store.apply_departure("AAAA", T0 + 1)
+    for pid, name, epc in [
+        (1, "Beans", "AAAA"),
+        (2, "Rice", "BBBB"),
+        (3, "Oats", "CCCC"),
+    ]:
+        backend.add_product(pid, name)
+        await link(store, epc, pid, name)
+        await store.apply_arrival(epc, T0, 1)
     backend.faults.extend(["down", "down", "down"])
     w = worker_for(store, backend)
     delays = await drain(w)
-    assert delays[:3] == [d for d in delays[:3] if d is not None and d > 0]
+    assert all(d is not None and d > 0 for d in delays[:3])  # three backoffs
     assert w.grocy_ok is True
-    assert [entry[0:2] for entry in backend.log] == [
-        ("add", 1),
-        ("add", 2),
-        ("consume", 1),
-    ]
+    assert [entry[0:2] for entry in backend.log] == [("add", 1), ("add", 2), ("add", 3)]
+    await store.apply_departure("AAAA", T0 + 1)
+    await drain(w)
+    assert backend.log[-1][0:2] == ("consume", 1)
 
 
 async def test_lost_answer_does_not_double_add(store: Store) -> None:
@@ -165,32 +165,125 @@ async def test_rejected_op_fails_without_blocking_queue(store: Store) -> None:
     w = worker_for(store, backend)
     await drain(w)
     counts = await store.counts()
-    assert counts == {"pending": 0, "done": 1, "failed": 1, "verifying": 0}
+    assert (counts["pending"], counts["done"], counts["failed"]) == (0, 1, 1)
     failed = await store.ops("failed")
     assert failed[0].epc == "AAAA" and "rejected" in (failed[0].last_error or "")
-    # Departure of the failed add does not journal a consume.
-    d = await store.apply_departure("AAAA", T0 + 1)
-    assert d.consume_op_id is None
-    # Retry from the UI.
+    # Retry while the item is still in the pantry: the add is replayed.
     assert await store.retry_failed(failed[0].id)
     assert not await store.retry_failed(failed[0].id)
     await drain(w)
     assert (await store.counts())["failed"] == 0
+    assert [e.product_id for e in backend.stock] == [2, 1]
 
 
-async def test_consume_of_failed_add_fails(store: Store) -> None:
+async def test_q3_failed_add_retried_after_item_left_is_cancelled(store: Store) -> None:
+    """Q3 regression: a failed add retried after its arrival departed must not
+    reach Grocy (it would never be consumed)."""
     backend = MemoryBackend()
     backend.add_product(1, "Beans")
     await link(store, "AAAA", 1)
     await store.apply_arrival("AAAA", T0, 1)
+    backend.faults.append("reject")
+    w = worker_for(store, backend)
+    await drain(w)
+    failed = await store.ops("failed")
+    assert len(failed) == 1
+    d = await store.apply_departure("AAAA", T0 + 1)  # failed add → no consume
+    assert d.consume_op_id is None
+    assert await store.retry_failed(failed[0].id)  # retry from the web UI
+    await drain(w)
+    op = await store.get_op(failed[0].id)
+    assert op is not None and (op.status, op.resolution) == ("done", "cancelled")
+    assert backend.log == []  # nothing sent to Grocy
+    # The item coming back is a new arrival and is added normally.
+    await store.apply_arrival("AAAA", T0 + 2, 1)
+    await drain(w)
+    assert [entry[0] for entry in backend.log] == ["add"]
+
+
+async def test_q3_add_and_consume_cancelled_when_item_left_while_grocy_down(
+    store: Store,
+) -> None:
+    """Q3: arrival + departure both queued while Grocy is down → net zero, no calls."""
+    backend = MemoryBackend()
+    backend.add_product(1, "Beans")
+    await link(store, "AAAA", 1)
+    r = await store.apply_arrival("AAAA", T0, 1)
     d = await store.apply_departure("AAAA", T0 + 1)  # consume journaled behind add
     assert d.consume_op_id is not None
-    backend.faults.append("reject")
+    w = worker_for(store, backend)
+    await drain(w)
+    add = await store.get_op(r.add_op_id or 0)
+    consume = await store.get_op(d.consume_op_id)
+    assert add is not None and consume is not None
+    assert (add.status, add.resolution) == ("done", "cancelled")
+    assert (consume.status, consume.resolution) == ("done", "cancelled")
+    assert backend.log == []
+    assert (await store.counts())["pending"] == 0
+
+
+async def test_q3_ambiguous_add_that_landed_is_kept_and_consumed(store: Store) -> None:
+    """Q3 + idempotency: if the add did reach Grocy before the item left, keep
+    it and let the queued consume remove it (not a cancel)."""
+    backend = MemoryBackend()
+    backend.add_product(1, "Beans")
+    await link(store, "AAAA", 1)
+    await store.apply_arrival("AAAA", T0, 1)
+    backend.faults.append("lost")  # applied in Grocy, answer lost
+    w = worker_for(store, backend)
+    await w.process_one()
+    await store.apply_departure("AAAA", T0 + 1)
+    await drain(w)
+    assert backend.stock == []
+    assert [entry[0] for entry in backend.log] == ["add", "consume"]
+
+
+async def test_q3_ambiguous_add_not_found_cancels_and_verifies(store: Store) -> None:
+    """Q3: an ambiguous add of a departed cycle that is not in Grocy yet is
+    cancelled, and the delayed check removes it if it lands late."""
+    backend = MemoryBackend()
+    backend.add_product(1, "Beans")
+    await link(store, "AAAA", 1)
+    r = await store.apply_arrival("AAAA", T0, 1)
+    now = [0.0]
+    w = GrocyWorker(
+        store,
+        backend,
+        clock=lambda: T0,
+        rng=random.Random(1),
+        verify_after=10,
+        verify_clock=lambda: now[0],
+    )
+    backend.faults.append("late")  # times out unapplied; lands two calls later
+    await w.process_one()
+    await store.apply_departure("AAAA", T0 + 1)
+    await w.process_one()  # entries check (not there yet) → cancel + verify
+    op = await store.get_op(r.add_op_id or 0)
+    assert op is not None and op.resolution == "cancelled"
+    await backend.entries(1)  # time passes: the late add lands
+    assert len(backend.stock) == 1
+    now[0] = 11
+    assert await w.process_one() is None  # duplicate check: keep nothing
+    assert backend.stock == []
+    assert w.duplicates_removed == 1
+
+
+async def test_consume_of_failed_add_fails(store: Store) -> None:
+    """A consume whose add failed (e.g. rejected after the consume was
+    journaled) is failed too, never sent."""
+    backend = MemoryBackend()
+    backend.add_product(1, "Beans")
+    await link(store, "AAAA", 1)
+    r = await store.apply_arrival("AAAA", T0, 1)
+    d = await store.apply_departure("AAAA", T0 + 1)
+    assert d.consume_op_id is not None
+    await store.mark_failed(r.add_op_id or 0, "rejected", T0)
     w = worker_for(store, backend)
     await drain(w)
     consume = await store.get_op(d.consume_op_id)
     assert consume is not None and consume.status == "failed"
     assert "nothing to consume" in (consume.last_error or "")
+    assert backend.log == []
 
 
 async def test_auth_error_keeps_op_queued(store: Store) -> None:

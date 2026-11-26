@@ -92,6 +92,8 @@ class WebUI:
         self.app.router.add_post("/forget", self._form(self._forget))
         self.app.router.add_post("/dismiss", self._form(self._dismiss))
         self.app.router.add_post("/retry", self._form(self._retry))
+        self.app.router.add_post("/consume-now", self._form(self._consume_now))
+        self.app.router.add_post("/dismiss-op", self._form(self._dismiss_op))
         self.app.router.add_post("/resync", self._form(self._resync))
         self._runner: web.AppRunner | None = None
         self._flash: str | None = None
@@ -155,11 +157,15 @@ class WebUI:
         target = form.get("target", "").strip()
         if not target:
             raise ValueError("enter a barcode or a Grocy product id (#12)")
+        in_stock = form.get("in_stock") == "on"
         if target.startswith("#") and target[1:].isdigit():
-            link = await self.hub.relink(epc, product_id=int(target[1:]))
+            link = await self.hub.relink(
+                epc, product_id=int(target[1:]), in_stock=in_stock
+            )
         else:
-            link = await self.hub.relink(epc, barcode=target)
-        return f"Linked {epc} to {link.product_name}"
+            link = await self.hub.relink(epc, barcode=target, in_stock=in_stock)
+        suffix = " (already in stock: no add for this arrival)" if in_stock else ""
+        return f"Linked {epc} to {link.product_name}{suffix}"
 
     async def _forget(self, form: dict[str, str]) -> str:
         epc = form.get("epc", "")
@@ -179,6 +185,18 @@ class WebUI:
             self.hub.mark_dirty()
             return f"Op {op_id} queued again"
         return f"Op {op_id} is not failed"
+
+    async def _consume_now(self, form: dict[str, str]) -> str:
+        op = await self.hub.worker.consume_now(int(form.get("op", "0") or 0))
+        self.hub.mark_dirty()
+        return f"Consumed one {op.product_name} in Grocy (op {op.id})"
+
+    async def _dismiss_op(self, form: dict[str, str]) -> str:
+        op_id = int(form.get("op", "0") or 0)
+        if await self.hub.worker.dismiss(op_id):
+            self.hub.mark_dirty()
+            return f"Op {op_id} dismissed (no change in Grocy)"
+        return f"Op {op_id} is not waiting for review"
 
     async def _resync(self, form: dict[str, str]) -> str:
         report = await self.hub.resync()
@@ -205,6 +223,8 @@ class WebUI:
             f'<input type="hidden" name="csrf" value="{self.token}">'
             f'<input type="hidden" name="epc" value="{_e(epc)}">'
             '<input name="target" placeholder="barcode or #id" aria-label="barcode or product id">'
+            '<label title="Grocy already counts this unit: skip the add for its current '
+            'or next arrival"><input type="checkbox" name="in_stock"> already in stock</label> '
             "<button>Link</button></form>"
         )
 
@@ -242,7 +262,13 @@ class WebUI:
             "<tr>"
             f"<td><code>{_e(lk.epc)}</code>{' <span class=ok>●</span>' if lk.epc in in_pantry else ''}</td>"
             f'<td><a href="{_e(grocy)}/product/{lk.product_id}" target="_blank" rel="noopener">{_e(lk.product_name)}</a></td>'
-            f"<td>{_e(iso(lk.linked_at))}</td><td>{_ago(last_seen.get(lk.epc))}</td>"
+            f"<td>{_e(iso(lk.linked_at))}"
+            + (
+                f' <span class="muted">(in stock: no add for arrival {lk.skip_add_cycle})</span>'
+                if lk.skip_add_cycle
+                else ""
+            )
+            + f"</td><td>{_ago(last_seen.get(lk.epc))}</td>"
             f"<td>{self._button('unlink', 'Unlink', epc=lk.epc)} {self._relink_form(lk.epc)}</td>"
             "</tr>"
             for lk in links
@@ -269,8 +295,13 @@ class WebUI:
             "<tr>"
             f"<td>{op.id}</td><td>{_e(op.kind)}</td><td>{_e(op.product_name)}</td>"
             f"<td><code>{_e(op.epc)}</code></td><td>{_e(op.last_error)}</td>"
-            f"<td>{self._button('retry', 'Retry', op=op.id)}</td>"
-            "</tr>"
+            + (
+                f"<td><b>Review:</b> {self._button('consume-now', 'Consume now', op=op.id)} "
+                f"{self._button('dismiss-op', 'Dismiss', op=op.id)}</td>"
+                if op.needs_review
+                else f"<td>{self._button('retry', 'Retry', op=op.id)}</td>"
+            )
+            + "</tr>"
             for op in failed
         )
         resync = hub.last_resync
@@ -294,6 +325,14 @@ class WebUI:
                     + diff_rows
                     + "</table></div>"
                     if diff_rows
+                    else ""
+                )
+                + (
+                    f'<p class="warn">{len(resync.review_ops)} consume(s) waiting for review '
+                    "(Grocy may be one unit high for: "
+                    + ", ".join(_e(r["product"]) for r in resync.review_ops)
+                    + "). See Failed Grocy operations.</p>"
+                    if resync.review_ops
                     else ""
                 )
             )

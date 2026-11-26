@@ -1,13 +1,16 @@
 # Pantry Hub build report
-- App version: 0.1.0
+- App version: 0.2.0 (0.1.0 was never merged/released; both are in PR #1)
 - aiochainway version used: v0.2.0 (`f188a02`, ships `aiochainway.testing.FakeUR4`)
-- Date / PR / Commit / CI (per job): 2026-11-26 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / code verified at `07d8a7c` (this report is committed on top) / CI on `07d8a7c`, all green:
-  - Lint: Ruff + mypy ✅ · HA app linter ✅ · yamllint ✅ · ESPHome linking station (C++ host tests, `esphome config`, `esphome compile`) ✅ · Version bump ✅
-  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (coverage gate 90%)
-  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
+- Date / PR / Commit / CI (per job): 2026-11-26 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / CI_V020
 
 ## Summary
-Built in one pass on `claude/kind-ritchie-58v2e4`, one PR:
+**v0.2.0** applies the open-question decisions:
+- **Q1 "already in stock"**: per-link option (web UI checkbox; `"in_stock": true` in the station's barcode or tag message). It skips the add of the current presence cycle (or the next arrival if the tag isn't in the pantry), only that cycle. Default off. The departure of that cycle still consumes one unit, by amount at the Pantry location, because Grocy counted it.
+- **Q2 ambiguous consume without a stock entry id**: never resent. It's failed for review (`resolution = review`), counted in `sensor.pantry_hub_grocy_queue` (`failed`, plus a new `review` attribute), listed in the web UI with **Consume now** / **Dismiss**, and included in the resync report (`review_ops`).
+- **Q3 add replayed after the item left**: before replaying any queued or retried add, the worker checks the EPC's presence. If that cycle has departed, it cancels both the add and its consume (net zero) and logs it. If the add was ambiguous, it first checks Grocy: a landed add is kept, and the queued consume removes it. If nothing has landed, the add is cancelled and the delayed duplicate check removes a late landing.
+- Schema v2 (`links.skip_add_cycle`, `ops.resolution`), with an automatic add-only migration from v1.
+
+**v0.1.0** (same PR) built in one pass on `claude/kind-ritchie-58v2e4`, one PR:
 - **Pantry Hub app** (`pantry-hub/`, slug `pantry_hub`): asyncio Python 3.14 service. Chainway UR4 UDP auto-mode reads via `aiochainway` → per-EPC presence state machine → Grocy add/consume through a persistent, idempotent SQLite journal; MQTT linking workflow; MQTT discovery entities; ingress web UI rendered on the server.
 - **Linking station firmware** (`esphome/linking-station/`): the Kroger wall scanner (AtomS3 Lite + QRCode2) reflashed with a U107 on Grove. Kroger mode is unchanged; double-click enters link mode. The U107 driver is an ESPHome external component (`jrd4035`) with host-tested protocol code.
 - **Docs**: `docs/setup.md`, `docs/automations.md`, `docs/tagging.md`, `pantry-hub/DOCS.md`.
@@ -35,14 +38,18 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 - Door gating (`depart_requires_door_closed`): departures only fire while the door is **closed and has been closed ≥ arrive_window_s** (time to re-read tags shadowed by a person). Door unknown (no message yet) blocks departures. Payloads: `ON/OFF`, `open/closed`, `true/false`, `1/0` (ON = open), zigbee2mqtt `{"contact": true}` (= closed), `{"state": …}`.
 - Restart: EPCs persisted as `present` are restored as present with last-seen = start time, so nothing departs for one full `depart_after_s`. `arriving` isn't persisted (re-reads redo it).
 - Late-landing protection: an add that may have reached Grocy more than once (timeout / 5xx / connection reset, then retried) is re-checked `verify_after` (60 s) later; duplicate stock entries carrying the same op marker are consumed again. Pending checks survive restarts and are counted as `verifying`.
+- Q1: an arrival whose cycle equals the link's `skip_add_cycle` journals a *skipped* add (status done, resolution `in_stock`, nothing sent). The departure then journals a normal consume, by amount, with no stock entry id.
+- Q3: replaying an add first compares its cycle with the persisted presence: `presence.cycle > op.cycle` or (same cycle and `departed`) → cancel add + consume (resolution `cancelled`).
+- Q2: an ambiguous consume with no stock entry id → `failed` + resolution `review`; it can't be blindly retried (Retry is refused). Only **Consume now** (by amount) or **Dismiss** closes it.
 - Journal rules: an arrival journals one add per (EPC, arrival cycle) in the same SQLite transaction as the presence update (`dedupe_key = epc:cycle:add`). A departure journals a consume only if that cycle's add was journaled and didn't fail. Linking a tag that is already present journals that cycle's add once.
 
 ## Linking flow (final topics and payloads)
-- `pantry_hub/linking/<station_id>/barcode` ← `{"barcode": "...", "ts": <epoch s>}` (`station_id` matches `[A-Za-z0-9_-]{1,32}`; the firmware uses `kroger_scanner`)
-- `pantry_hub/linking/<station_id>/tag` ← `{"epc": "<hex>", "rssi": -45.2, "ts": ...}`
+- `pantry_hub/linking/<station_id>/barcode` ← `{"barcode": "...", "ts": <epoch s>, "in_stock"?: true}` (`station_id` matches `[A-Za-z0-9_-]{1,32}`; the firmware uses `kroger_scanner`)
+- `pantry_hub/linking/<station_id>/tag` ← `{"epc": "<hex>", "rssi": -45.2, "ts": ..., "in_stock"?: true}` (`in_stock` on either message marks the new link "already in stock"; the `linked` result message says so)
 - `pantry_hub/linking/<station_id>/result` → `{"status": "linked|unknown_barcode|tag_already_linked|timeout|error", "product": "...", "message": "...", "barcode"?: "...", "epc"?: "..."}`
 - Flow: by-barcode lookup → else external lookup `?add=true` → else `unknown_barcode` + "needs product" list. The first tag must arrive within **15 s** of the barcode; then tags are collected for **1 s** and the strongest RSSI wins (unknown RSSI loses; ties keep the first). Tags after that window are ignored. Already linked → `tag_already_linked` with the existing product (relink only in the web UI). A new barcode on the same station replaces the session. A tag with no session → `error` "Scan a barcode first".
 - Linking never changes Grocy stock.
+- `pantry_hub/resync/result` also carries `review_ops: [{op_id, product_id, product, epc, note}]`.
 - Also published: `pantry_hub/events` (`{"event_type": "arrived|departed", "epc", "product", "product_id", "linked", "ts"}`), `pantry_hub/state` (retained), `pantry_hub/last_link` (retained), `pantry_hub/resync/result` (retained), `pantry_hub/status` (`online`/`offline`, LWT). Subscribed: `pantry_hub/resync/press`, `homeassistant/status`, `door_entity_topic`.
 
 ## Linking station firmware (pins, UARTs, U107 power, mode behaviour, Kroger Restock event/action used)
@@ -55,10 +62,17 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 - MQTT is used for the linking topics only (`discovery: false`); the native API is kept for Kroger mode.
 
 ## HA entities created
-`binary_sensor.pantry_hub_reader_online`, `sensor.pantry_hub_present_tags`, `sensor.pantry_hub_unlinked_tags`, `sensor.pantry_hub_grocy_queue` (attributes: failed, online, last_error), `sensor.pantry_hub_last_link`, `sensor.pantry_hub_resync_differences` (added: holds the resync report), `event.pantry_hub_item` (`arrived`/`departed`), `button.pantry_hub_resync`. All under one device "Pantry Hub" via device-based discovery (`homeassistant/device/pantry_hub/config`) using `default_entity_id`.
+`binary_sensor.pantry_hub_reader_online`, `sensor.pantry_hub_present_tags`, `sensor.pantry_hub_unlinked_tags`, `sensor.pantry_hub_grocy_queue` (attributes: failed (includes review), review, online, last_error), `sensor.pantry_hub_last_link`, `sensor.pantry_hub_resync_differences` (added: holds the resync report), `event.pantry_hub_item` (`arrived`/`departed`), `button.pantry_hub_resync`. All under one device "Pantry Hub" via device-based discovery (`homeassistant/device/pantry_hub/config`) using `default_entity_id`.
 Linking station adds: `binary_sensor` Link mode, `text_sensor` Last linked tag, `switch` Link result beep (unverified).
 
 ## Spec changes vs. this spec
+v0.2.0:
+- Q1 interpretation: skipping the add means the tag *owns* the unit Grocy already counted for that cycle, so its departure still consumes one unit, by amount at the Pantry location. Without that, Grocy would never decrease for existing stock. If the tag isn't in the pantry when linked, the skip applies to its next arrival (the "current" cycle hasn't started).
+- Q1 linking station firmware: not changed; it doesn't send `in_stock` yet. Use the web UI (or any MQTT client) for existing stock. A station gesture can be added later.
+- Q2: a review consume blocks nothing (it's failed, not pending). Retry is disabled for it on purpose.
+- Q3 also covers the Grocy-down case (arrival and departure both queued): both are cancelled without calling Grocy. An ambiguous add is checked in Grocy before cancelling.
+
+v0.1.0:
 1. **aiochainway v0.2.0** instead of v0.1.0 (your instruction); it ships `aiochainway.testing`.
 2. **Linking station = reflashed Kroger wall scanner** (device `kroger-scanner`, decisions Q3–Q7): double-click for link mode; Kroger idle LED stays off (not solid white); link mode = blue pulse; magenta = already linked; beep switch unverified/off; housing out of scope.
 3. **Image naming / builder**: the official HA builder is now the `home-assistant/builder/actions/*` set (the old `home-assistant/builder` action is deprecated). Per-arch images are `ghcr.io/thermitehash/{arch}-pantry-hub` plus a multi-arch manifest **`ghcr.io/thermitehash/pantry-hub`** (`image:` in config.yaml), instead of `pantry-hub-{arch}`. Builds run **natively** (ubuntu-24.04 / ubuntu-24.04-arm), not under QEMU; the smoke test runs each arch natively.
@@ -72,13 +86,13 @@ Linking station adds: `binary_sensor` Link mode, `text_sensor` Last linked tag, 
 11. Default `grocy_url` = `http://a0d7b954-grocy`. It requires enabling the Grocy app's port (Grocy's direct server only runs when a host port is set); documented.
 
 ## Open questions
-1. **Existing stock**: tagging an item Grocy already counts adds one more on arrival. Docs say to tag on the way in or correct once in Grocy. Do you want a per-link "already in stock" flag (link without a later add)?
-2. **Ambiguous consume without a stock entry id** (only when the add's answer was lost *and* the stock id couldn't be recovered) is sent again, which could double-consume. Prefer marking it failed for manual review?
-3. **Failed add retried after the item already left**: the item gets added but no consume follows (resync shows it). Acceptable?
+Q1–Q3 are resolved in v0.2.0 (above). Q4–Q7 stay as first-run hardware checks (no code changes):
 4. **U107 TX power floor**: JRD-4035/M100 modules often accept only ~18.5–26 dBm. If 15 dBm is rejected, the firmware logs a warning. Confirm on hardware and raise the default if needed.
 5. **U107 Grove TX/RX orientation** (G1/G2) is unverified; swap if no reads.
 6. **UDP source IP through the Supervisor's Docker bridge**: expected to be preserved (DNAT); if `dropped_sources` rises, NAT is rewriting it.
 7. HA 2026.11 MQTT discovery `default_entity_id` (replacement for `object_id`): verify the entity IDs on first run.
+
+New: 8. Should the linking station get a gesture for "already in stock" (e.g. triple-click before scanning), so existing stock can be tagged without the web UI?
 
 ## Hardware/setup impact (ports, firewall, disk, power supply)
 - **Ports**: UDP **8888** on 192.168.1.38 (UR4 → hub, host port configurable under Network); ingress 8099 internal; no host networking.
@@ -89,7 +103,13 @@ Linking station adds: `binary_sensor` Link mode, `text_sensor` Last linked tag, 
 - U107 needs mounting beside the scanner, antenna facing out (housing doesn't fit; separate ha-kroger-restock PR later).
 
 ## Test results (tests, coverage, property tests, fault injection)
-- **133 pytest tests** pass locally (Python 3.14.6, Linux); CI runs ubuntu-latest and macos-latest. **Coverage 94%** (branch) for `pantry_hub` (gate 90%): `__main__` 98, `grocy` 96, `hub` 95, `linking` 94, `store` 92, `web` 99, `worker` 88, `mqtt` 86, `presence`/`config`/`discovery` 100.
+- **149 pytest tests** pass locally (Python 3.14.6, Linux; two full runs); CI runs ubuntu-latest and macos-latest. **Coverage 95%** (branch) for `pantry_hub` (gate 90%): `__main__` 98, `grocy` 96, `hub` 94, `linking` 94, `store` 93, `web` 99, `worker` 91, `mqtt` 86, `presence`/`config`/`discovery` 100.
+- **v0.2.0 regression tests** (`tests/test_v020_decisions.py`, `tests/test_worker.py`):
+  - Q1: in-stock link while present (no add; departure consumes the pre-existing unit; next arrival adds); while absent (next arrival skipped only); default off; relink in-stock doesn't undo a queued add; MQTT `in_stock` on the barcode and on the tag message; web UI checkbox end to end.
+  - Q2: lost-answer consume without a stock id → review, sent exactly once; Retry refused; Dismiss; Consume now (worker and web); a crash mid-request → review; consumes *with* a stock id keep the existing check; review count in the MQTT state and `review_ops` in the resync report; under-consume (not double) on 5xx.
+  - Q3: failed add retried after departure → cancelled, nothing sent, the next arrival is added; arrival + departure queued while Grocy is down → both cancelled, no calls; an ambiguous add that landed is kept and consumed; an ambiguous add not found → cancelled, and a late landing is removed by the duplicate check.
+  - Schema v1 → v2 migration (idempotent).
+  - Mutation checks: reverting Q1 → 7 tests fail; Q2 → 4; Q3 → 3.
 - **Unit**: presence (thresholds, sliding window, arriving expiry, missing/departed timers, restart grace, door gating incl. settle and re-open), RSSI selection, journal idempotency, FIFO replay, backoff, config validation, door payload parsing.
 - **Integration** (fake UR4 frames via `aiochainway.testing.tag_frames` over real UDP → hub → fake Grocy HTTP → `amqtt` broker): arrival/departure, unlinked, discovery + availability + HA-restart republish, full MQTT linking flow (linked, already linked, unknown barcode, timeout), link-while-present adds once, resync, relink/unlink, web UI actions + CSRF + ingress-only, TCP probe with `FakeUR4`, `run()` start/stop and SIGTERM, refuse-to-start cases.
 - **Fault injection**: Grocy down (503) with ordered replay; 500, apply-then-500, apply-then-hang, hang-before-apply on add *and* consume (no double add/consume); auth errors; rejected ops; UDP garbage / short frames / wrong source; MQTT broker stop/start (reconnect, outbox, retained republish); restart mid-arrival with the add still queued.
@@ -113,6 +133,9 @@ Linking station adds: `binary_sensor` Link mode, `text_sensor` Last linked tag, 
 | 11 | Unclosed SQLite write cursors made `Store.close()` fail ("database table is locked") and left aiosqlite's thread alive, so shutdown could hang and the SIGTERM flush could fail | teardown error in repeated runs | every statement goes through helpers that close the cursor; `close()` always closes the connection (checkpoint failure only logged; data is already durable) | `test_close_after_writes_and_checkpoint_failure` |
 | 12 | Test rig treated "event queue empty" as "event handled" (race on slow runners) | macOS CI | `task_done()` in the event loop + `Hub.drain_events()` (`queue.join()`) | `rig.idle()` uses it; reproduced with +0.3 s departures |
 | 13 | Overflow-unsafe `millis()` comparison for the U107 wake delay | self-review | wrap-safe signed difference | — (firmware) |
+| 14 | (v0.2.0, behaviour) A failed add retried after the item left would add a unit that is never consumed | open question Q3 | presence check before replay; cancel add + consume | `test_q3_*` (4 tests) |
+| 15 | (v0.2.0, behaviour) An ambiguous consume without a stock id was resent, risking a double consume | open question Q2 | review instead of resend | `test_q2_*` (5 tests) |
+| 16 | (v0.2.0, behaviour) Tagging existing stock double-counted it | open question Q1 | "already in stock" per-link skip | `test_q1_*` (7 tests) |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.
@@ -129,3 +152,5 @@ Linking station adds: `binary_sensor` Link mode, `text_sensor` Last linked tag, 
 12. Press **Resync**; it should report 0 differences for tagged products.
 13. Restart the app with items in the pantry: nothing departs for one `depart_after_s` window.
 14. Import the low-stock → Kroger Restock automation from `docs/automations.md`.
+15. (v0.2.0) Tag one item Grocy already counts with **already in stock** in the web UI: on arrival, no Grocy add; on departure, Grocy −1.
+16. (v0.2.0) Check the web UI's Failed operations list stays empty in normal use; if a **Review** row appears, check Grocy, then Consume now / Dismiss.

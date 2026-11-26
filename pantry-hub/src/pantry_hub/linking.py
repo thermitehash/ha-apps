@@ -6,6 +6,9 @@ MQTT topics (prefix ``pantry_hub/``)::
     linking/<station_id>/tag      ← {"epc": "...", "rssi": -45.2, "ts": ...}
     linking/<station_id>/result   → {"status": "...", "product": "...", "message": "..."}
 
+Either message may carry ``"in_stock": true``: Grocy already counts this
+unit, so the add of its current (or next) pantry arrival is skipped.
+
 ``status`` is one of ``linked``, ``unknown_barcode``, ``tag_already_linked``,
 ``timeout`` or ``error``.
 
@@ -72,6 +75,7 @@ class _Session:
     tags: dict[str, float | None] = field(default_factory=dict)
     first_tag: asyncio.Event = field(default_factory=asyncio.Event)
     window_opened: float | None = None
+    in_stock: bool = False
     task: asyncio.Task[None] | None = None
 
 
@@ -81,6 +85,11 @@ def normalize_epc(raw: object) -> str | None:
         return None
     epc = raw.replace(" ", "").replace(":", "").upper()
     return epc if EPC_RE.fullmatch(epc) else None
+
+
+def _in_stock(data: dict[str, Any] | None) -> bool:
+    """``"in_stock": true`` in a barcode or tag message."""
+    return data is not None and data.get("in_stock") is True
 
 
 def _decode(payload: bytes) -> dict[str, Any] | None:
@@ -167,7 +176,12 @@ class LinkingManager:
         old = self._sessions.pop(station, None)
         if old is not None and old.task is not None:
             old.task.cancel()
-        session = _Session(station=station, barcode=barcode, started=self.clock())
+        session = _Session(
+            station=station,
+            barcode=barcode,
+            started=self.clock(),
+            in_stock=_in_stock(data),
+        )
         self._sessions[station] = session
         session.task = asyncio.create_task(
             self._run(session), name=f"pantry_hub.link.{station}"
@@ -197,6 +211,8 @@ class LinkingManager:
             if isinstance(raw_rssi, int | float) and not isinstance(raw_rssi, bool)
             else None
         )
+        if _in_stock(data):
+            session.in_stock = True
         now = self.clock()
         if session.window_opened is None:
             session.window_opened = now
@@ -319,6 +335,7 @@ class LinkingManager:
             link,
             location_id=self.location_id,
             best_before=best_before_for(link, self.clock()),
+            in_stock=session.in_stock,
         )
         if not created:
             again = await self.store.get_link(epc)
@@ -339,7 +356,12 @@ class LinkingManager:
             station,
             LinkResult(
                 "linked",
-                f"Linked to {product.name}",
+                f"Linked to {product.name}"
+                + (
+                    " (already in stock: no add for this arrival)"
+                    if session.in_stock
+                    else ""
+                ),
                 product=product.name,
                 barcode=barcode,
                 epc=epc,

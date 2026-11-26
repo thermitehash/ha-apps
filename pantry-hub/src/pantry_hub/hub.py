@@ -105,6 +105,8 @@ class ResyncReport:
     checked: int
     differences: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    #: Ambiguous consumes waiting for a person (Grocy may be one unit high).
+    review_ops: list[dict[str, Any]] = field(default_factory=list)
 
 
 class Hub:
@@ -420,6 +422,7 @@ class Hub:
             "grocy": {
                 "online": self.worker.grocy_ok,
                 "failed": self._counts.get("failed", 0),
+                "review": self._counts.get("review", 0),
                 "last_error": self.worker.last_error,
             },
             "door": self.machine.door.value,
@@ -533,8 +536,19 @@ class Hub:
         self.mark_dirty()
         return removed
 
-    async def relink(self, epc: str, *, barcode: str = "", product_id: int = 0) -> Link:
-        """Link ``epc`` to a product by barcode or Grocy product id (web UI)."""
+    async def relink(
+        self,
+        epc: str,
+        *,
+        barcode: str = "",
+        product_id: int = 0,
+        in_stock: bool = False,
+    ) -> Link:
+        """Link ``epc`` to a product by barcode or Grocy product id (web UI).
+
+        ``in_stock``: Grocy already counts this unit; skip the add of the
+        current (or next) arrival.
+        """
         if barcode:
             product = await self.backend.product_by_barcode(barcode)
             if product is None:
@@ -556,6 +570,7 @@ class Hub:
             link,
             location_id=self.options.grocy_location_id,
             best_before=best_before_for(link, self.wall()),
+            in_stock=in_stock,
         )
         self.linking.last_link = link
         await self._on_linked(link, op_id)
@@ -573,6 +588,17 @@ class Hub:
             if pid is not None:
                 present[pid] += 1
         report = ResyncReport(checked_at=now, checked=len(present))
+        report.review_ops = [
+            {
+                "op_id": op.id,
+                "product_id": op.product_id,
+                "product": op.product_name,
+                "epc": op.epc,
+                "note": "consume may not have reached Grocy",
+            }
+            for op in await self.store.ops("failed", limit=500)
+            if op.needs_review
+        ]
         try:
             for pid in sorted(present):
                 entries = await self.backend.entries(pid)
@@ -608,6 +634,7 @@ class Hub:
                         "checked": report.checked,
                         "pending_ops": self._counts.get("pending", 0),
                         "differences": report.differences,
+                        "review_ops": report.review_ops,
                         "error": report.error,
                     }
                 ),

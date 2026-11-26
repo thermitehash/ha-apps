@@ -53,10 +53,12 @@ adds one unit to Grocy at the Pantry location. Linking itself never changes
 stock, so nothing is counted twice.
 
 > **Existing stock:** if Grocy already counts an item you're tagging for
-> the first time, its arrival adds one more. Either tag items as they come
-> home from shopping (before you add them in Grocy), or correct the amount
-> once in Grocy after tagging what's already on the shelves. Resync shows
-> where the counts differ.
+> the first time, link it as **already in stock**: in the Pantry Hub page,
+> type its barcode in the Link form and tick "already in stock". Its
+> current (or next) arrival isn't added again, and when it leaves one unit
+> is still consumed. New shopping needs nothing special: tag it on the way
+> in and its arrival adds it. (The linking station itself doesn't send
+> `in_stock` yet; use the web UI for existing stock.)
 
 ## Taking things out
 
@@ -72,7 +74,11 @@ re-use it: re-linking is **Relink** in the web UI.
 In the Pantry Hub page (sidebar):
 
 - **Unlink**: forget the tag ↔ product link. Grocy stock isn't changed.
-- **Link / Relink**: type a barcode, or a Grocy product id as `#12`.
+- **Link / Relink**: type a barcode, or a Grocy product id as `#12`. Tick
+  **already in stock** if Grocy already counts that unit.
+- **Failed Grocy operations**: **Retry** for rejected changes. A consume
+  marked **Review** may or may not have reached Grocy: check the product in
+  Grocy, then **Consume now** (it didn't) or **Dismiss** (it did).
 - **Unlinked tags**: tags seen in the pantry that have no link. Link them
   from here if you know what they are, or forget them.
 - **Resync** (button or `button.pantry_hub_resync`): compares, per product,
