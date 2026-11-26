@@ -1,7 +1,10 @@
 # Pantry Hub build report
 - App version: 0.1.0
 - aiochainway version used: v0.2.0 (`f188a02`, ships `aiochainway.testing.FakeUR4`)
-- Date / PR / Commit / CI (per job): 2026-11-26 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / see PR head / CI_TABLE
+- Date / PR / Commit / CI (per job): 2026-11-26 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / code verified at `07d8a7c` (this report is committed on top) / CI on `07d8a7c`, all green:
+  - Lint: Ruff + mypy ✅ · HA app linter ✅ · yamllint ✅ · ESPHome linking station (C++ host tests, `esphome config`, `esphome compile`) ✅ · Version bump ✅
+  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (coverage gate 90%)
+  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
 
 ## Summary
 Built in one pass on `claude/kind-ritchie-58v2e4`, one PR:
