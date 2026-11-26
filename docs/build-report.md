@@ -144,7 +144,7 @@ New: 8. Should the linking station get a gesture for "already in stock" (e.g. tr
 1. Free HA disk space below ~75%; take a backup.
 2. Mosquitto + MQTT integration up; create a `linking-station` HA user for MQTT.
 3. Grocy app: enable a port, ssl off, create the **Pantry** location and an **API key**; Grocy HACS integration set up.
-4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.1.0`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
+4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.2.0`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
 5. Check the entity IDs in HA match the list above (`default_entity_id`).
 6. Provision the UR4 from the Mac with `aiochainway` v0.2.0: static IP on the IoT VLAN, region USA, power ≤ 27 dBm, auto mode, UDP destination `192.168.1.38:8888`; add the firewall rule.
 7. Put one tagged item in range: `reader_online` on, `bad_frames` 0, `dropped_sources` 0 (else set `allowed_reader_ip`). An unlinked arrival appears in the web UI.
