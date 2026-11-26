@@ -55,8 +55,8 @@ class JRD4035Component : public Component, public uart::UARTDevice {
   uint32_t scan_interval_{100};
   uint32_t rssi_window_{1000};
 
-  ::jrd4035::Decoder decoder_;
-  ::jrd4035::StrongestTag strongest_;
+  ::jrd4035_proto::Decoder decoder_;
+  ::jrd4035_proto::StrongestTag strongest_;
   bool scanning_{false};
   uint32_t scan_started_{0};
   uint32_t scan_timeout_{0};

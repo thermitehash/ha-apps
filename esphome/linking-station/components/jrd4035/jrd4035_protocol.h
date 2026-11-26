@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace jrd4035 {
+namespace jrd4035_proto {
 
 constexpr uint8_t HEADER = 0xBB;
 constexpr uint8_t END = 0x7E;
@@ -207,4 +207,4 @@ class StrongestTag {
   TagRead best_;
 };
 
-}  // namespace jrd4035
+}  // namespace jrd4035_proto

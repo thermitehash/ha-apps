@@ -104,7 +104,8 @@ Linking station adds: `binary_sensor` Link mode, `text_sensor` Last linked tag, 
 | 6 | `rgb_order` deprecated in esp32_rmt_led_strip | `esphome config` warning | `channel_colors: GRB` | CI `esphome config` |
 | 7 | Container smoke test failed on aarch64 with exit 141: `docker logs | grep -q` under `pipefail` gets SIGPIPE when grep exits early (amd64 passed by luck) | CI `Build aarch64` | logs written to a file, then grepped | CI smoke test |
 | 8 | config.yaml set default-valued keys (`boot`, `startup`, `ingress_port`) | CI HA app linter | removed (defaults unchanged) | CI app linter |
-| 9 | Overflow-unsafe `millis()` comparison for the U107 wake delay | self-review | wrap-safe signed difference | — (firmware) |
+| 9 | Firmware didn't compile: the pure protocol namespace `jrd4035` was ambiguous with `esphome::jrd4035` under the generated `using namespace esphome;` | CI `esphome compile` | protocol namespace renamed `jrd4035_proto` | CI `esphome compile` |
+| 10 | Overflow-unsafe `millis()` comparison for the U107 wake delay | self-review | wrap-safe signed difference | — (firmware) |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.

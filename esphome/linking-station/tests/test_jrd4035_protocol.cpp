@@ -6,7 +6,7 @@
 
 #include "jrd4035_protocol.h"
 
-using namespace jrd4035;
+using namespace jrd4035_proto;
 
 static std::vector<Frame> decode_all(Decoder &d, const std::vector<uint8_t> &bytes) {
   std::vector<Frame> out;
