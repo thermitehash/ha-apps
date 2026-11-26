@@ -15,11 +15,14 @@ import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import logging
 from pathlib import Path
 import sqlite3
 from typing import Literal
 
 import aiosqlite
+
+_LOGGER = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
@@ -59,7 +62,8 @@ CREATE TABLE IF NOT EXISTS ops (
     last_error TEXT,
     stock_entry_id TEXT,
     created_at REAL NOT NULL,
-    done_at REAL
+    done_at REAL,
+    verify_at REAL
 );
 CREATE INDEX IF NOT EXISTS ops_status ON ops (status, id);
 CREATE TABLE IF NOT EXISTS unlinked (
@@ -241,21 +245,28 @@ class Store:
         """Open (creating if needed) the database at ``path``."""
         conn = await aiosqlite.connect(str(path), isolation_level=None)
         conn.row_factory = sqlite3.Row
-        await conn.execute("PRAGMA journal_mode=WAL")
-        await conn.execute("PRAGMA synchronous=FULL")
-        await conn.execute("PRAGMA foreign_keys=ON")
-        await conn.executescript(_SCHEMA)
-        await conn.execute(
+        store = cls(conn)
+        await store._exec("PRAGMA journal_mode=WAL")
+        await store._exec("PRAGMA synchronous=FULL")
+        await store._exec("PRAGMA foreign_keys=ON")
+        cur = await conn.executescript(_SCHEMA)
+        await cur.close()
+        await store._exec(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
-        return cls(conn)
+        return store
 
     async def close(self) -> None:
-        """Checkpoint and close."""
+        """Checkpoint and close (the connection is closed even if the checkpoint fails)."""
         async with self._lock:
-            await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            await self._conn.close()
+            try:
+                await self._exec("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error as err:
+                # Committed data is already durable in the WAL (synchronous=FULL).
+                _LOGGER.warning("SQLite checkpoint at shutdown failed: %s", err)
+            finally:
+                await self._conn.close()
 
     # Helpers -------------------------------------------------------------------
 
@@ -268,14 +279,27 @@ class Store:
         async with self._conn.execute(sql, tuple(args)) as cur:
             return list(await cur.fetchall())
 
+    async def _exec(self, sql: str, args: Iterable[object] = ()) -> None:
+        """Run a statement and close its cursor at once.
+
+        A cursor left open keeps its statement active, which makes the
+        shutdown checkpoint fail with "database table is locked".
+        """
+        cur = await self._conn.execute(sql, tuple(args))
+        await cur.close()
+
+    async def _exec_many(self, sql: str, rows: list[tuple[object, ...]]) -> None:
+        cur = await self._conn.executemany(sql, rows)
+        await cur.close()
+
     async def _begin(self) -> None:
-        await self._conn.execute("BEGIN IMMEDIATE")
+        await self._exec("BEGIN IMMEDIATE")
 
     async def _commit(self) -> None:
-        await self._conn.execute("COMMIT")
+        await self._exec("COMMIT")
 
     async def _rollback(self) -> None:
-        await self._conn.execute("ROLLBACK")
+        await self._exec("ROLLBACK")
 
     async def _get_link(self, epc: str) -> Link | None:
         row = await self._one(f"SELECT {_LINK_COLS} FROM links WHERE epc = ?", (epc,))
@@ -330,7 +354,7 @@ class Store:
         async with self._lock:
             await self._begin()
             try:
-                await self._conn.execute(
+                await self._exec(
                     "INSERT INTO presence (epc, state, cycle, first_seen, last_seen) "
                     "VALUES (?, 'present', 1, ?, ?) ON CONFLICT(epc) DO UPDATE SET "
                     "state = 'present', cycle = cycle + 1, last_seen = excluded.last_seen",
@@ -343,7 +367,7 @@ class Store:
                 link = await self._get_link(epc)
                 op_id: int | None = None
                 if link is None:
-                    await self._conn.execute(
+                    await self._exec(
                         "INSERT INTO unlinked (epc, first_seen, last_seen) "
                         "VALUES (?, ?, ?) ON CONFLICT(epc) DO UPDATE SET "
                         "last_seen = excluded.last_seen, arrivals = arrivals + 1",
@@ -375,7 +399,7 @@ class Store:
                     "SELECT cycle FROM presence WHERE epc = ?", (epc,)
                 )
                 cycle = 0 if row is None else int(row["cycle"])
-                await self._conn.execute(
+                await self._exec(
                     "UPDATE presence SET state = 'departed' WHERE epc = ?", (epc,)
                 )
                 link = await self._get_link(epc)
@@ -441,7 +465,7 @@ class Store:
         return op_id
 
     async def _write_link(self, link: Link) -> None:
-        await self._conn.execute(
+        await self._exec(
             f"INSERT OR REPLACE INTO links ({_LINK_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 link.epc,
@@ -454,7 +478,7 @@ class Store:
                 link.station,
             ),
         )
-        await self._conn.execute("DELETE FROM unlinked WHERE epc = ?", (link.epc,))
+        await self._exec("DELETE FROM unlinked WHERE epc = ?", (link.epc,))
 
     async def _add_for_present(
         self, link: Link, location_id: int, best_before: str | None
@@ -528,11 +552,11 @@ class Store:
         async with self._lock:
             await self._begin()
             try:
-                await self._conn.executemany(
+                await self._exec_many(
                     "UPDATE presence SET last_seen = MAX(last_seen, ?) WHERE epc = ?",
                     [(ts, epc) for epc, ts in last_seen.items()],
                 )
-                await self._conn.executemany(
+                await self._exec_many(
                     "UPDATE unlinked SET last_seen = MAX(last_seen, ?) WHERE epc = ?",
                     [(ts, epc) for epc, ts in last_seen.items()],
                 )
@@ -574,7 +598,7 @@ class Store:
     async def mark_sending(self, op_id: int) -> None:
         """Record that a request for ``op_id`` is about to be sent."""
         async with self._lock:
-            await self._conn.execute(
+            await self._exec(
                 "UPDATE ops SET attempts = attempts + 1, maybe_sent = 1 WHERE id = ?",
                 (op_id,),
             )
@@ -582,7 +606,7 @@ class Store:
     async def mark_retry(self, op_id: int, error: str, *, maybe_sent: bool) -> None:
         """Record a transient failure."""
         async with self._lock:
-            await self._conn.execute(
+            await self._exec(
                 "UPDATE ops SET last_error = ?, maybe_sent = ? WHERE id = ?",
                 (error[:500], int(maybe_sent), op_id),
             )
@@ -592,7 +616,7 @@ class Store:
     ) -> None:
         """Record success."""
         async with self._lock:
-            await self._conn.execute(
+            await self._exec(
                 "UPDATE ops SET status = 'done', done_at = ?, maybe_sent = 0, "
                 "last_error = NULL, stock_entry_id = COALESCE(?, stock_entry_id) "
                 "WHERE id = ?",
@@ -602,7 +626,7 @@ class Store:
     async def mark_failed(self, op_id: int, error: str, now: float) -> None:
         """Record a permanent failure (kept for the UI; never silently dropped)."""
         async with self._lock:
-            await self._conn.execute(
+            await self._exec(
                 "UPDATE ops SET status = 'failed', last_error = ?, done_at = ? "
                 "WHERE id = ?",
                 (error[:500], now, op_id),
@@ -626,10 +650,33 @@ class Store:
             rows = await self._all(
                 "SELECT status, COUNT(*) AS n FROM ops GROUP BY status"
             )
+            verifying = await self._one(
+                "SELECT COUNT(*) AS n FROM ops WHERE verify_at IS NOT NULL"
+            )
         out = {"pending": 0, "done": 0, "failed": 0}
         for r in rows:
             out[r["status"]] = int(r["n"])
+        out["verifying"] = int(verifying["n"]) if verifying is not None else 0
         return out
+
+    async def schedule_verify(self, op_id: int, at: float) -> None:
+        """Re-check Grocy for late duplicates of an ambiguous add at ``at``."""
+        async with self._lock:
+            await self._exec("UPDATE ops SET verify_at = ? WHERE id = ?", (at, op_id))
+
+    async def next_verify(self) -> tuple[Op, float] | None:
+        """Return the op whose duplicate check is due first, and its due time."""
+        async with self._lock:
+            row = await self._one(
+                f"SELECT {_OP_COLS}, verify_at FROM ops "
+                "WHERE verify_at IS NOT NULL ORDER BY verify_at LIMIT 1"
+            )
+        return None if row is None else (_op(row), float(row["verify_at"]))
+
+    async def clear_verify(self, op_id: int) -> None:
+        """Mark the duplicate check of ``op_id`` as finished."""
+        async with self._lock:
+            await self._exec("UPDATE ops SET verify_at = NULL WHERE id = ?", (op_id,))
 
     async def stocked_epcs(self) -> dict[int, list[str]]:
         """Per product: EPCs whose current arrival was added and not consumed."""
@@ -669,7 +716,7 @@ class Store:
     async def add_needs_product(self, barcode: str, station: str, now: float) -> None:
         """Remember a barcode Grocy does not know."""
         async with self._lock:
-            await self._conn.execute(
+            await self._exec(
                 "INSERT INTO needs_product (barcode, station, first_seen, last_seen) "
                 "VALUES (?, ?, ?, ?) ON CONFLICT(barcode) DO UPDATE SET "
                 "last_seen = excluded.last_seen, scans = scans + 1, "

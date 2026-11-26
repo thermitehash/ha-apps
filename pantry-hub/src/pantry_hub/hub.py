@@ -275,14 +275,20 @@ class Hub:
     async def _event_loop(self) -> None:
         while True:
             event = await self._events.get()
-            if event is None:
-                if self._events.empty():
-                    return
-                continue
             try:
+                if event is None:
+                    if self._events.empty():
+                        return
+                    continue
                 await self._handle_event(event)
             except Exception:
-                _LOGGER.exception("Error handling %s of %s", event.kind, event.epc)
+                _LOGGER.exception("Error handling %s", event)
+            finally:
+                self._events.task_done()
+
+    async def drain_events(self) -> None:
+        """Wait until every queued arrival/departure has been fully handled."""
+        await self._events.join()
 
     async def _handle_event(self, event: PresenceEvent) -> None:
         now = self.wall()

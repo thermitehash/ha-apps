@@ -21,11 +21,14 @@ class MemoryBackend:
     barcodes: dict[str, int] = field(default_factory=dict)
     lookup: dict[str, Product] = field(default_factory=dict)
     stock: list[StockEntry] = field(default_factory=list)
-    # Each fault: "down" (not sent), "lost" (applied, answer lost), "reject", "auth"
+    # Each fault: "down" (not sent), "lost" (applied, answer lost), "reject",
+    # "auth", "late" (add times out unapplied, then lands two calls later)
     faults: deque[str] = field(default_factory=deque)
     log: list[tuple[str, int, str | None]] = field(default_factory=list)
     notes: dict[str, str] = field(default_factory=dict)
     _ids: itertools.count[int] = field(default_factory=lambda: itertools.count(1))
+    _late: list[list[object]] = field(default_factory=list)
+    calls: int = 0
 
     def add_product(
         self, pid: int, name: str, barcode: str | None = None, days: int | None = None
@@ -37,7 +40,22 @@ class MemoryBackend:
         return p
 
     def _fault(self) -> str | None:
+        self.calls += 1
+        # Deliver late adds whose countdown ran out (Grocy finishing a request
+        # the client already gave up on).
+        for item in list(self._late):
+            item[0] = int(item[0]) - 1  # type: ignore[call-overload]
+            if int(item[0]) <= 0:  # type: ignore[call-overload]
+                self._late.remove(item)
+                self._apply_add(int(item[1]), int(item[2]), str(item[3]))  # type: ignore[call-overload]
         return self.faults.popleft() if self.faults else None
+
+    def _apply_add(self, product_id: int, location_id: int, note: str) -> str:
+        sid = f"s{next(self._ids)}"
+        self.stock.append(StockEntry(sid, product_id, 1.0, location_id, note))
+        self.log.append(("add", product_id, sid))
+        self.notes[sid] = note
+        return sid
 
     def _pre(self, fault: str | None) -> None:
         if fault == "down":
@@ -71,10 +89,10 @@ class MemoryBackend:
     ) -> str | None:
         fault = self._fault()
         self._pre(fault)
-        sid = f"s{next(self._ids)}"
-        self.stock.append(StockEntry(sid, product_id, 1.0, location_id, note))
-        self.log.append(("add", product_id, sid))
-        self.notes[sid] = note
+        if fault == "late":
+            self._late.append([2, product_id, location_id, note])
+            raise GrocyUnavailable("timed out", maybe_applied=True)
+        sid = self._apply_add(product_id, location_id, note)
         if fault == "lost":
             raise GrocyUnavailable("timed out", maybe_applied=True)
         return sid

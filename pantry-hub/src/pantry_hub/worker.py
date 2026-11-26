@@ -11,6 +11,11 @@ Rules:
   - consume: is the unit (``stock_entry_id``) gone?
   Only if not is the request sent again. This is what makes an arrival add
   at most one unit even across timeouts and restarts.
+* A pre-retry check cannot see a request Grocy is *still* processing: a
+  timed-out add can land after its retry. So every add that may have been
+  sent more than once gets a delayed duplicate check (``verify_after``,
+  persisted): stock entries carrying the same op marker beyond the one the
+  hub tracks are consumed again, by stock entry id, and logged.
 * Grocy rejecting a request (4xx) marks the op ``failed``. Failed ops stay in
   the journal, are counted in ``sensor.pantry_hub_grocy_queue`` and are
   shown in the web UI with a retry button. Nothing is dropped silently.
@@ -75,6 +80,8 @@ class GrocyWorker:
         rng: random.Random | None = None,
         on_change: Callable[[], None] | None = None,
         on_done: Callable[[Op], Awaitable[None]] | None = None,
+        verify_after: float = 60.0,
+        verify_clock: Callable[[], float] = time.time,
     ) -> None:
         """Create; call :meth:`start`."""
         self.store = store
@@ -84,6 +91,10 @@ class GrocyWorker:
         self.rng = rng or random.Random()
         self.on_change = on_change
         self.on_done = on_done
+        self.verify_after = verify_after
+        self.verify_clock = verify_clock
+        #: Late duplicate adds found and consumed again.
+        self.duplicates_removed = 0
         #: None = no request made yet; True = last request answered.
         self.grocy_ok: bool | None = None
         self.last_error: str | None = None
@@ -147,9 +158,14 @@ class GrocyWorker:
         seconds to wait: a backoff delay after a failure, or a long idle wait
         when the queue is empty (new ops call :meth:`wake`).
         """
+        due = await self.store.next_verify()
+        if due is not None and due[1] <= self.verify_clock():
+            return await self._verify(due[0])
         op = await self.store.next_pending()
         if op is None:
-            return 3600.0
+            if due is None:
+                return 3600.0
+            return max(0.05, due[1] - self.verify_clock())
         ambiguous = op.maybe_sent
         self._in_flight = True
         try:
@@ -223,9 +239,44 @@ class GrocyWorker:
         if self.on_change is not None:
             self.on_change()
 
+    async def _verify(self, op: Op) -> float | None:
+        """Consume late duplicates of an ambiguous add (same op marker)."""
+        note = op_note(op)
+        try:
+            entries = await self.backend.entries(op.product_id)
+            mine = [e for e in entries if e.note == note]
+            keep = op.stock_entry_id
+            if keep is None and mine:
+                keep = mine[0].stock_id
+            for extra in (e for e in mine if e.stock_id != keep):
+                await self.backend.consume(
+                    op.product_id,
+                    stock_entry_id=extra.stock_id,
+                    location_id=op.location_id,
+                )
+                self.duplicates_removed += 1
+                _LOGGER.warning(
+                    "Grocy applied a timed-out add for op %d late; consumed the "
+                    "duplicate stock entry %s",
+                    op.id,
+                    extra.stock_id,
+                )
+        except GrocyError as err:
+            delay = self.backoff.next_delay(self.rng)
+            _LOGGER.warning("Duplicate check for op %d failed: %s", op.id, err)
+            await self.store.schedule_verify(op.id, self.verify_clock() + delay)
+            return delay
+        await self.store.clear_verify(op.id)
+        self._changed()
+        return None
+
     async def _do_add(self, op: Op, ambiguous: bool) -> bool:
         note = op_note(op)
         if ambiguous:
+            # An earlier attempt may still land in Grocy after this one.
+            await self.store.schedule_verify(
+                op.id, self.verify_clock() + self.verify_after
+            )
             for entry in await self.backend.entries(op.product_id):
                 if entry.note == note:
                     _LOGGER.info(

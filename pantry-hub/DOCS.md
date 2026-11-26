@@ -88,7 +88,10 @@ unknown ──read──▶ arriving ──3 reads in 10 s──▶ present ◀�
 Every Grocy change goes through a journal in `/data/pantry_hub.db`. If
 Grocy is down, changes queue up (`sensor.pantry_hub_grocy_queue`) and replay
 in order. A request that may have reached Grocy before failing is checked
-before it's sent again, so an arrival is never added twice. If Grocy rejects
+before it's sent again. Because Grocy can still finish a request after
+Pantry Hub gave up waiting, such adds get a second check a minute later:
+any duplicate unit carrying the same marker is consumed again (and logged).
+An arrival never leaves more than one unit in Grocy. If Grocy rejects
 a change (for example, the unit was already consumed by hand), it's marked
 failed and listed in the web UI with a **Retry** button. Nothing is dropped
 silently.

@@ -259,8 +259,7 @@ async def test_restart_mid_arrival_and_grace_window(
         rig.send(EPC_B)  # one read only: still arriving
         await rig.read_until_state(EPC_B, "arriving")
         grocy.down = True  # A's add is journaled but not yet in Grocy
-        await eventually(lambda: rig.h._events.empty())
-        await asyncio.sleep(0.1)
+        await rig.h.drain_events()
         await rig.stop()
         grocy.down = False
 

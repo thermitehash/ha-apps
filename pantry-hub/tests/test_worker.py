@@ -165,7 +165,7 @@ async def test_rejected_op_fails_without_blocking_queue(store: Store) -> None:
     w = worker_for(store, backend)
     await drain(w)
     counts = await store.counts()
-    assert counts == {"pending": 0, "done": 1, "failed": 1}
+    assert counts == {"pending": 0, "done": 1, "failed": 1, "verifying": 0}
     failed = await store.ops("failed")
     assert failed[0].epc == "AAAA" and "rejected" in (failed[0].last_error or "")
     # Departure of the failed add does not journal a consume.
@@ -231,3 +231,62 @@ async def test_worker_task_runs_and_stops(store: Store) -> None:
     await eventually(lambda: len(backend.stock) == 1)
     await w.stop()
     await w.stop()  # idempotent
+
+
+async def test_close_after_writes_and_checkpoint_failure(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Regression: unclosed write cursors made close() fail ("table is locked")
+    and left aiosqlite's thread running, hanging shutdown."""
+    s = await Store.open(tmp_path / "c.db")
+    await link(s, "AAAA")
+    await s.apply_arrival("AAAA", T0, 1)
+    await s.touch({"AAAA": T0 + 1})
+    op = await s.next_pending()
+    assert op is not None
+    await s.mark_sending(op.id)
+    await s.mark_retry(op.id, "x", maybe_sent=True)
+    await s.schedule_verify(op.id, T0)
+    await s.mark_done(op.id, T0, "s1")
+    await s.close()  # must checkpoint cleanly
+    s2 = await Store.open(tmp_path / "c.db")
+    assert (await s2.counts())["done"] == 1
+    await s2._conn.execute("SELECT 1")  # leave a cursor open on purpose
+    held = await s2._conn.execute("SELECT * FROM ops")
+    await held.fetchone()
+    await s2.close()  # still closes even if the checkpoint is refused
+
+
+async def test_verify_removes_late_duplicates(store: Store) -> None:
+    backend = MemoryBackend()
+    backend.add_product(1, "Beans")
+    await link(store, "AAAA")
+    r = await store.apply_arrival("AAAA", T0, 1)
+    now = [0.0]
+    w = GrocyWorker(
+        store,
+        backend,
+        clock=lambda: T0,
+        rng=random.Random(1),
+        verify_after=10,
+        verify_clock=lambda: now[0],
+    )
+    backend.faults.append("lost")
+    await w.process_one()  # applied, answer lost → ambiguous
+    await w.process_one()  # check finds it → done, verify scheduled
+    op = await store.get_op(r.add_op_id or 0)
+    assert op is not None and op.status == "done"
+    assert (await store.counts())["verifying"] == 1
+    # The timed-out first request lands late in Grocy: a duplicate entry.
+    from pantry_hub.grocy import StockEntry
+    from pantry_hub.worker import op_note
+
+    backend.stock.append(StockEntry("late", 1, 1.0, 1, op_note(op)))
+    assert 9 <= (await w.process_one() or 0) <= 10  # not due yet
+    now[0] = 11
+    backend.faults.append("down")
+    assert (await w.process_one() or 0) > 0  # check fails → rescheduled
+    now[0] = 400
+    assert await w.process_one() is None
+    assert [e.stock_id for e in backend.stock] == [op.stock_entry_id]
+    assert w.duplicates_removed == 1
+    assert (await store.counts())["verifying"] == 0
+    assert await w.process_one() == 3600.0

@@ -120,6 +120,7 @@ class Rig:
         )
         self.hub.worker.backoff.base = 0.01
         self.hub.worker.backoff.cap = 0.05
+        self.hub.worker.verify_after = 1.5  # > FakeGrocy.hang_s in fault tests
         if self.hub.mqtt is not None:
             self.hub.mqtt.min_backoff = 0.05
             self.hub.mqtt.max_backoff = 0.2
@@ -172,12 +173,14 @@ class Rig:
 
     async def idle(self) -> None:
         """Let queued events and the worker settle."""
-        await eventually(lambda: self.h._events.empty())
-        await asyncio.sleep(0.05)
+        # Regression: "queue empty" is not "handled": an event taken off the
+        # queue may still be committing, so wait for task_done() on all of them.
+        await asyncio.wait_for(self.h.drain_events(), 5)
         store = self.store
         assert store is not None
         await eventually(self._queue_empty)
 
     async def _queue_empty(self) -> bool:
         assert self.store is not None
-        return (await self.store.counts())["pending"] == 0
+        counts = await self.store.counts()
+        return counts["pending"] == 0 and counts["verifying"] == 0
