@@ -1,0 +1,62 @@
+---
+configuration:
+  reader_host:
+    name: Reader IP address
+    description: The Chainway UR4's IP address (static, on the IoT VLAN).
+  allowed_reader_ip:
+    name: Allowed reader IP
+    description: >-
+      Only accept UDP reads from this IP. Leave empty to use the reader IP
+      above.
+  reader_tcp_probe:
+    name: TCP probe
+    description: >-
+      Also ask the reader for its firmware version over TCP every minute, so
+      it shows online even when no tags are being read.
+  reader_offline_after_s:
+    name: Reader offline after (s)
+    description: Show the reader as offline after this long without a datagram.
+  grocy_url:
+    name: Grocy URL
+    description: >-
+      For the Grocy app use http://a0d7b954-grocy (enable the Grocy app's
+      port first; see the Documentation tab).
+  grocy_api_key:
+    name: Grocy API key
+    description: Grocy → Settings (wrench) → Manage API keys.
+  grocy_location_id:
+    name: Pantry location ID
+    description: The ID of the "Pantry" location in Grocy.
+  grocy_ui_url:
+    name: Grocy browser URL
+    description: >-
+      Optional. Base URL your browser uses for Grocy, for links in the web UI.
+  arrive_reads:
+    name: Reads to arrive
+    description: Reads needed within the arrival window before an item counts as arrived.
+  arrive_window_s:
+    name: Arrival window (s)
+    description: Window for the reads above.
+  depart_after_s:
+    name: Depart after (s)
+    description: Unseen this long means the item left the pantry.
+  depart_requires_door_closed:
+    name: Departures need a closed door
+    description: >-
+      Only count departures while the pantry door is closed (needs the door
+      topic below).
+  door_entity_topic:
+    name: Door contact MQTT topic
+    description: >-
+      MQTT topic of the pantry door contact (ON/OFF, open/closed, or
+      zigbee2mqtt JSON with "contact").
+  max_reader_power_dbm:
+    name: Max reader power (dBm)
+    description: >-
+      Ceiling for reader power. 27 dBm with 8.3 dBi antennas stays within
+      the FCC 36 dBm EIRP limit.
+  log_level:
+    name: Log level
+    description: How much to log.
+network:
+  8888/udp: UR4 auto-mode tag reads (UDP). The reader sends to this host port.

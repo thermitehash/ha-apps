@@ -1,0 +1,193 @@
+name: Build
+
+# Multi-arch images with the official Home Assistant builder actions, built
+# natively (amd64 on ubuntu-24.04, aarch64 on ubuntu-24.04-arm).
+# - Pull requests: build both, load them and smoke-test that each starts with
+#   a minimal options file and stops cleanly on SIGTERM. Nothing is pushed.
+# - Push to main / a pantry-hub-v* tag: same, then push
+#   ghcr.io/thermitehash/{arch}-pantry-hub and the multi-arch manifest
+#   ghcr.io/thermitehash/pantry-hub (config.yaml `image:`), and create the
+#   pantry-hub-v<version> tag. An existing version is never overwritten.
+
+on:
+  pull_request:
+    paths:
+      - "pantry-hub/**"
+      - "script/smoke_grocy.py"
+      - ".github/workflows/build.yml"
+  push:
+    branches: [main]
+    paths:
+      - "pantry-hub/**"
+      - ".github/workflows/build.yml"
+    tags:
+      - "pantry-hub-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP: pantry-hub
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.info.outputs.version }}
+      architectures: ${{ steps.info.outputs.architectures }}
+      image_name: ${{ steps.info.outputs.image_name }}
+      registry_prefix: ${{ steps.info.outputs.registry_prefix }}
+      publish: ${{ steps.info.outputs.publish }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read config.yaml
+        id: info
+        env:
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          version=$(yq -r '.version' "$APP/config.yaml")
+          image=$(yq -r '.image' "$APP/config.yaml")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "architectures=$(yq -o=json -I=0 '.arch' "$APP/config.yaml")" >> "$GITHUB_OUTPUT"
+          echo "image_name=${image##*/}" >> "$GITHUB_OUTPUT"
+          echo "registry_prefix=${image%/*}" >> "$GITHUB_OUTPUT"
+          publish=false
+          if [[ "$EVENT" == "push" && "$REF" == "refs/heads/main" ]]; then publish=true; fi
+          if [[ "$REF" == refs/tags/pantry-hub-v* ]]; then
+            if [[ "$REF" != "refs/tags/pantry-hub-v$version" ]]; then
+              echo "::error::Tag ${REF#refs/tags/} does not match config.yaml version $version"
+              exit 1
+            fi
+            publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Version $version, image $image, publish=$publish"
+      - name: Build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.09.0
+        with:
+          architectures: ${{ steps.info.outputs.architectures }}
+          image-name: ${{ steps.info.outputs.image_name }}
+          registry-prefix: ${{ steps.info.outputs.registry_prefix }}
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Build image (load for the smoke test)
+        uses: home-assistant/builder/actions/build-image@2026.09.0
+        with:
+          arch: ${{ matrix.arch }}
+          context: ./pantry-hub
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          labels: |
+            io.hass.type=app
+            io.hass.name=Pantry Hub
+            io.hass.version=${{ needs.prepare.outputs.version }}
+          version: ${{ needs.prepare.outputs.version }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          push: "false"
+          load: "true"
+          cosign: "false"
+
+      - name: Smoke test (starts with minimal options, stops on SIGTERM)
+        env:
+          IMAGE: ${{ matrix.image }}:${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/data"
+          cat > "$RUNNER_TEMP/data/options.json" <<'JSON'
+          {"reader_host": "127.0.0.1", "grocy_url": "http://127.0.0.1:18080",
+           "grocy_api_key": "smoke", "grocy_location_id": 1, "log_level": "info"}
+          JSON
+          printf 'listener 1883\nallow_anonymous true\n' > "$RUNNER_TEMP/mosquitto.conf"
+          docker run -d --name mqtt --network host \
+            -v "$RUNNER_TEMP/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" \
+            eclipse-mosquitto:2
+          python3 script/smoke_grocy.py 18080 &
+          docker run -d --name hub --network host -v "$RUNNER_TEMP/data:/data" \
+            -e PANTRY_HUB_MQTT_HOST=127.0.0.1 -e PANTRY_HUB_GROCY_WAIT=10 "$IMAGE"
+          for _ in $(seq 1 60); do
+            if docker logs hub 2>&1 | grep -q "Pantry Hub running"; then break; fi
+            sleep 1
+          done
+          docker logs hub
+          docker logs hub 2>&1 | grep -q "Pantry Hub running"
+          docker logs hub 2>&1 | grep -q "MQTT connected"
+          # A UR4-style datagram (garbage is fine: it must not crash).
+          printf '\xa5\x5a\x00\x08\x8c\x84\x0d\x0a' > /dev/udp/127.0.0.1/8888
+          sleep 1
+          docker stop -t 30 hub
+          docker logs hub 2>&1 | tail -20
+          docker logs hub 2>&1 | grep -q "Pantry Hub stopped"
+          test -s "$RUNNER_TEMP/data/pantry_hub.db"
+
+      - name: Push image
+        if: needs.prepare.outputs.publish == 'true'
+        uses: home-assistant/builder/actions/build-image@2026.09.0
+        with:
+          arch: ${{ matrix.arch }}
+          context: ./pantry-hub
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          labels: |
+            io.hass.type=app
+            io.hass.name=Pantry Hub
+            io.hass.version=${{ needs.prepare.outputs.version }}
+          version: ${{ needs.prepare.outputs.version }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          push: "true"
+          skip-existing: ${{ needs.prepare.outputs.version }}
+
+  manifest:
+    name: Publish multi-arch manifest
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.09.0
+        with:
+          architectures: ${{ needs.prepare.outputs.architectures }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ needs.prepare.outputs.image_name }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          registry-prefix: ${{ needs.prepare.outputs.registry_prefix }}
+          skip-existing: ${{ needs.prepare.outputs.version }}
+      - name: Tag the release
+        env:
+          TAG: pantry-hub-v${{ needs.prepare.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "$TAG exists"
+          else
+            git tag "$TAG" "$GITHUB_SHA"
+            git push origin "$TAG"
+          fi

@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/apps/repository
+name: thermitehash Home Assistant apps
+url: https://github.com/thermitehash/ha-apps
+maintainer: thermitehash
