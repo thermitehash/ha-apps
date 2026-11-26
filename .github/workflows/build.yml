@@ -126,19 +126,25 @@ jobs:
           python3 script/smoke_grocy.py 18080 &
           docker run -d --name hub --network host -v "$RUNNER_TEMP/data:/data" \
             -e PANTRY_HUB_MQTT_HOST=127.0.0.1 -e PANTRY_HUB_GROCY_WAIT=10 "$IMAGE"
+          # Read logs into a file before grepping: `docker logs | grep -q` under
+          # pipefail fails with SIGPIPE (exit 141) when grep exits early.
+          logs() { docker logs hub > "$RUNNER_TEMP/hub.log" 2>&1; }
           for _ in $(seq 1 60); do
-            if docker logs hub 2>&1 | grep -q "Pantry Hub running"; then break; fi
+            logs
+            if grep -q "Pantry Hub running" "$RUNNER_TEMP/hub.log"; then break; fi
             sleep 1
           done
-          docker logs hub
-          docker logs hub 2>&1 | grep -q "Pantry Hub running"
-          docker logs hub 2>&1 | grep -q "MQTT connected"
+          logs
+          cat "$RUNNER_TEMP/hub.log"
+          grep -q "Pantry Hub running" "$RUNNER_TEMP/hub.log"
+          grep -q "MQTT connected" "$RUNNER_TEMP/hub.log"
           # A UR4-style datagram (garbage is fine: it must not crash).
           printf '\xa5\x5a\x00\x08\x8c\x84\x0d\x0a' > /dev/udp/127.0.0.1/8888
           sleep 1
           docker stop -t 30 hub
-          docker logs hub 2>&1 | tail -20
-          docker logs hub 2>&1 | grep -q "Pantry Hub stopped"
+          logs
+          tail -20 "$RUNNER_TEMP/hub.log"
+          grep -q "Pantry Hub stopped" "$RUNNER_TEMP/hub.log"
           test -s "$RUNNER_TEMP/data/pantry_hub.db"
 
       - name: Push image
