@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.coverage
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+*.db
+*.db-wal
+*.db-shm
+secrets.yaml
+.esphome/
+.DS_Store

@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Start Pantry Hub. Options, MQTT credentials (Supervisor service API) and
+# validation are handled in Python; see DOCS.md.
+# ==============================================================================
+bashio::log.info "Starting Pantry Hub"
+exec python3 -m pantry_hub

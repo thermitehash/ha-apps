@@ -1,0 +1,90 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Ruff + mypy (Pantry Hub)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pantry-hub
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pantry-hub/pyproject.toml
+      - run: pip install -e ".[dev]"
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: mypy --strict
+
+  app-linter:
+    name: HA app linter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: frenck/action-addon-linter@v2.21
+        with:
+          path: "./pantry-hub"
+
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install yamllint==1.38.0
+      - run: yamllint --strict .
+
+  esphome:
+    name: ESPHome linking station
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: esphome/linking-station
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Host unit tests (JRD-4035 protocol, link mode / in-stock session)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -Icomponents/jrd4035 \
+            tests/test_jrd4035_protocol.cpp -o /tmp/jrd4035_tests
+          /tmp/jrd4035_tests
+          g++ -std=c++17 -Wall -Wextra -Werror -Iinclude \
+            tests/test_link_mode.cpp -o /tmp/link_mode_tests
+          /tmp/link_mode_tests
+      - run: pip install esphome==2026.11.1
+      - name: Validate config (esphome config)
+        run: |
+          sed "s|PASTE-YOUR-GENERATED-KEY-HERE|$(openssl rand -base64 32)|" \
+            secrets.yaml.example > secrets.yaml
+          esphome config kroger-scanner.yaml > /dev/null
+      - name: Compile firmware
+        run: esphome compile kroger-scanner.yaml
+
+  version:
+    name: Version bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: python script/check_version_bump.py "origin/${{ github.base_ref }}"
