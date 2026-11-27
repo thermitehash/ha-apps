@@ -1,0 +1,56 @@
+/*
+ * Shared design tokens for thermitehash Home Assistant apps.
+ *
+ * KEEP IN SYNC with thermitehash/ha-laundry-hub (frontend/tokens.css, from
+ * v0.2). When this file was written that copy wasn't merged yet, so this one
+ * was created from the agreed values; whichever lands second must match the
+ * first. App palettes (Pantry: --ph-*, Laundry: its own prefix) live in each
+ * app's own stylesheet, not here.
+ *
+ * Ingress pages don't get Home Assistant's theme variables, so dark mode
+ * follows prefers-color-scheme with the same hues, lightened ~15%.
+ */
+:root {
+  --font: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --fs-sm: 13px;
+  --fs-md: 16px;
+  --fs-lg: 20px;
+  --fs-xl: 28px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --r-sm: 12px;
+  --r-md: 16px;
+  --r-pill: 999px;
+  --ink: #1c1b19;
+  --muted: #5c5953;
+  --card: #ffffff;
+  --ok: #2e7d4f;
+  --warn: #9a6412;
+  --problem: #b3261e;
+  --problem-bg: #fbe9e7;
+  --problem-ink: #8c1d18;
+  --warn-bg: #fbf0dc;
+  --ok-bg: #e6f2ea;
+  --focus: #1a5fb4;
+  --tap: 44px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #f1eee9;
+    --muted: #bbb5ab;
+    --card: #26221e;
+    --ok: #57a877;
+    --warn: #d19a44;
+    --problem: #ec6b62;
+    --problem-bg: #3b1f1c;
+    --problem-ink: #f6b8b2;
+    --warn-bg: #3a2d17;
+    --ok-bg: #1e3326;
+    --focus: #8ab4f8;
+  }
+}

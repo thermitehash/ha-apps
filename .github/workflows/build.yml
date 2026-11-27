@@ -126,7 +126,8 @@ jobs:
             eclipse-mosquitto:2
           python3 script/smoke_grocy.py 18080 &
           docker run -d --name hub --network host -v "$RUNNER_TEMP/data:/data" \
-            -e PANTRY_HUB_MQTT_HOST=127.0.0.1 -e PANTRY_HUB_GROCY_WAIT=10 "$IMAGE"
+            -e PANTRY_HUB_MQTT_HOST=127.0.0.1 -e PANTRY_HUB_GROCY_WAIT=10 \
+            -e PANTRY_HUB_WEB_ALLOW=127.0.0.1 "$IMAGE"
           # Read logs into a file before grepping: `docker logs | grep -q` under
           # pipefail fails with SIGPIPE (exit 141) when grep exits early.
           logs() { docker logs hub > "$RUNNER_TEMP/hub.log" 2>&1; }
@@ -139,6 +140,18 @@ jobs:
           cat "$RUNNER_TEMP/hub.log"
           grep -q "Pantry Hub running" "$RUNNER_TEMP/hub.log"
           grep -q "MQTT connected" "$RUNNER_TEMP/hub.log"
+          # The web UI from the image: shell under an ingress prefix, static
+          # assets (packaged in the wheel), and no-store state.
+          curl -fsS -H 'X-Ingress-Path: /api/hassio_ingress/smoke' \
+            http://127.0.0.1:8099/ -o "$RUNNER_TEMP/shell.html"
+          grep -q '/api/hassio_ingress/smoke/static/app.js' "$RUNNER_TEMP/shell.html"
+          curl -fsS http://127.0.0.1:8099/static/app.js -o "$RUNNER_TEMP/app.js"
+          grep -q 'import' "$RUNNER_TEMP/app.js"
+          curl -fsS -D "$RUNNER_TEMP/state.headers" http://127.0.0.1:8099/api/state \
+            -o "$RUNNER_TEMP/state.json"
+          grep -qi '^cache-control: no-store' "$RUNNER_TEMP/state.headers"
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert 'health' in d" \
+            "$RUNNER_TEMP/state.json"
           # A UR4-style datagram (garbage is fine: it must not crash).
           printf '\xa5\x5a\x00\x08\x8c\x84\x0d\x0a' > /dev/udp/127.0.0.1/8888
           sleep 1

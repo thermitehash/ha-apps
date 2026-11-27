@@ -24,6 +24,8 @@ class FakeProduct:
     name: str
     barcodes: list[str] = field(default_factory=list)
     default_best_before_days: int = 0
+    #: PNG bytes served as the product picture (None: no picture).
+    picture: bytes | None = None
 
 
 @dataclass
@@ -90,6 +92,7 @@ class FakeGrocy:
         r.add_get("/api/stock/barcodes/external-lookup/{barcode}", self.external)
         r.add_get("/api/stock/products/{id}", self.product)
         r.add_get("/api/stock/products/{id}/entries", self.product_entries)
+        r.add_get("/api/files/productpictures/{name}", self.picture)
         r.add_post("/api/stock/products/{id}/add", self.add)
         r.add_post("/api/stock/products/{id}/consume", self.consume)
         self._runner = web.AppRunner(app, access_log=None)
@@ -149,6 +152,7 @@ class FakeGrocy:
             "id": p.id,
             "name": p.name,
             "default_best_before_days": p.default_best_before_days,
+            "picture_file_name": f"product-{p.id}.png" if p.picture else None,
         }
 
     # Handlers --------------------------------------------------------------
@@ -186,6 +190,16 @@ class FakeGrocy:
         return web.json_response(
             {"product": self._pjson(p), "stock_amount": self.amount(p.id)}
         )
+
+    async def picture(self, request: web.Request) -> web.Response:
+        import base64
+
+        name = base64.b64decode(request.match_info["name"]).decode()
+        for p in self.products.values():
+            if p.picture is not None and name == f"product-{p.id}.png":
+                assert request.query.get("force_serve_as") == "picture"
+                return web.Response(body=p.picture, content_type="image/png")
+        return web.Response(status=404)
 
     async def product_entries(self, request: web.Request) -> web.Response:
         p = self._pid(request)

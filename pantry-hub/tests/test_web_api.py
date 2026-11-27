@@ -90,6 +90,7 @@ TOP_KEYS = {
     "failed_ops",
     "needs_product",
     "events",
+    "resync",
     "options",
     "diagnostics",
 }

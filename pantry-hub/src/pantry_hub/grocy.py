@@ -14,6 +14,7 @@ Endpoints used (checked against Grocy v4.7.1's ``grocy.openapi.json``):
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 import logging
 from typing import Any, Protocol
@@ -275,6 +276,42 @@ class GrocyClient:
         if not isinstance(body, dict):
             raise GrocyError(f"unexpected product details payload: {body!r}")
         return self._product(body.get("product"))
+
+    async def product_picture(
+        self, product_id: int, size: int = 128
+    ) -> tuple[bytes, str] | None:
+        """Return ``(image bytes, content type)`` of the product's picture, or None.
+
+        Grocy serves pictures from ``/files/productpictures/<base64 name>``;
+        ``best_fit_*`` asks it for a thumbnail.
+        """
+        body = await self._request("GET", f"/stock/products/{product_id}")
+        product = body.get("product") if isinstance(body, dict) else None
+        name = product.get("picture_file_name") if isinstance(product, dict) else None
+        if not isinstance(name, str) or not name:
+            return None
+        encoded = base64.b64encode(name.encode()).decode()
+        url = f"{self.base}/files/productpictures/{encoded}"
+        params = {
+            "force_serve_as": "picture",
+            "best_fit_width": str(size),
+            "best_fit_height": str(size),
+        }
+        headers = {"GROCY-API-KEY": self._api_key}
+        try:
+            async with self._get_session().get(
+                url, params=params, headers=headers, timeout=self._timeout
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                ctype = resp.content_type or "application/octet-stream"
+                if not ctype.startswith("image/"):
+                    return None
+                return await resp.read(), ctype
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise GrocyUnavailable(
+                f"Grocy picture for product {product_id}: {err!r}", maybe_applied=False
+            ) from err
 
     # Stock ---------------------------------------------------------------------
 

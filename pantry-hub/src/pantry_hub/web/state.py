@@ -214,6 +214,7 @@ async def build_state(hub: Hub) -> dict[str, Any]:
         },
         "door": {
             "entity_id": hub.door_entity,
+            "web_entity_id": hub.door_entity_web,
             "source": hub.door_entity_source,
             "state": hub.machine.door.value,
             "raw": source.raw_state if source else None,
@@ -286,6 +287,7 @@ async def build_state(hub: Hub) -> dict[str, Any]:
             for n in needs
         ],
         "events": list(reversed(hub.recent_events)),
+        "resync": _resync(hub),
         "options": {
             "reading_mode": opts.reading_mode,
             "reader_antennas": list(opts.reader_antennas),
@@ -297,6 +299,19 @@ async def build_state(hub: Hub) -> dict[str, Any]:
     }
     state["health"] = health_for(state)
     return state
+
+
+def _resync(hub: Hub) -> dict[str, Any] | None:
+    report = hub.last_resync
+    if report is None:
+        return None
+    return {
+        "checked_at": report.checked_at,
+        "checked": report.checked,
+        "differences": report.differences,
+        "error": report.error,
+        "review_ops": report.review_ops,
+    }
 
 
 def _diagnostics(hub: Hub, s: dict[str, Any], door_mode: bool) -> list[list[str]]:
