@@ -352,6 +352,7 @@ class Hub:
         if self.planner is None or self.activity is Activity.SWEEP:
             return False
         self.planner.request_sweep()
+        _LOGGER.info("Sweep requested (reader is %s)", self.activity.value)
         if self.activity is Activity.CONTINUOUS:
             self._abort_window()  # sweep now; continuous resumes afterwards
         self._wake.set()
@@ -359,6 +360,7 @@ class Hub:
 
     def _abort_window(self) -> None:
         if self._window is not None and not self._window.done():
+            _LOGGER.info("Aborting the current %s window", self.activity.value)
             self._window.cancel()
 
     def _set_activity(self, activity: Activity) -> None:

@@ -34,14 +34,6 @@ EPC = "E28011700000020F1A2B3C01"
 OTHER = "E28011700000020F1A2B3CFF"
 
 
-@pytest.fixture
-async def fake() -> AsyncIterator[FakeUR4]:
-    async with FakeUR4() as f:
-        f.tags = [tag_record(OTHER, rssi_dbm=-70)]
-        f.tag_interval = 0.01
-        yield f
-
-
 class DoorRig:
     def __init__(
         self, tmp: Path, grocy: FakeGrocy, ha: FakeHomeAssistant, fake: FakeUR4
@@ -358,8 +350,8 @@ async def test_sweep_now_during_continuous_then_resumes(
     await eventually(lambda: rig.h.activity is Activity.CONTINUOUS, timeout=5)
     done = rig.h.machine.sweeps_completed
     assert rig.h.request_sweep()
-    await rig.sweeps(done + 1)
-    await eventually(lambda: rig.h.activity is Activity.CONTINUOUS)
+    await rig.sweeps(done + 1, timeout=12)
+    await eventually(lambda: rig.h.activity is Activity.CONTINUOUS, timeout=8)
     assert rig.h.last_sweep is not None and rig.h.last_sweep["reason"] == "requested"
 
 

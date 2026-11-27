@@ -79,6 +79,8 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
+# Failures print the hub's INFO timeline (sweeps, aborts, door changes).
+log_level = "INFO"
 filterwarnings = [
     "error::pytest.PytestUnraisableExceptionWarning",
     "error::RuntimeWarning",

@@ -10,6 +10,7 @@ from pathlib import Path
 import socket
 from typing import Any
 
+from aiochainway.testing import FakeUR4, tag_record
 from amqtt.broker import Broker
 from hypothesis import settings
 import pytest
@@ -93,6 +94,15 @@ async def store(tmp_path: Path) -> AsyncIterator[Store]:
     s = await Store.open(tmp_path / "test.db")
     yield s
     await s.close()
+
+
+@pytest.fixture
+async def fake() -> AsyncIterator[FakeUR4]:
+    """aiochainway's own fake UR4 (TCP command port), reading one tag."""
+    async with FakeUR4() as f:
+        f.tags = [tag_record("E28011700000020F1A2B3CFF", rssi_dbm=-70)]
+        f.tag_interval = 0.01
+        yield f
 
 
 @pytest.fixture
