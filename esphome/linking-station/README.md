@@ -55,6 +55,18 @@ the U107. Logs go over USB-CDC (`hardware_uart: USB_SERIAL_JTAG`).
 Leaving link mode (by double-click or after 60 s idle) shows one short cyan
 flash, then the LED goes off.
 
+### Counted session (Pantry Hub "Just bought")
+
+Firmware 0.3.0+. When you tap **Tag them** on a Kroger delivery in Pantry
+Hub, the hub publishes `pantry_hub/linking/kroger_scanner/start`
+`{"barcode": "...", "count": 3}`. The station enters link mode (same dim
+**blue** pulse) and starts the U107 without a barcode scan. Tap one tag at a
+time: each result flashes as usual (green linked, magenta already linked and
+skipped), then after 1.5 s the station scans for the next tag. It stops when
+the hub's result says `remaining: 0`, on a timeout or error (red), when you
+scan a barcode (a normal link replaces it), or when link mode ends. The hub
+ends the session 60 s after the last tag.
+
 ### In-stock session (mode card)
 
 For tagging stock Grocy already counts. Print

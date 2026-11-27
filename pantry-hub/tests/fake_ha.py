@@ -1,12 +1,15 @@
 """A small fake of Home Assistant's websocket API (what the door source uses).
 
 Implements auth, ``subscribe_entities`` (initial ``a`` event, ``c`` changes,
-``r`` removals) and records ``call_service`` messages.
+``r`` removals), ``subscribe_events`` and records ``call_service`` messages.
+The REST side serves ``GET /api/services`` and ``POST /api/services/<d>/<s>``
+with ``?return_response`` (handlers registered with :meth:`add_action`).
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 import contextlib
 from typing import Any
 
@@ -26,16 +29,28 @@ class FakeHomeAssistant:
         self._clients: list[tuple[web.WebSocketResponse, int, list[str]]] = []
         self._runner: web.AppRunner | None = None
         self.url = ""
+        self.rest_url = ""
+        #: (domain, service) → handler(data) → response (or raises web.HTTPException).
+        self.actions: dict[
+            tuple[str, str], Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+        ] = {}
+        #: Every REST action call: (domain, service, data).
+        self.rest_calls: list[tuple[str, str, dict[str, Any]]] = []
+        self._event_subs: list[tuple[web.WebSocketResponse, int, str]] = []
+        self.services_down = False
 
     async def start(self) -> None:
         app = web.Application()
         app.router.add_get("/api/websocket", self._ws)
+        app.router.add_get("/api/services", self._services)
+        app.router.add_post("/api/services/{domain}/{service}", self._call)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "127.0.0.1", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
         self.url = f"ws://127.0.0.1:{port}/api/websocket"
+        self.rest_url = f"http://127.0.0.1:{port}/api"
 
     async def stop(self) -> None:
         await self.drop()
@@ -45,9 +60,68 @@ class FakeHomeAssistant:
     async def drop(self) -> None:
         """Close every client connection (HA restart / network blip)."""
         clients, self._clients = self._clients, []
-        for ws, _, _ in clients:
+        subs, self._event_subs = self._event_subs, []
+        for ws in [c[0] for c in clients] + [e[0] for e in subs]:
             with contextlib.suppress(Exception):
                 await ws.close()
+
+    def add_action(
+        self,
+        domain: str,
+        service: str,
+        handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
+    ) -> None:
+        """Register an action answering ``?return_response``."""
+        self.actions[(domain, service)] = handler
+
+    def rest(self, domain: str, service: str) -> list[dict[str, Any]]:
+        return [d for dm, sv, d in self.rest_calls if (dm, sv) == (domain, service)]
+
+    def event_subscribers(self, event_type: str) -> int:
+        return sum(
+            1 for ws, _, t in self._event_subs if t == event_type and not ws.closed
+        )
+
+    async def fire_event(self, event_type: str, data: dict[str, Any]) -> None:
+        """Send an event to its subscribers."""
+        for ws, sub_id, etype in list(self._event_subs):
+            if etype == event_type and not ws.closed:
+                with contextlib.suppress(ConnectionError, RuntimeError):
+                    await ws.send_json(
+                        {
+                            "id": sub_id,
+                            "type": "event",
+                            "event": {"event_type": etype, "data": data},
+                        }
+                    )
+
+    def _authorized(self, request: web.Request) -> None:
+        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
+            raise web.HTTPUnauthorized()
+
+    async def _services(self, request: web.Request) -> web.Response:
+        self._authorized(request)
+        if self.services_down:
+            raise web.HTTPBadGateway()
+        domains: dict[str, dict[str, Any]] = {}
+        for domain, service in self.actions:
+            domains.setdefault(domain, {})[service] = {"fields": {}}
+        domains.setdefault("persistent_notification", {})["create"] = {}
+        return web.json_response(
+            [{"domain": d, "services": s} for d, s in domains.items()]
+        )
+
+    async def _call(self, request: web.Request) -> web.Response:
+        self._authorized(request)
+        domain, service = request.match_info["domain"], request.match_info["service"]
+        data = await request.json()
+        self.rest_calls.append((domain, service, data))
+        handler = self.actions.get((domain, service))
+        if handler is None:
+            raise web.HTTPBadRequest(text="Service not found")
+        assert "return_response" in request.query
+        response = await handler(data)
+        return web.json_response({"changed_states": [], "service_response": response})
 
     def calls(self, domain: str, service: str) -> list[dict[str, Any]]:
         return [d for dm, sv, d in self.services if dm == domain and sv == service]
@@ -101,6 +175,11 @@ class FakeHomeAssistant:
                 }
                 await ws.send_json(
                     {"id": data["id"], "type": "event", "event": {"a": added}}
+                )
+            elif data.get("type") == "subscribe_events":
+                self._event_subs.append((ws, data["id"], data["event_type"]))
+                await ws.send_json(
+                    {"id": data["id"], "type": "result", "success": True}
                 )
             elif data.get("type") == "get_states":
                 if self.fail_get_states:

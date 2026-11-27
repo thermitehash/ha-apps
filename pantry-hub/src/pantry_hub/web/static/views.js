@@ -172,6 +172,59 @@ export function attention(state) {
   return cards.join("");
 }
 
+/** 40 px product thumbnail; neutral icon when there's none. */
+export function pic(productId, state, ui) {
+  if (productId == null) return `<span class="pic ph">${icons.can}</span>`;
+  const v = (state.pictures && state.pictures.versions[String(productId)]) || 0;
+  if (ui.noPicture.has(`${productId}:${v}`)) return `<span class="pic ph">${icons.can}</span>`;
+  const src = ui.api.url(`/api/picture/${productId}?v=${v}`);
+  return `<img class="pic" src="${esc(src)}" alt="" loading="lazy" data-product="${productId}" data-v="${v}" width="40" height="40">`;
+}
+
+// Just bought (Kroger Restock) -----------------------------------------------------
+
+function boughtRow(r, state, ui) {
+  const size = r.size ? `<span class="sub">${esc(r.size)}</span>` : "";
+  const skipOpen = ui.skipOpen.has(String(r.id));
+  const skip = skipOpen
+    ? `<form class="inline-form" data-form="skip" data-epc="${r.id}">
+<label class="check"><input type="checkbox" name="add_stock" checked> Add to Grocy stock</label>
+<p class="sub">${r.to_tag === 1 ? "The untagged item is" : `The ${r.to_tag} untagged items are`} booked as a purchase. If you tag one within a week, it isn’t counted twice.</p>
+<div class="actions"><button class="btn primary" type="submit">Remove from list</button><button class="btn" type="button" data-action="skip-toggle" data-row="${r.id}">Cancel</button></div>
+</form>`
+    : "";
+  return `<li class="item stack${r.older ? " older" : ""}"><div class="row">${pic(r.product_id, state, ui)}<span class="grow"><span class="title">${esc(r.name)}</span>${size}</span><span class="tag-count">×${r.to_tag} of ${r.quantity} to tag</span></div>
+<div class="actions"><button class="btn primary" type="button" data-action="post" data-path="/bought/tag" data-row="${r.id}">Tag them</button><button class="btn" type="button" data-action="skip-toggle" data-row="${r.id}" aria-expanded="${skipOpen}">Not tagging</button></div>${skip}</li>`;
+}
+
+export function justBought(state, ui) {
+  const jb = state.just_bought;
+  if (!jb || !jb.available) return "";
+  const fresh = jb.rows.filter((r) => !r.older);
+  const older = jb.rows.filter((r) => r.older);
+  const s = jb.session;
+  const session = s
+    ? `<div class="session" role="status" aria-live="polite"><span class="title">Tap each ${esc(s.product)} on the station</span><span class="sub">${esc(s.text)}${s.skipped ? ` · ${plural(s.skipped, "tag")} skipped (already linked)` : ""}</span></div>`
+    : "";
+  if (!fresh.length && !older.length && !session) return "";
+  const head = `<div class="section-head"><h2>Just bought · ${plural(jb.to_tag, "item")} to tag</h2></div>`;
+  const list = fresh.length ? `<ul class="list" role="list">${fresh.map((r) => boughtRow(r, state, ui)).join("")}</ul>` : "";
+  const old = older.length
+    ? `<details class="older-group"${ui.olderOpen ? " open" : ""}><summary data-action="older-toggle">Older · ${older.length}</summary><ul class="list" role="list">${older.map((r) => boughtRow(r, state, ui)).join("")}</ul></details>`
+    : "";
+  return head + session + list + old;
+}
+
+export function picturesCard(state) {
+  const p = state.pictures;
+  if (!p.available) {
+    return `<p class="sub">Product pictures come from Kroger Restock, which isn’t installed (or its lookup action is missing).</p>`;
+  }
+  const progress = p.text ? `<p class="sub" role="status" aria-live="polite">${esc(p.text)}</p>` : "";
+  return `<p class="sub">Pictures are looked up by barcode in Kroger Restock and saved in Grocy. Products with a picture you chose are never changed.</p>${progress}
+<div class="actions"><button class="btn" type="button" data-action="post" data-path="/pictures/fetch" ${p.running ? "disabled" : ""}>${p.running ? "Fetching…" : "Fetch missing pictures"}</button></div>`;
+}
+
 export function pantryItems(state, ui) {
   const p = state.pantry;
   const count = p.linked_present
@@ -186,11 +239,9 @@ export function pantryItems(state, ui) {
   }
   const rows = p.items
     .map((item) => {
-      const pic = ui.noPicture.has(item.product_id)
-        ? `<span class="pic ph">${icons.can}</span>`
-        : `<img class="pic" src="${esc(ui.api.url(`/api/product-picture/${item.product_id}`))}" alt="" loading="lazy" data-product="${item.product_id}" width="40" height="40">`;
+      const thumb = pic(item.product_id, state, ui);
       const since = item.since != null ? `since ${day(item.since, state.now)}` : "";
-      return `<li class="item row">${pic}<span class="grow"><span class="title">${esc(item.name)}</span><span class="sub">${esc(since)}</span></span><span class="qty" aria-label="${item.quantity} in the pantry">${item.quantity}</span></li>`;
+      return `<li class="item row">${thumb}<span class="grow"><span class="title">${esc(item.name)}</span><span class="sub">${esc(since)}</span></span><span class="qty" aria-label="${item.quantity} in the pantry">${item.quantity}</span></li>`;
     })
     .join("");
   return `${head}<ul class="list" role="list">${rows}</ul>`;
@@ -251,7 +302,7 @@ export function linkedList(state, ui) {
 ${linkForm(l.epc, ui).replace("Link</button>", "Relink</button>")}
 </div>`
         : "";
-      return `<li class="item"><div class="row"><span class="grow"><span class="title">${esc(l.product_name)}${l.present ? ' <span class="sub">· in the pantry</span>' : ""}</span><span class="sub">${esc(shortEpc(l.epc))} · ${esc(seen)}</span></span><button class="btn icon-only" type="button" data-action="toggle-menu" data-epc="${esc(l.epc)}" aria-expanded="${open}" aria-label="More for ${esc(l.product_name)} (${esc(shortEpc(l.epc))})">${icons.more}</button></div>${menu}</li>`;
+      return `<li class="item"><div class="row">${pic(l.product_id, state, ui)}<span class="grow"><span class="title">${esc(l.product_name)}${l.present ? ' <span class="sub">· in the pantry</span>' : ""}</span><span class="sub">${esc(shortEpc(l.epc))} · ${esc(seen)}</span></span><button class="btn icon-only" type="button" data-action="toggle-menu" data-epc="${esc(l.epc)}" aria-expanded="${open}" aria-label="More for ${esc(l.product_name)} (${esc(shortEpc(l.epc))})">${icons.more}</button></div>${menu}</li>`;
     })
     .join("");
   return `<ul class="list" role="list">${rows}</ul>`;

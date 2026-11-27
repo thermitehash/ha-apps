@@ -277,6 +277,123 @@ class GrocyClient:
             raise GrocyError(f"unexpected product details payload: {body!r}")
         return self._product(body.get("product"))
 
+    async def product_object(self, product_id: int) -> dict[str, Any]:
+        """Return the raw product row (``name``, ``description``, ``picture_file_name``…)."""
+        body = await self._request("GET", f"/objects/products/{product_id}")
+        if not isinstance(body, dict):
+            raise GrocyError(f"unexpected product object payload: {body!r}")
+        return body
+
+    async def update_product(self, product_id: int, fields: dict[str, Any]) -> None:
+        """Change some fields of a product row."""
+        await self._request("PUT", f"/objects/products/{product_id}", json=fields)
+
+    async def upload_product_picture(self, filename: str, data: bytes) -> None:
+        """Store ``data`` as product picture file ``filename`` (overwrites it)."""
+        encoded = base64.b64encode(filename.encode()).decode()
+        url = f"{self.base}/files/productpictures/{encoded}"
+        headers = {
+            "GROCY-API-KEY": self._api_key,
+            "Content-Type": "application/octet-stream",
+        }
+        try:
+            async with self._get_session().put(
+                url, data=data, headers=headers, timeout=self._timeout
+            ) as resp:
+                self.reachable = True
+                if resp.status in (401, 403):
+                    raise GrocyAuthError(
+                        f"Grocy refused the API key (HTTP {resp.status})"
+                    )
+                if resp.status >= 400:
+                    raise GrocyRequestError(
+                        resp.status, f"picture upload failed: {await resp.text()}"[:200]
+                    )
+        except (aiohttp.ClientError, TimeoutError) as err:
+            self.reachable = False
+            raise GrocyUnavailable(
+                f"Grocy picture upload failed: {err!r}", maybe_applied=True
+            ) from err
+
+    async def first_barcode(self, product_id: int) -> str | None:
+        """One barcode of the product, or None."""
+        body = await self._request(
+            "GET",
+            "/objects/product_barcodes",
+            params={"query[]": f"product_id={product_id}"},
+        )
+        for row in body if isinstance(body, list) else []:
+            if isinstance(row, dict) and row.get("barcode"):
+                return str(row["barcode"])
+        return None
+
+    async def picture_exists(self, filename: str) -> bool:
+        """Whether Grocy can serve product picture file ``filename``."""
+        encoded = base64.b64encode(filename.encode()).decode()
+        try:
+            async with self._get_session().get(
+                f"{self.base}/files/productpictures/{encoded}",
+                params={"force_serve_as": "picture", "best_fit_width": "16"},
+                headers={"GROCY-API-KEY": self._api_key},
+                timeout=self._timeout,
+            ) as resp:
+                return resp.status == 200
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise GrocyUnavailable(
+                f"Grocy unreachable: {err!r}", maybe_applied=False
+            ) from err
+
+    async def create_product(
+        self, name: str, *, barcode: str, location_id: int, description: str = ""
+    ) -> Product:
+        """Create a product (first quantity unit for every unit field) + barcode."""
+        units = await self._request("GET", "/objects/quantity_units")
+        if not isinstance(units, list) or not units:
+            raise GrocyError("Grocy has no quantity units to create a product with")
+        unit = int(units[0]["id"])
+        body = await self._request(
+            "POST",
+            "/objects/products",
+            json={
+                "name": name,
+                "description": description,
+                "location_id": location_id,
+                "qu_id_purchase": unit,
+                "qu_id_stock": unit,
+                "qu_id_consume": unit,
+                "qu_id_price": unit,
+            },
+        )
+        if not isinstance(body, dict) or "created_object_id" not in body:
+            raise GrocyError(f"unexpected create product answer: {body!r}")
+        product_id = int(body["created_object_id"])
+        await self._request(
+            "POST",
+            "/objects/product_barcodes",
+            json={"product_id": product_id, "barcode": barcode},
+        )
+        return Product(id=product_id, name=name)
+
+    async def purchase(
+        self,
+        product_id: int,
+        amount: float,
+        *,
+        location_id: int,
+        price: float | None,
+        note: str,
+    ) -> None:
+        """Book a purchase of ``amount`` units (Just bought, not tagged)."""
+        body: dict[str, Any] = {
+            "amount": amount,
+            "transaction_type": "purchase",
+            "location_id": location_id,
+            "note": note,
+        }
+        if price is not None:
+            body["price"] = price
+        await self._request("POST", f"/stock/products/{product_id}/add", json=body)
+
     async def product_picture(
         self, product_id: int, size: int = 128
     ) -> tuple[bytes, str] | None:

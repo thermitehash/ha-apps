@@ -261,19 +261,19 @@ async def test_product_picture_proxied_or_204(rig: Rig, grocy: FakeGrocy) -> Non
     oats = grocy.add_product("Oats")
     async with WebClient(rig.h) as c:
         assert c.session is not None
-        async with c.session.get(f"{c.base}/api/product-picture/{beans.id}") as r:
+        async with c.session.get(f"{c.base}/api/picture/{beans.id}") as r:
             assert r.status == 200
             assert r.content_type == "image/png"
-            assert r.headers["Cache-Control"] == "private, max-age=3600"
+            assert r.headers["Cache-Control"] == "private, max-age=86400"
             assert await r.read() == PNG
-        async with c.session.get(f"{c.base}/api/product-picture/{oats.id}") as r:
+        async with c.session.get(f"{c.base}/api/picture/{oats.id}") as r:
             assert r.status == 204  # no picture: the page shows an icon
             assert r.headers["Cache-Control"] == "no-store"
-        async with c.session.get(f"{c.base}/api/product-picture/nope") as r:
+        async with c.session.get(f"{c.base}/api/picture/nope") as r:
             assert r.status == 404
         # Cached: Grocy going down doesn't break a picture already fetched.
         grocy.down = True
-        async with c.session.get(f"{c.base}/api/product-picture/{beans.id}") as r:
+        async with c.session.get(f"{c.base}/api/picture/{beans.id}") as r:
             assert r.status == 200
-        async with c.session.get(f"{c.base}/api/product-picture/9999") as r:
+        async with c.session.get(f"{c.base}/api/picture/9999") as r:
             assert r.status == 204

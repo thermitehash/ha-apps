@@ -11,6 +11,12 @@
 //
 // The in-stock session ends whenever link mode ends, and every barcode linked
 // while it is active is published with "in_stock": true.
+//
+// Counted session (Pantry Hub "Just bought" → Tag them): the hub publishes
+// linking/<station>/start {"barcode", "count"}; the station enters link mode
+// (same blue pulse) and scans one tag per tap until the hub's result says
+// remaining = 0, or reports a timeout / error. Scanning a barcode, leaving
+// link mode, or the 60 s idle timeout ends it.
 #pragma once
 
 #include <cstdint>
@@ -101,6 +107,31 @@ class State {
   void exit_link() {
     link_ = false;
     in_stock_ = false;
+    counted_ = 0;
+  }
+
+  // Counted session started by the hub. Enters link mode; count < 1 ignored.
+  // Returns whether a session is now running.
+  bool start_counted(int count) {
+    if (count < 1) return false;
+    if (!link_) enter_link();
+    counted_ = count;
+    return true;
+  }
+  bool counted() const { return link_ && counted_ > 0; }
+  int counted_remaining() const { return counted() ? counted_ : 0; }
+
+  // A hub result arrived. Returns true when the station should scan for the
+  // next tag (counted session still running), false when it is over.
+  bool on_result(const std::string &status, int remaining) {
+    if (!counted()) return false;
+    bool tap_ok = status == "linked" || status == "tag_already_linked";
+    if (!tap_ok || remaining < 1) {
+      counted_ = 0;
+      return false;
+    }
+    counted_ = remaining;
+    return true;
   }
   // Double-click. Returns the new link-mode state.
   bool toggle_link() {
@@ -119,7 +150,9 @@ class State {
         in_stock_ = !in_stock_;
         return in_stock_ ? Action::SESSION_ON : Action::SESSION_OFF;
       case ScanKind::PRODUCT:
-        return link_ ? Action::LINK_BARCODE : Action::KROGER_SCAN;
+        if (!link_) return Action::KROGER_SCAN;
+        counted_ = 0;  // a barcode starts a normal link (hub replaces the session)
+        return Action::LINK_BARCODE;
       case ScanKind::IGNORED:
       default:
         return Action::IGNORED;
@@ -137,6 +170,7 @@ class State {
  private:
   bool link_ = false;
   bool in_stock_ = false;
+  int counted_ = 0;  // units still to tag in a counted session
 };
 
 // The station's single mode state (one instance per firmware image).

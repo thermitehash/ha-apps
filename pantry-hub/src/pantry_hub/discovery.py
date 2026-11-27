@@ -12,6 +12,7 @@ LAST_LINK_TOPIC = f"{PREFIX}/last_link"
 RESYNC_COMMAND_TOPIC = f"{PREFIX}/resync/press"
 RESYNC_RESULT_TOPIC = f"{PREFIX}/resync/result"
 SWEEP_COMMAND_TOPIC = f"{PREFIX}/sweep/press"
+PICTURES_COMMAND_TOPIC = f"{PREFIX}/pictures/press"
 LINKING_SUB = f"{PREFIX}/linking/+/+"
 HA_STATUS_TOPIC = "homeassistant/status"
 DISCOVERY_TOPIC = "homeassistant/device/pantry_hub/config"
@@ -20,6 +21,11 @@ DISCOVERY_TOPIC = "homeassistant/device/pantry_hub/config"
 def linking_result_topic(station: str) -> str:
     """Topic the hub answers a station on."""
     return f"{PREFIX}/linking/{station}/result"
+
+
+def linking_start_topic(station: str) -> str:
+    """Topic that puts a station into a counted link session."""
+    return f"{PREFIX}/linking/{station}/start"
 
 
 def discovery_payload(version: str, reader_id: str | None = None) -> dict[str, Any]:
@@ -166,6 +172,16 @@ def discovery_payload(version: str, reader_id: str | None = None) -> dict[str, A
                 "payload_press": "PRESS",
                 "icon": "mdi:sync",
                 "entity_category": "diagnostic",
+            },
+            "fetch_pictures": {
+                "p": "button",
+                "name": "Fetch missing pictures",
+                "unique_id": "pantry_hub_fetch_pictures",
+                "default_entity_id": "button.pantry_hub_fetch_pictures",
+                "command_topic": PICTURES_COMMAND_TOPIC,
+                "payload_press": "PRESS",
+                "icon": "mdi:image-sync",
+                "entity_category": "config",
             },
         },
     }

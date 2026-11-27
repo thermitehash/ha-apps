@@ -389,3 +389,85 @@ async def test_door_check_offers_flip_for_reversed_sensor(stack: Stack) -> None:
     await page.wait_for_selector("text=Door: CLOSED")
     assert await stack.rig.store.get_meta("door_inverted") == "0"
     assert stack.errors == []
+
+
+# v0.4.1: pictures + Just bought -----------------------------------------------
+
+
+async def test_pictures_and_just_bought(
+    stack: Stack, ha: FakeHomeAssistant, tmp_path: Path
+) -> None:
+    hub = stack.rig.h
+    now = hub.wall()
+
+    def item(
+        item_id: str, upc: str, name: str, qty: int, age_s: float
+    ) -> dict[str, Any]:
+        from datetime import UTC, datetime
+
+        at = datetime.fromtimestamp(now - age_s, UTC).isoformat()
+        return {
+            "item_id": item_id,
+            "upc": upc,
+            "name": name,
+            "size": "15 oz",
+            "quantity_received": qty,
+            "price": 0.89,
+            "received_at": at,
+        }
+
+    recent = [
+        item("1", "0001", "Black beans", 3, 3600),
+        item("2", "0099", "Old crackers", 1, 20 * 86400),
+    ]
+
+    async def recent_received(data: dict[str, Any]) -> dict[str, Any]:
+        return {"items": recent}
+
+    async def lookup(data: dict[str, Any]) -> dict[str, Any]:
+        return {"found": False}
+
+    ha.add_action("kroger_restock", "recent_received", recent_received)
+    ha.add_action("kroger_restock", "lookup_product", lookup)
+    assert hub.ha_api is not None and hub.just_bought is not None
+    assert hub.pictures is not None
+    await hub.ha_api.services(refresh=True)
+    await hub.pictures.refresh_available()
+    assert await hub.just_bought.catch_up() == 2
+    out = shots_dir(tmp_path)
+    for scheme in ("light", "dark"):
+        page = await stack.page("phone", scheme)
+        await page.wait_for_selector("text=Just bought · 3 items to tag")
+        await page.wait_for_selector("text=×3 of 3 to tag")
+        await page.wait_for_selector("summary:has-text('Older · 1')")
+        # Thumbnails: the picture loads for Black beans, an icon otherwise.
+        await page.wait_for_function(
+            "() => [...document.querySelectorAll('#s-items img.pic')]"
+            ".some(i => i.complete && i.naturalWidth > 0)"
+        )
+        assert await page.locator("#s-items .pic.ph").count() >= 1
+        await no_horizontal_scroll(page)
+        await page.screenshot(
+            path=str(out / f"phone-{scheme}-just-bought.png"), full_page=True
+        )
+        await page.close()
+    page = await stack.page("phone")
+    await page.click("#s-bought button:has-text('Not tagging')")
+    box = page.locator("form[data-form='skip'] input[name='add_stock']")
+    assert await box.is_checked()  # default: add to Grocy stock
+    await page.click("form[data-form='skip'] button:has-text('Cancel')")
+    await page.click("#s-bought button:has-text('Tag them') >> nth=0")
+    await page.wait_for_selector("text=Tap each Black beans on the station")
+    await page.wait_for_selector("text=0 of 3 linked")
+    await page.click("nav.tabs >> text=Tags")
+    await page.wait_for_function(
+        "() => [...document.querySelectorAll('#s-linked img.pic')]"
+        ".some(i => i.complete && i.naturalWidth > 0)"
+    )
+    await page.click("nav.tabs >> text=Settings")
+    await page.wait_for_selector("button:has-text('Fetch missing pictures')")
+    await page.screenshot(
+        path=str(out / "phone-light-settings-pictures.png"), full_page=True
+    )
+    await page.close()
+    assert stack.errors == []

@@ -119,6 +119,7 @@ async def test_discovery_and_availability(rig: Rig, observer: Observer) -> None:
         "sensor.pantry_hub_reader_activity",
         "sensor.pantry_hub_last_sweep",
         "button.pantry_hub_sweep_now",
+        "button.pantry_hub_fetch_pictures",
     }
     assert observer.messages[AVAILABILITY_TOPIC][-1] == b"online"
     # HA restart → discovery republished.

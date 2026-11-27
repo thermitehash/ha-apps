@@ -24,7 +24,7 @@ import aiosqlite
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -80,6 +80,35 @@ CREATE TABLE IF NOT EXISTS needs_product (
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL,
     scans INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS picture_misses (
+    product_id INTEGER PRIMARY KEY,
+    at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS received (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    upc TEXT NOT NULL,
+    kroger_product_id TEXT,
+    name TEXT NOT NULL,
+    brand TEXT,
+    size TEXT,
+    image_url TEXT,
+    quantity INTEGER NOT NULL,
+    price REAL,
+    order_ref TEXT,
+    stored_at REAL NOT NULL,
+    grocy_product_id INTEGER,
+    tagged INTEGER NOT NULL DEFAULT 0,
+    done_at REAL,
+    UNIQUE (item_id, received_at)
+);
+CREATE TABLE IF NOT EXISTS booked_credits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    units INTEGER NOT NULL,
+    booked_at REAL NOT NULL
 );
 """
 
@@ -262,6 +291,61 @@ def _link(row: sqlite3.Row) -> Link:
         default_best_before_days=row["default_best_before_days"],
         station=row["station"],
         skip_add_cycle=row["skip_add_cycle"],
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Received:
+    """One Kroger Restock "received" item waiting to be tagged (Just bought)."""
+
+    id: int
+    item_id: str
+    received_at: str
+    upc: str
+    kroger_product_id: str | None
+    name: str
+    brand: str | None
+    size: str | None
+    image_url: str | None
+    quantity: int
+    price: float | None
+    order_ref: str | None
+    stored_at: float
+    grocy_product_id: int | None
+    tagged: int
+    done_at: float | None
+
+    @property
+    def to_tag(self) -> int:
+        """Units still without a tag."""
+        return max(self.quantity - self.tagged, 0)
+
+
+_RECEIVED_COLS = (
+    "id, item_id, received_at, upc, kroger_product_id, name, brand, size, "
+    "image_url, quantity, price, order_ref, stored_at, grocy_product_id, tagged, "
+    "done_at"
+)
+
+
+def _received(row: sqlite3.Row) -> Received:
+    return Received(
+        id=int(row["id"]),
+        item_id=row["item_id"],
+        received_at=row["received_at"],
+        upc=row["upc"],
+        kroger_product_id=row["kroger_product_id"],
+        name=row["name"],
+        brand=row["brand"],
+        size=row["size"],
+        image_url=row["image_url"],
+        quantity=int(row["quantity"]),
+        price=row["price"],
+        order_ref=row["order_ref"],
+        stored_at=float(row["stored_at"]),
+        grocy_product_id=row["grocy_product_id"],
+        tagged=int(row["tagged"]),
+        done_at=row["done_at"],
     )
 
 
@@ -943,3 +1027,209 @@ class Store:
             deleted = cur.rowcount == 1
             await cur.close()
         return deleted
+
+    # Product pictures ----------------------------------------------------------
+
+    async def picture_miss(self, product_id: int) -> float | None:
+        """When Kroger last had no picture for ``product_id`` (None: never)."""
+        async with self._lock:
+            row = await self._one(
+                "SELECT at FROM picture_misses WHERE product_id = ?", (product_id,)
+            )
+        return None if row is None else float(row["at"])
+
+    async def set_picture_miss(self, product_id: int, at: float | None) -> None:
+        """Remember (``at``) or forget (None) a not-found picture lookup."""
+        async with self._lock:
+            if at is None:
+                await self._exec(
+                    "DELETE FROM picture_misses WHERE product_id = ?", (product_id,)
+                )
+            else:
+                await self._exec(
+                    "INSERT INTO picture_misses (product_id, at) VALUES (?, ?) "
+                    "ON CONFLICT(product_id) DO UPDATE SET at = excluded.at",
+                    (product_id, at),
+                )
+
+    async def linked_products(self) -> dict[int, str | None]:
+        """Grocy products with a link → one barcode used to link them (or None)."""
+        async with self._lock:
+            rows = await self._all(
+                "SELECT product_id, MAX(barcode) AS barcode FROM links "
+                "GROUP BY product_id ORDER BY product_id"
+            )
+        return {int(r["product_id"]): r["barcode"] for r in rows}
+
+    # Just bought ---------------------------------------------------------------
+
+    async def add_received(
+        self,
+        *,
+        item_id: str,
+        received_at: str,
+        upc: str,
+        name: str,
+        quantity: int,
+        now: float,
+        kroger_product_id: str | None = None,
+        brand: str | None = None,
+        size: str | None = None,
+        image_url: str | None = None,
+        price: float | None = None,
+        order_ref: str | None = None,
+    ) -> int | None:
+        """Store a received item once per ``(item_id, received_at)``; its row id."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "INSERT OR IGNORE INTO received (item_id, received_at, upc, "
+                "kroger_product_id, name, brand, size, image_url, quantity, price, "
+                "order_ref, stored_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item_id,
+                    received_at,
+                    upc,
+                    kroger_product_id,
+                    name,
+                    brand,
+                    size,
+                    image_url,
+                    quantity,
+                    price,
+                    order_ref,
+                    now,
+                ),
+            )
+            row_id = cur.lastrowid if cur.rowcount == 1 else None
+            await cur.close()
+        return row_id
+
+    async def received(self, *, include_done: bool = False) -> list[Received]:
+        """Received items, newest first (open ones only unless ``include_done``)."""
+        where = "" if include_done else "WHERE done_at IS NULL"
+        async with self._lock:
+            rows = await self._all(
+                f"SELECT {_RECEIVED_COLS} FROM received {where} "
+                "ORDER BY received_at DESC, id DESC"
+            )
+        return [_received(r) for r in rows]
+
+    async def get_received(self, row_id: int) -> Received | None:
+        """One received item by row id."""
+        async with self._lock:
+            row = await self._one(
+                f"SELECT {_RECEIVED_COLS} FROM received WHERE id = ?", (row_id,)
+            )
+        return None if row is None else _received(row)
+
+    async def set_received_product(self, row_id: int, product_id: int) -> None:
+        """Remember the Grocy product a received item maps to."""
+        async with self._lock:
+            await self._exec(
+                "UPDATE received SET grocy_product_id = ? WHERE id = ?",
+                (product_id, row_id),
+            )
+
+    async def add_received_tagged(self, row_id: int, now: float) -> Received | None:
+        """Count one more tagged unit; close the row when all are tagged."""
+        async with self._lock:
+            await self._exec(
+                "UPDATE received SET tagged = MIN(tagged + 1, quantity) WHERE id = ?",
+                (row_id,),
+            )
+            await self._exec(
+                "UPDATE received SET done_at = ? "
+                "WHERE id = ? AND tagged >= quantity AND done_at IS NULL",
+                (now, row_id),
+            )
+            row = await self._one(
+                f"SELECT {_RECEIVED_COLS} FROM received WHERE id = ?", (row_id,)
+            )
+        return None if row is None else _received(row)
+
+    async def close_received(self, row_id: int, now: float) -> int:
+        """Close an open row ("Not tagging"); return its untagged units (0: not open)."""
+        async with self._lock:
+            await self._begin()
+            try:
+                row = await self._one(
+                    "SELECT quantity, tagged, done_at FROM received WHERE id = ?",
+                    (row_id,),
+                )
+                if row is None or row["done_at"] is not None:
+                    await self._rollback()
+                    return 0
+                await self._exec(
+                    "UPDATE received SET done_at = ? WHERE id = ?", (now, row_id)
+                )
+                await self._commit()
+            except BaseException:
+                await self._rollback()
+                raise
+        return max(int(row["quantity"]) - int(row["tagged"]), 0)
+
+    async def add_booked_credit(self, product_id: int, units: int, at: float) -> None:
+        """Remember units booked in Grocy without a tag (see take_booked_credit)."""
+        async with self._lock:
+            await self._exec(
+                "INSERT INTO booked_credits (product_id, units, booked_at) "
+                "VALUES (?, ?, ?)",
+                (product_id, units, at),
+            )
+
+    async def reopen_received(self, row_id: int) -> None:
+        """Undo :meth:`close_received` without credit (the Grocy booking failed)."""
+        async with self._lock:
+            await self._exec(
+                "UPDATE received SET done_at = NULL WHERE id = ?", (row_id,)
+            )
+
+    async def purge_received(self, before: float) -> int:
+        """Delete received rows stored before ``before``; return how many."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM received WHERE stored_at < ?", (before,)
+            )
+            n = cur.rowcount
+            await cur.close()
+        return n
+
+    async def take_booked_credit(
+        self, product_id: int, now: float, window_s: float
+    ) -> bool:
+        """Use one unit booked without a tag in the last ``window_s`` seconds.
+
+        Expired credits are dropped. True: the new link's arrival must not
+        add stock again (Grocy already counts the unit).
+        """
+        async with self._lock:
+            await self._begin()
+            try:
+                await self._exec(
+                    "DELETE FROM booked_credits WHERE booked_at < ? OR units <= 0",
+                    (now - window_s,),
+                )
+                row = await self._one(
+                    "SELECT id FROM booked_credits WHERE product_id = ? "
+                    "ORDER BY booked_at LIMIT 1",
+                    (product_id,),
+                )
+                if row is not None:
+                    await self._exec(
+                        "UPDATE booked_credits SET units = units - 1 WHERE id = ?",
+                        (row["id"],),
+                    )
+                await self._commit()
+            except BaseException:
+                await self._rollback()
+                raise
+        return row is not None
+
+    async def booked_credits(self) -> dict[int, int]:
+        """Remaining booked units per product (for the web UI / tests)."""
+        async with self._lock:
+            rows = await self._all(
+                "SELECT product_id, SUM(units) AS n FROM booked_credits "
+                "WHERE units > 0 GROUP BY product_id"
+            )
+        return {int(r["product_id"]): int(r["n"]) for r in rows}

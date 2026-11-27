@@ -3,6 +3,69 @@
 Decisions taken while building a release, one line of reason each, so they
 can be reviewed and reverted. Newest release first.
 
+## 0.4.1: Kroger Restock pictures + Just bought
+
+Built against the Part A contract (`lookup_product`, `recent_received`, the
+`kroger_restock_received` event) without the Kroger Restock code in hand.
+
+1. **REST for actions, websocket for the event.** `lookup_product` /
+   `recent_received` go through `POST /core/api/services/...?return_response`
+   as specified; the REST base is derived from the websocket URL already in
+   use (`ws://supervisor/core/websocket` → `http://supervisor/core/api`), so
+   `PANTRY_HUB_HA_URL` covers development too. The event subscription is its
+   own websocket connection (the door's connection only exists in door mode).
+2. **"Is Kroger Restock there?"** = the action is listed by `GET /api/services`,
+   cached 10 min, so installing it later is picked up without a restart.
+3. **`recent_received` response shape.** Accepts `{"items": [...]}` or
+   `{"received": [...]}`; the contract names the fields of an item but not the
+   wrapper. One-line change if Part A uses another key.
+4. **Price is per unit.** Booked as Grocy's `price` (per stock unit). If Kroger
+   Restock reports line totals, divide by `quantity_received` there or here.
+5. **Pictures only for barcode links.** A web relink by `#id` has no barcode,
+   so no lookup. Backfill covers products Pantry Hub has linked or seen in
+   Just bought, using the link's barcode or the product's first Grocy barcode.
+6. **"Empty name"** also means a name equal to the barcode (what some
+   lookups leave). Description is filled with "Brand · size" when empty.
+7. **`pantryhub_` pictures are replaced only when Grocy lost the file**
+   (backfill checks); otherwise "missing" means an empty `picture_file_name`.
+8. **Not-found memory** (30 days) applies to the backfill; a fresh link still
+   asks once (the person is holding the product now).
+9. **Retries**: link-time picture fetch retries after 10 s, 60 s, 5 min for
+   network / Home Assistant / Grocy / 5xx-429 image errors; a bad image (too
+   big, not an image, 4xx) is not retried. Logs name the image host only.
+10. **Resize** with Pillow 13.0.0 (musllinux wheels for amd64 and aarch64;
+    adds about 5 MB to the image). Transparent PNGs are flattened on white.
+11. **Picture route renamed** to `/api/picture/<id>` with
+    `private, max-age=86400`; the page appends `?v=<n>`, bumped when Pantry Hub
+    sets that product's picture, so a new picture shows at once. A "no
+    picture" answer stays `no-store` / 204 and is re-checked server-side
+    every 5 min.
+12. **Station for Tag them** is the station that last sent a barcode or tag,
+    else `kroger_scanner`. No station picker (one station today).
+13. **One tag per tap** is enforced by the firmware (one scan per result,
+    1.5 s pause), plus the hub's existing 1 s strongest-RSSI window.
+14. **Skipped tags**: a tag already linked to *this* product is skipped and
+    not counted; a tag linked to *another* product is skipped too (relink it
+    in the web UI), with status `tag_already_linked` either way so old
+    firmware shows magenta.
+15. **Counted-session timeout** counts from the start or the last tap
+    (60 s); "Tag them" again continues with the units left.
+16. **No double count** = a "booked credit" per Not-tagging booking, used by
+    the next links of that product within 7 days (station, counted session
+    or web relink) as "already in stock". The credit is recorded only after
+    Grocy accepted the purchase; a refused purchase reopens the row.
+17. **Event log** for a matched unit: an entry `matched_booked` in the recent
+    events of `/api/state` plus an info log line (the UI has no event list).
+18. **Product created from a delivery** uses Grocy's first quantity unit for
+    every unit field and the pantry location; the picture follows through
+    the normal picture flow.
+19. **Older rows** (14–30 days) are listed under a collapsed "Older" and not
+    counted in "N items to tag"; rows are deleted 30 days after
+    `received_at` (or arrival, if that's in the future/unparsable).
+20. **Quantity capped at 99** per delivery row (guards a bad payload).
+21. **Firmware 0.3.0**: `on_json_message` on `.../start`; counted state
+    lives in `link_mode.h` (host-tested) like the in-stock session.
+
 ## 0.4.0: UI redesign + stale-page fix
 
 1. **Part 1 is server-side only.** Commit 1 adds `no-store` and `GET /api/state`; the page's polling arrives with the new shell (commit 2), because the old server-rendered page was replaced in the same release. Reverting commit 2 alone leaves a working API with the old page.

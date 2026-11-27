@@ -17,7 +17,9 @@ const ui = {
   api,
   tab: "pantry",
   detailsOpen: false,
-  noPicture: new Set(),
+  noPicture: new Set(), // "productId:version" without a picture
+  skipOpen: new Set(),
+  olderOpen: false,
   fullEpc: new Set(),
   howTo: new Set(),
   menu: null,
@@ -42,6 +44,7 @@ const LAYOUTS = {
 <div id="s-health"></div>
 <div id="s-door"></div>
 <div id="s-attention" class="stack"></div>
+<section id="s-bought" class="stack" aria-label="Just bought"></section>
 <section id="s-items" class="stack" aria-label="In the pantry"></section>`,
   tags: () => `
 <section id="s-unlinked" class="stack" aria-label="Not linked yet"></section>
@@ -78,7 +81,9 @@ const LAYOUTS = {
 <div class="card" id="s-reader"></div>
 <p class="sub">Change these in the app’s Configuration tab.</p>
 <div class="section-head"><h2>Grocy</h2></div>
-<div class="card stack" id="s-resync"></div>`,
+<div class="card stack" id="s-resync"></div>
+<div class="section-head"><h2>Product pictures</h2></div>
+<div class="card stack" id="s-pictures"></div>`,
 };
 
 function slotsFor(tab) {
@@ -88,6 +93,7 @@ function slotsFor(tab) {
       "s-health": () => V.healthBanner(state, ui),
       "s-door": () => V.doorCard(state),
       "s-attention": () => V.attention(state),
+      "s-bought": () => V.justBought(state, ui),
       "s-items": () => V.pantryItems(state, ui),
     };
   }
@@ -107,6 +113,7 @@ function slotsFor(tab) {
     "s-check": () => V.checkStep(ui, door),
     "s-reader": () => V.readerOptions(state),
     "s-resync": () => V.resyncCard(state),
+    "s-pictures": () => V.picturesCard(state),
   };
 }
 
@@ -393,8 +400,14 @@ root.addEventListener("click", async (event) => {
     }
   } else if (action === "post") {
     const fields = {};
-    for (const key of ["epc", "op", "barcode"]) if (el.dataset[key]) fields[key] = el.dataset[key];
+    for (const key of ["epc", "op", "barcode", "row"]) if (el.dataset[key]) fields[key] = el.dataset[key];
     await act(el.dataset.path, fields, el);
+  } else if (action === "skip-toggle") {
+    toggle(ui.skipOpen, el.dataset.row);
+  } else if (action === "older-toggle") {
+    event.preventDefault();
+    ui.olderOpen = !ui.olderOpen;
+    render();
   } else if (action === "pick-door") {
     await act("/settings/door", { door_entity: el.dataset.entity }, el);
     ui.check = { phase: "idle" };
@@ -434,6 +447,16 @@ async function act(path, fields, el) {
 }
 
 root.addEventListener("submit", async (event) => {
+  const skip = event.target.closest("form[data-form='skip']");
+  if (skip) {
+    event.preventDefault();
+    const row = skip.dataset.epc;
+    const add = skip.elements.add_stock.checked ? "on" : "";
+    await act("/bought/skip", { row, add_stock: add }, skip.querySelector("button[type=submit]"));
+    ui.skipOpen.delete(row);
+    render();
+    return;
+  }
   const form = event.target.closest("form[data-form='relink']");
   if (!form) return;
   event.preventDefault();
@@ -467,7 +490,7 @@ view.addEventListener(
   (event) => {
     const img = event.target;
     if (!(img instanceof HTMLImageElement) || !img.dataset.product) return;
-    ui.noPicture.add(Number(img.dataset.product));
+    ui.noPicture.add(`${img.dataset.product}:${img.dataset.v || 0}`);
     const ph = document.createElement("span");
     ph.className = "pic ph";
     ph.innerHTML = V.icons.can;

@@ -45,6 +45,8 @@ substitutions:
   u107_tx_power_dbm: "15" # low, so only the item in hand is read
   link_tag_timeout_ms: "15000"
   link_idle_timeout_ms: "60000"
+  # Counted session: wait this long for each tap (the hub ends it after 60 s).
+  link_counted_timeout_ms: "60000"
   # M14 beep command tried after link results when "Link result beep" is on.
   # Unverified: the M14's documented UART command is "beep on decode"
   # (21 63 42 01); no direct buzzer command is known. See README.
@@ -57,7 +59,7 @@ esphome:
   friendly_name: ${friendly_name}
   project:
     name: thermitehash.pantry_linking_station
-    version: "0.2.0"
+    version: "0.3.0"
   includes:
     - include/link_mode.h
   on_boot:
@@ -125,13 +127,35 @@ mqtt:
   log_topic: null
   topic_prefix: pantry_hub/stations/${station_id}
   on_json_message:
-    topic: pantry_hub/linking/${station_id}/result
-    then:
-      - lambda: |-
-          std::string status = x["status"] | "error";
-          ESP_LOGI("link", "Hub result: %s", status.c_str());
-          id(touch_link_mode).execute();
-          id(link_result).execute(status);
+    - topic: pantry_hub/linking/${station_id}/result
+      then:
+        - lambda: |-
+            std::string status = x["status"] | "error";
+            int remaining = x["remaining"] | -1;
+            ESP_LOGI("link", "Hub result: %s", status.c_str());
+            id(touch_link_mode).execute();
+            id(link_result).execute(status);
+            // Counted session: scan for the next tag while some remain.
+            if (link_mode::state().on_result(status, remaining)) {
+              ESP_LOGI("link", "Counted session: %d to go", remaining);
+              id(counted_next_tag).execute();
+            }
+    # Pantry Hub "Just bought" → Tag them: link up to `count` tags, one per
+    # tap, to the product with this barcode (same blue pulse as link mode).
+    - topic: pantry_hub/linking/${station_id}/start
+      then:
+        - lambda: |-
+            int count = x["count"] | 0;
+            std::string barcode = x["barcode"] | "";
+            if (!link_mode::state().start_counted(count)) {
+              ESP_LOGW("link", "Ignoring start without a count");
+              return;
+            }
+            ESP_LOGI("link", "Counted session: tag %d × %s", count, barcode.c_str());
+            id(last_barcode).publish_state(barcode);
+            id(touch_link_mode).execute();
+            id(link_idle_led).execute();
+            id(u107).start_scan(${link_counted_timeout_ms});
 
 time:
   - platform: homeassistant
@@ -465,6 +489,19 @@ script:
             beeps = 3;
           }
           if (id(link_beep).state) id(link_beep_script).execute(beeps);
+
+  # Counted session: after a result, let the LED show it, then scan again
+  # (one tag per tap: the tag just linked has usually left the antenna).
+  - id: counted_next_tag
+    mode: restart
+    then:
+      - delay: 1500ms
+      - if:
+          condition:
+            lambda: return link_mode::state().counted();
+          then:
+            - script.execute: touch_link_mode
+            - lambda: id(u107).start_scan(${link_counted_timeout_ms});
 
   - id: link_beep_script
     mode: restart
