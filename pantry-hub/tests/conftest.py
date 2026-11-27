@@ -38,6 +38,39 @@ logging.getLogger("transitions").setLevel(logging.WARNING)
 HANG_DUMP_AFTER_S = float(os.environ.get("PANTRY_HUB_HANG_DUMP_S", "120"))
 
 
+def _print_await_chain(task: asyncio.Task[Any], buf: io.StringIO) -> None:
+    """Follow awaits, including into async generators (fixture teardowns)."""
+    obj: Any = task.get_coro()
+    seen: set[int] = set()
+    while obj is not None and id(obj) not in seen:
+        seen.add(id(obj))
+        frame = (
+            getattr(obj, "cr_frame", None)
+            or getattr(obj, "ag_frame", None)
+            or getattr(obj, "gi_frame", None)
+        )
+        if frame is not None:
+            code = frame.f_code
+            print(
+                f"    await chain: {code.co_filename}:{frame.f_lineno} "
+                f"in {code.co_qualname}",
+                file=buf,
+            )
+            # pytest-asyncio awaits gen_obj.__anext__(): follow the generator.
+            gen = frame.f_locals.get("gen_obj")
+            if gen is not None and getattr(gen, "ag_await", None) is not None:
+                obj = gen
+                continue
+        nxt = (
+            getattr(obj, "cr_await", None)
+            or getattr(obj, "ag_await", None)
+            or getattr(obj, "gi_yieldfrom", None)
+        )
+        if nxt is None:
+            print(f"    waiting on: {obj!r}", file=buf)
+        obj = nxt
+
+
 def _dump_asyncio_tasks(
     name: str, loops: list[asyncio.AbstractEventLoop], fd: int
 ) -> None:
@@ -52,6 +85,7 @@ def _dump_asyncio_tasks(
             tasks = list(asyncio.all_tasks(loop))
         for task in tasks:
             print(asyncio.format_call_graph(task), file=buf)
+            _print_await_chain(task, buf)
     os.write(fd, buf.getvalue().encode())
 
 
@@ -191,6 +225,16 @@ class BrokerHandle:
 
     async def stop(self) -> None:
         if self.broker is not None:
+            # amqtt's shutdown ends with asyncio Server.wait_closed(), which
+            # (Python >= 3.12) waits for every client connection to close; it
+            # never closes them itself, so a leftover socket (a client mid
+            # connect or reconnect when the broker stops) hung the teardown
+            # forever. Stop listening and close the clients first.
+            for server in self.broker._servers.values():
+                instance = server.instance
+                if isinstance(instance, asyncio.Server):
+                    instance.close()
+                    instance.close_clients()
             await self.broker.shutdown()
             self.broker = None
 

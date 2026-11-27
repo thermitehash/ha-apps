@@ -2,10 +2,7 @@
 - App version: 0.3.2 (door sensor picker + inverted sensors; 0.1.0–0.3.1 were released together in PR #1, 0.3.2 is in PR #2) · linking station firmware 0.2.0
 - Branches: PR #2 (`claude/kind-ritchie-58v2e4` → `main`) was started from `main` at `873bd33`, the merge commit of PR #1, so it contains all of PR #1. PR #1 is merged (not open). Its merge published `ghcr.io/thermitehash/pantry-hub:0.3.1` (amd64 + aarch64 + manifest, release tagged). Merging PR #2 publishes 0.3.2 and leaves `main` at 0.3.2.
 - aiochainway version used: v0.3.0 (`git+https://github.com/thermitehash/aiochainway@v0.3.0`; unchanged)
-- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#2](https://github.com/thermitehash/ha-apps/pull/2) / code verified at `20b156e` (this report is committed on top) / CI on `20b156e`, all green:
-  - Lint: Ruff + mypy ✅ · HA app linter ✅ (accepts the `match(...)` schema) · yamllint ✅ · ESPHome linking station ✅ · Version bump (0.3.2) ✅
-  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (260 tests, coverage gate 90%) · Sweep-now repeat ×200 (macOS) ✅
-  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
+- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#2](https://github.com/thermitehash/ha-apps/pull/2) / CI_PENDING
 
 ## Summary
 **v0.3.2, door sensor picker**:
@@ -246,6 +243,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 | 21 | (v0.3.0→0.3.1) macOS-only timeout in `test_sweep_now_during_continuous_then_resumes` | macOS CI (once, `2914a8c`) | root cause in the test double: `FakeUR4` registered connections late under kqueue (fixed in aiochainway v0.3.0, `wait_for_connections`); wait restored to 8 s; confirmed by 200/200 on macOS CI | macOS CI job, 200 repeats |
 | 22 | (test only) `test_state_not_republished_for_traffic_counters_alone` counted republishes while the arrival's second, legitimate publish (unlinked count after the store write) could still be pending | ubuntu CI on `21b60e9` (didn't reproduce in 40 local runs) | drain events, then wait for 0.3 s with no new state before counting | same test, 20 local repeats + CI |
 | 23 | (v0.3.2) Switching to another door sensor while the door was already unknown never armed the 120 s unavailable notification (`_set(UNKNOWN)` returned early because nothing changed), so a mistyped or deleted web choice would never notify | new test `test_saved_sensor_not_found_notification` | `set_entity` arms the timer for the new entity explicitly | same test |
+| 24 | (test only) Intermittent hang in the MQTT broker fixture teardown: amqtt's `Broker.shutdown()` ends with asyncio `Server.wait_closed()`, which (Python ≥ 3.12) waits for every client connection to close, and amqtt never closes them. A client socket left open (the hub mid connect/reconnect when the broker stopped) made teardown wait forever. Seen as Pytest ubuntu-latest cancelled at the 20-min limit on `a674051` | CI, then reproduced locally (1 hang in 43 runs of `test_mqtt_broker_restart_reconnects_and_republishes`) with a new test watchdog that prints every asyncio task's await chain after 120 s; it showed `broker` fixture → `Broker.shutdown` → `Server.close_instance` → `Server.wait_closed` | the test broker stops listening and closes its client connections (`Server.close_clients()`) before `shutdown()` | 80/80 repeats of that test after the fix; the watchdog stays in `tests/conftest.py` (`PANTRY_HUB_HANG_DUMP_S`) |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.
