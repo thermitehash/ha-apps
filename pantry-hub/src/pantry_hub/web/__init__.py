@@ -23,11 +23,43 @@ from ..grocy import GrocyError
 from ..homeassistant import DoorCandidate
 from ..linking import normalize_epc
 from ..store import iso
+from .state import build_state
 
 if TYPE_CHECKING:
     from ..hub import Hub
 
 _LOGGER = logging.getLogger(__name__)
+
+#: Long cache for versioned static assets (``?v=<version>`` busts it).
+STATIC_CACHE = "public, max-age=31536000, immutable"
+
+
+@web.middleware
+async def no_store(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    """Never let a web view show a cached page or state.
+
+    The HA companion app's web view could show an old copy of the page after
+    opening Pantry Hub from the side menu. HTML and JSON are ``no-store``;
+    static assets are versioned and cached for a year.
+    """
+    try:
+        response = await handler(request)
+    except web.HTTPException as exc:
+        response = exc
+        if request.path.startswith("/static/"):
+            raise
+        response.headers["Cache-Control"] = "no-store"
+        raise
+    if request.path.startswith("/static/") and response.status == 200:
+        response.headers["Cache-Control"] = STATIC_CACHE
+    else:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers.setdefault("Pragma", "no-cache")
+    return response
+
 
 INGRESS_PROXY = "172.30.32.2"
 HUB_KEY = web.AppKey("hub", object)
@@ -93,9 +125,10 @@ class WebUI:
             if allowed_peers is not None
             else frozenset({INGRESS_PROXY})
         )
-        self.app = web.Application(middlewares=[self._guard])
+        self.app = web.Application(middlewares=[self._guard, no_store])
         self.app[ALLOW_KEY] = allow
         self.app.router.add_get("/", self.index)
+        self.app.router.add_get("/api/state", self.api_state)
         self.app.router.add_get("/settings", self.settings)
         self.app.router.add_get("/settings/door-state", self.door_state)
         self.app.router.add_post(
@@ -126,6 +159,10 @@ class WebUI:
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
+
+    async def api_state(self, request: web.Request) -> web.Response:
+        """Everything the page shows, as JSON (polled by the page)."""
+        return web.json_response(await build_state(self.hub))
 
     @web.middleware
     async def _guard(

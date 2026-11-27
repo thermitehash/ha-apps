@@ -8,6 +8,7 @@ TCP, from the Home Assistant door entity (see :mod:`pantry_hub.reading`).
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Callable, Coroutine
 import contextlib
 from dataclasses import dataclass, field
@@ -66,6 +67,8 @@ from .worker import GrocyWorker
 _LOGGER = logging.getLogger(__name__)
 
 TICK_S = 1.0
+#: How many arrivals/departures the web UI shows.
+RECENT_EVENTS = 20
 STATE_EVERY_S = 60.0
 TOUCH_EVERY_S = 30.0
 PROBE_EVERY_S = 60.0
@@ -190,6 +193,8 @@ class Hub:
             DeadPortMonitor(options.reader_antennas) if door_mode else None
         )
         self._dead_notified: frozenset[int] = frozenset()
+        #: Last arrivals/departures, newest last (web UI "recent events").
+        self.recent_events: deque[dict[str, Any]] = deque(maxlen=RECENT_EVENTS)
         self.probe_every_s = probe_every_s
         #: Last time a window or probe talked to the reader (monotonic).
         self._last_contact = monotonic()
@@ -487,6 +492,19 @@ class Hub:
             self._wake.set()
         self.mark_dirty()
 
+    def next_sweep_at(self) -> float | None:
+        """Wall time of the next sweep (now if one is due or running), or None."""
+        if self.planner is None:
+            return None
+        if self.activity is Activity.SWEEP:
+            return self.wall()
+        plan = self.planner.next(self.monotonic())
+        if plan.activity is Activity.IDLE:
+            return self.wall() + plan.duration
+        if plan.activity is Activity.SWEEP:
+            return self.wall()
+        return None  # reading continuously: sweeps resume afterwards
+
     def request_sweep(self) -> bool:
         """``button.pantry_hub_sweep_now``: sweep as soon as possible."""
         if self.planner is None or self.activity is Activity.SWEEP:
@@ -666,6 +684,7 @@ class Hub:
         self.planner.sweep_done(completed, now)
         record = {
             "at": iso(self.wall()),
+            "epoch": self.wall(),
             "reason": reason,
             "completed": completed,
             "tags": result.tags,
@@ -757,6 +776,15 @@ class Hub:
         self.mark_dirty()
 
     async def _publish_event(self, kind: str, epc: str, link: Link | None) -> None:
+        self.recent_events.append(
+            {
+                "kind": kind,
+                "epc": epc,
+                "product": link.product_name if link else None,
+                "product_id": link.product_id if link else None,
+                "at": self.wall(),
+            }
+        )
         if self.mqtt is None:
             return
         payload = {
