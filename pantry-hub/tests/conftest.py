@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+import io
 import logging
 import os
 from pathlib import Path
 import socket
+import threading
 from typing import Any
 
+from _pytest.faulthandler import fault_handler_stderr_fd_key
 from aiochainway.testing import FakeUR4, tag_record
 from amqtt.broker import Broker
 from hypothesis import settings
@@ -27,6 +30,51 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 
 logging.getLogger("amqtt").setLevel(logging.WARNING)
 logging.getLogger("transitions").setLevel(logging.WARNING)
+
+
+#: A test (setup + call + teardown) running longer than this dumps every
+#: asyncio task's stack: faulthandler only shows threads, not which coroutine
+#: is stuck (e.g. a fixture teardown waiting forever).
+HANG_DUMP_AFTER_S = float(os.environ.get("PANTRY_HUB_HANG_DUMP_S", "120"))
+
+
+def _dump_asyncio_tasks(
+    name: str, loops: list[asyncio.AbstractEventLoop], fd: int
+) -> None:
+    # Written to the stderr copy pytest gives faulthandler: captured output of
+    # a test that never finishes would never be shown.
+    buf = io.StringIO()
+    print(f"\n=== {name} still running after {HANG_DUMP_AFTER_S:.0f} s ===", file=buf)
+    for loop in loops:
+        try:
+            tasks = list(asyncio.all_tasks(loop))
+        except RuntimeError:  # the set changed while we read it; try once more
+            tasks = list(asyncio.all_tasks(loop))
+        for task in tasks:
+            print(asyncio.format_call_graph(task), file=buf)
+    os.write(fd, buf.getvalue().encode())
+
+
+@pytest.fixture(autouse=True)
+def _hang_watchdog(request: pytest.FixtureRequest) -> Any:
+    loops: list[asyncio.AbstractEventLoop] = []
+    original = asyncio.BaseEventLoop.run_forever
+
+    def tracking(self: asyncio.BaseEventLoop) -> None:
+        if self not in loops:
+            loops.append(self)
+        original(self)
+
+    asyncio.BaseEventLoop.run_forever = tracking  # type: ignore[method-assign]
+    fd = request.config.stash.get(fault_handler_stderr_fd_key, 2)
+    timer = threading.Timer(
+        HANG_DUMP_AFTER_S, _dump_asyncio_tasks, (request.node.nodeid, loops, fd)
+    )
+    timer.daemon = True
+    timer.start()
+    yield
+    timer.cancel()
+    asyncio.BaseEventLoop.run_forever = original  # type: ignore[method-assign]
 
 
 class FakeClock:
