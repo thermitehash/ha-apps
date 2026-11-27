@@ -2,7 +2,7 @@
 - App version: 0.4.1 (Kroger Restock pictures + Just bought; 0.1.0–0.3.1 in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4, 0.4.0 in PR #5, 0.4.1 in PR #6) · linking station firmware 0.3.0
 - Branches: PR #6 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` after the merge of PR #5 (0.4.0). Merging PR #6 publishes 0.4.1. Part A (Kroger Restock) is not in this repository; 0.4.1 is built against its agreed contract.
 - aiochainway version used: v0.4.0 (unchanged).
-- Date / PR / Commit / CI (per job): 2026-11-27 / PR #6 / CI_PENDING (v0.4.0: PR #5 at `9f561d1`, all 12 jobs green)
+- Date / PR / Commit / CI (per job): 2026-11-27 / PR #6 / `d359469` / all green: HA app linter, yamllint, Ruff + mypy, ESPHome linking station (firmware 0.3.0 config + compile), Version bump, Pytest (ubuntu-latest), Pytest (macos-latest), Sweep-now repeat ×200 (macOS), UI smoke (Playwright), Prepare, Build amd64, Build aarch64 (multi-arch manifest skipped on PRs). First run on `a5d9ec2` failed once on ubuntu (bug 29). v0.4.0: PR #5 at `a145868`, all green, merged as `4d8a129`.
 
 ## Summary
 **v0.4.1, Kroger Restock product pictures + "Just bought"** (needs the Kroger Restock integration; without it nothing changes and Details says "Product pictures: Kroger Restock not found."):
@@ -337,6 +337,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 | 26 | (v0.4.0, caught before release) The poller's "coalesce calls within 250 ms" started from 0, and a fresh page is under 250 ms old, so the very first `/api/state` fetch was skipped and nothing was scheduled: the page stayed on its skeleton | the local preview (Playwright) before any test existed | `lastStart = -Infinity` | every browser test (the page must leave `aria-busy` within 5 s) |
 | 27 | (v0.4.1, caught before release) Backfill skipped a product whose `pantryhub_` picture file was gone from Grocy: the per-product fetch saw a picture name and returned early | backfill test | backfill passes `replace_ours` for those products | `test_backfill_throttled_with_progress_and_30_day_memory` |
 | 28 | (v0.4.1, caught in design) Booking the credit in the same step as closing the row would leave a credit behind when Grocy refused the purchase, silently skipping a later real add | self-review | credit recorded only after Grocy accepts; refusal reopens the row | `test_purchase_refused_keeps_the_row` |
+| 29 | (v0.4.1, test only) `test_event_and_catch_up_deduped` checked the Just bought rows as soon as the fake HA had logged the `recent_received` call, which happens before Pantry Hub stores the answer; it failed once on ubuntu CI | CI (Pytest ubuntu-latest on `a5d9ec2`) | wait for the rows themselves; the reconnect step now also proves an item delivered while disconnected is caught up | same test, 30 repeats locally, green on both CI OSes |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.
