@@ -2,7 +2,10 @@
 - App version: 0.3.4 (aiochainway v0.4.0 + dead port warning; 0.1.0–0.3.1 released in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4) · linking station firmware 0.2.0
 - Branches: PR #4 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `42fc128`, the merge of PR #3 (which published 0.3.3). Merging PR #4 publishes 0.3.4.
 - aiochainway version used: **v0.4.0** (`git+https://github.com/thermitehash/aiochainway@v0.4.0`; `UR4Client.ensure_config()`, `SweepResult.per_antenna_counts`).
-- Date / PR / Commit / CI (per job): 2026-11-27 / PR #4 / CI_PENDING
+- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#4](https://github.com/thermitehash/ha-apps/pull/4) / code verified at `4b4f4b7` (this report is committed on top) / CI on `4b4f4b7`, all green:
+  - Lint: Ruff + mypy ✅ · HA app linter ✅ · yamllint ✅ · ESPHome linking station ✅ · Version bump (0.3.4) ✅
+  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (284 tests, coverage gate 90%) · Sweep-now repeat ×200 (macOS) ✅
+  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
 
 ## Summary
 **v0.3.4, aiochainway v0.4.0 + dead port warning**:
