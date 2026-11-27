@@ -2,7 +2,7 @@
 - App version: 0.4.0 (UI redesign + stale-page fix; 0.1.0–0.3.1 in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4, 0.4.0 in PR #5) · linking station firmware 0.2.0
 - Branches: PR #5 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `e058842`, the merge of PR #4 (which published 0.3.4). Merging PR #5 publishes 0.4.0.
 - aiochainway version used: v0.4.0 (unchanged).
-- Date / PR / Commit / CI (per job): 2026-11-27 / PR #5 / CI_PENDING
+- Date / PR / Commit / CI (per job): 2026-11-27 / PR #5 / `9f561d1` / all green: HA app linter, yamllint, Ruff + mypy, ESPHome linking station, Version bump, Pytest (ubuntu-latest), Pytest (macos-latest), Sweep-now repeat ×200 (macOS), UI smoke (Playwright), Prepare, Build amd64, Build aarch64 (multi-arch manifest skipped on PRs)
 
 ## Summary
 **v0.4.0, web UI redesign + stale-page fix** (UI and caching only; reading, sweeps, Grocy sync and MQTT unchanged):
