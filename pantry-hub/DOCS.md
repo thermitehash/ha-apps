@@ -103,6 +103,21 @@ in the **needs door sensor** state. It sweeps every
 and raises a persistent notification in Home Assistant that links to the
 web UI. Both go away as soon as a sensor is chosen.
 
+**Inverted sensor** (reports `on` when the door is closed): fix it at the
+device first if you can. Wire the reed switch the other way (NC instead of
+NO, or the reverse), or set the sensor's own invert parameter (many Zigbee
+and Z-Wave contacts have one). The **Inverted** checkbox next to the picker
+is for sensors that can't be changed. The Settings page shows a live line
+such as `Door: open (raw: on)`: open the door and check that it says
+**open**. If it was already right before you ticked the box, untick it
+(inverting twice makes it wrong again).
+
+**Saved sensor not found** (renamed or deleted in Home Assistant): it stays
+selected and is marked "not found" on the Settings page. After 2 minutes a
+notification says "Saved door sensor … not found in Home Assistant (renamed
+or deleted?)". Until then and while it lasts, Pantry Hub uses the
+closed-door schedule. Pick the sensor again to fix it.
+
 An unreachable reader at start isn't fatal either: the app starts, shows
 the reader offline, and retries each sweep.
 

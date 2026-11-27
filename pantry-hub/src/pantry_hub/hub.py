@@ -189,6 +189,8 @@ class Hub:
         self.door_needed = door_mode or options.depart_requires_door_closed
         #: Door entity chosen in the web UI (stored in the DB); options win.
         self.door_entity_web: str | None = None
+        #: Swap open/closed for the door sensor in use (stored in the DB).
+        self.door_inverted = False
         self.door_source: HomeAssistantDoor | None = None
         if ha_token and self.door_needed:
             self.door_source = HomeAssistantDoor(
@@ -247,6 +249,9 @@ class Hub:
 
     async def start(self) -> None:
         """Restore state and start every task."""
+        self.door_inverted = await self.store.get_meta("door_inverted") == "1"
+        if self.door_source is not None:
+            self.door_source.set_inverted(self.door_inverted)
         stored_door = await self.store.get_meta("door_entity")
         if stored_door and DOOR_ENTITY_RE.fullmatch(stored_door):
             self.door_entity_web = stored_door
@@ -433,6 +438,27 @@ class Hub:
             await self.door_source.set_entity(entity_id)
         self.mark_dirty()
         return f"Door sensor: {entity_id}" if entity_id else "Door sensor cleared"
+
+    async def set_door_inverted(self, inverted: bool) -> None:
+        """Store and apply the "inverted" checkbox (open ↔ closed)."""
+        await self.store.set_meta("door_inverted", "1" if inverted else "0")
+        self.door_inverted = inverted
+        if self.door_source is not None:
+            self.door_source.set_inverted(inverted)
+        self.mark_dirty()
+
+    def door_status(self) -> dict[str, Any]:
+        """Live door status for the Settings page: interpreted and raw."""
+        source = self.door_source
+        return {
+            "entity_id": self.door_entity,
+            "source": self.door_entity_source,
+            "inverted": self.door_inverted,
+            "door": self.machine.door.value,
+            "raw": source.raw_state if source else None,
+            "missing": bool(source and source.missing),
+            "needed": self.door_sensor_needed,
+        }
 
     def _on_door(self, door: Door) -> None:
         """Door entity changed (open / closed / unknown)."""
@@ -753,6 +779,8 @@ class Hub:
                 "door_entity": self.door_entity,
                 "door_entity_source": self.door_entity_source,
                 "door_sensor_needed": self.door_sensor_needed,
+                "door_inverted": self.door_inverted,
+                "door_raw": self.door_source.raw_state if self.door_source else None,
                 "door_unavailable_notified": bool(
                     self.door_source and self.door_source.notified
                 ),

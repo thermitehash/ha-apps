@@ -440,3 +440,155 @@ async def test_settings_without_home_assistant_token(
             await rig.h.door_candidates()
     finally:
         await rig.stop()
+
+
+# v0.3.2 decisions: inverted sensor, live state, not-found notification ------------
+
+
+async def test_inverted_sensor_and_live_state(
+    tmp_path: Path, grocy: FakeGrocy, ha: FakeHomeAssistant, fake: FakeUR4
+) -> None:
+    await ha.set_state(DOOR, "on")  # raw on, but this sensor means closed
+    rig = DoorRig(tmp_path, grocy, ha, fake)
+    try:
+        await rig.start()
+        await eventually(lambda: rig.h.activity is Activity.CONTINUOUS)
+        await rig.h.set_door_inverted(True)
+        status = rig.h.door_status()
+        assert status["door"] == "closed" and status["raw"] == "on"
+        assert status["inverted"] is True
+        assert WebUI.door_line(status) == "Door: closed (raw: on, inverted)"
+        await eventually(lambda: rig.h.activity is not Activity.CONTINUOUS)
+        await ha.set_state(DOOR, "off")  # raw off → open when inverted
+        await eventually(lambda: rig.h.activity is Activity.CONTINUOUS)
+        assert WebUI.door_line(rig.h.door_status()) == (
+            "Door: open (raw: off, inverted)"
+        )
+        reading = rig.h.state()["reading"]
+        assert reading["door_inverted"] is True and reading["door_raw"] == "off"
+        await ha.set_state(DOOR, "unavailable")  # unknown stays unknown
+        await eventually(lambda: rig.h.door_status()["door"] == "unknown")
+        await ha.set_state(DOOR, "off")
+        await eventually(lambda: rig.h.door_status()["door"] == "open")
+    finally:
+        await rig.stop()
+    again = DoorRig(tmp_path, grocy, ha, fake)  # the checkbox survives a restart
+    try:
+        await again.start()
+        assert again.h.door_inverted is True
+        await eventually(lambda: again.h.door_status()["door"] == "open")
+        await again.h.set_door_inverted(False)
+        assert again.h.door_status()["door"] == "closed"
+        assert WebUI.door_line(again.h.door_status()) == "Door: closed (raw: off)"
+    finally:
+        await again.stop()
+
+
+async def test_settings_inverted_checkbox_and_live_endpoint(
+    rig: DoorRig, ha: FakeHomeAssistant
+) -> None:
+    ha.add_entity(DOOR, "on", friendly_name="Pantry door", device_class="door")
+    await rig.start()
+    await eventually(lambda: rig.h.door_status()["raw"] == "on")
+    ui = WebUI(rig.h, allowed_peers=["*"])
+    port = free_port()
+    await ui.start("127.0.0.1", port)
+    base = f"http://127.0.0.1:{port}"
+    hdr = {"X-Ingress-Path": "/api/hassio_ingress/a</script>"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(base + "/settings", headers=hdr) as r:
+                page = await r.text()
+            assert '<b id="door-live">Door: open (raw: on)</b>' in page
+            assert 'name="inverted">' in page  # unchecked
+            assert "</script>/settings" not in page  # header can't break the script
+            assert (
+                "/api/hassio_ingress/a\\u003c/script\\u003e/settings/door-state" in page
+            )
+            assert "NC/NO" in page
+            async with s.get(base + "/settings/door-state") as r:
+                assert await r.json() == {
+                    "entity_id": DOOR,
+                    "source": "options",
+                    "inverted": False,
+                    "door": "open",
+                    "raw": "on",
+                    "missing": False,
+                    "needed": False,
+                }
+            csrf = re.search(r'name="csrf" value="([^"]+)"', page)
+            assert csrf
+            async with s.post(
+                base + "/settings/door",
+                data={"csrf": csrf.group(1), "door_entity": "", "inverted": "on"},
+            ) as r:
+                page = await r.text()
+            assert "; inverted" in page
+            assert 'name="inverted" checked>' in page
+            assert '<b id="door-live">Door: closed (raw: on, inverted)</b>' in page
+            assert rig.store is not None
+            assert await rig.store.get_meta("door_inverted") == "1"
+            async with s.get(base + "/settings/door-state") as r:
+                live = await r.json()
+            assert live["door"] == "closed" and live["inverted"] is True
+            await ha.set_state(DOOR, "off")  # the live endpoint follows the door
+            await eventually(lambda: rig.h.door_status()["raw"] == "off")
+            async with s.get(base + "/settings/door-state") as r:
+                live = await r.json()
+            assert (live["door"], live["raw"]) == ("open", "off")
+    finally:
+        await ui.stop()
+
+
+async def test_saved_sensor_not_found_notification(
+    rig: DoorRig, ha: FakeHomeAssistant
+) -> None:
+    await rig.start(door_entity="", settings_url="/hassio/ingress/local_pantry_hub")
+    await rig.h.set_door_entity("binary_sensor.gone")  # not in Home Assistant
+    await eventually(lambda: rig.h.door_status()["missing"] is True)
+    assert WebUI.door_line(rig.h.door_status()) == (
+        "Door: unknown (sensor not found in Home Assistant)"
+    )
+    await eventually(
+        lambda: any(
+            c.get("notification_id") == "pantry_hub_door_unavailable"
+            for c in ha.calls("persistent_notification", "create")
+        )
+    )
+    note = next(
+        c
+        for c in ha.calls("persistent_notification", "create")
+        if c.get("notification_id") == "pantry_hub_door_unavailable"
+    )
+    assert note["title"] == "Pantry Hub: door sensor not found"
+    assert note["message"].startswith(
+        "Saved door sensor `binary_sensor.gone` not found in Home Assistant "
+        "(renamed or deleted?)."
+    )
+    assert "/hassio/ingress/local_pantry_hub" in note["message"]
+    # It comes back (e.g. renamed back): found again, notification dismissed.
+    await ha.set_state("binary_sensor.gone", "off")
+    await rig.h.set_door_entity(None)
+    await rig.h.set_door_entity("binary_sensor.gone")
+    await eventually(lambda: rig.h.door_status()["raw"] == "off")
+    assert rig.h.door_status()["missing"] is False
+
+
+async def test_removed_sensor_gets_not_found_text_unavailable_gets_generic(
+    rig: DoorRig, ha: FakeHomeAssistant
+) -> None:
+    await ha.set_state(DOOR, "off")
+    await rig.start()
+    await eventually(lambda: rig.h.door_status()["raw"] == "off")
+    await ha.set_state(DOOR, "unavailable")  # exists, but unavailable
+    await eventually(lambda: ha.calls("persistent_notification", "create") != [])
+    first = ha.calls("persistent_notification", "create")[0]
+    assert first["title"] == "Pantry Hub: door sensor unavailable"
+    assert "battery" in first["message"]
+    await ha.set_state(DOOR, "off")
+    await eventually(lambda: ha.calls("persistent_notification", "dismiss") != [])
+    await ha.set_state(DOOR, None)  # deleted from Home Assistant
+    await eventually(lambda: len(ha.calls("persistent_notification", "create")) >= 2)
+    second = ha.calls("persistent_notification", "create")[1]
+    assert second["title"] == "Pantry Hub: door sensor not found"
+    assert f"Saved door sensor `{DOOR}` not found" in second["message"]

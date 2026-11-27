@@ -167,6 +167,12 @@ class HomeAssistantDoor:
         self.notified = False
         #: The "needs door sensor" notification is up.
         self.needed_notified = False
+        #: Swap open/closed (for a sensor that reports ``on`` = closed).
+        self.inverted = False
+        #: Last raw HA state of the entity (``on``/``off``/…), None if unknown.
+        self.raw_state: str | None = None
+        #: The entity doesn't exist in Home Assistant (renamed or deleted?).
+        self.missing = False
         self._seen = False
         self._ids = itertools.count(1)
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -187,6 +193,8 @@ class HomeAssistantDoor:
         _LOGGER.info("Door sensor: %s", entity_id or "none (needs door sensor)")
         self.entity_id = entity_id
         self._seen = False
+        self.raw_state = None
+        self.missing = False
         if self._notify_task is not None:
             self._notify_task.cancel()
             self._notify_task = None
@@ -198,9 +206,37 @@ class HomeAssistantDoor:
             )
             self.notified = False
         self._set(Door.UNKNOWN)
+        # The door may already have been unknown (so _set didn't arm it): the
+        # new entity gets its own unavailable/not-found timer.
+        self._arm_notification()
         ws = self._ws
         if ws is not None and not ws.closed and self.connected:
             await self._on_connected(ws)
+
+    def set_inverted(self, inverted: bool) -> None:
+        """Swap open/closed from now on (re-applied to the current raw state)."""
+        if inverted == self.inverted:
+            return
+        self.inverted = inverted
+        _LOGGER.info("Door sensor inverted: %s", "yes" if inverted else "no")
+        if self.raw_state is not None:
+            self._apply_raw(self.raw_state)
+
+    def interpret(self, raw: object) -> Door:
+        """Raw HA state → :class:`Door`, honouring :attr:`inverted`."""
+        door = door_from_state(raw)
+        if self.inverted and door is not Door.UNKNOWN:
+            return Door.CLOSED if door is Door.OPEN else Door.OPEN
+        return door
+
+    def _apply_raw(self, raw: object) -> None:
+        self.raw_state = raw if isinstance(raw, str) else None
+        self._set(self.interpret(raw))
+
+    def _set_missing(self) -> None:
+        self.missing = True
+        self.raw_state = None
+        self._set(Door.UNKNOWN)
 
     async def stop(self) -> None:
         """Disconnect."""
@@ -254,14 +290,37 @@ class HomeAssistantDoor:
                 "create",
                 {
                     "notification_id": NOTIFICATION_ID,
-                    "title": "Pantry Hub: door sensor unavailable",
-                    "message": (
-                        f"`{self.entity_id}` is unavailable. Pantry Hub falls back "
-                        "to its closed-door sweep schedule until the sensor "
-                        "reports again. Check the sensor's battery and connection."
-                    ),
+                    **self._unavailable_text(),
                 },
             )
+
+    def _unavailable_text(self) -> dict[str, str]:
+        fallback = (
+            "Pantry Hub falls back to its closed-door sweep schedule until the "
+            "sensor reports again."
+        )
+        if self.missing:
+            where = (
+                f"[Pantry Hub → Settings]({self.settings_url})"
+                if self.settings_url
+                else "Pantry Hub's web UI → Settings"
+            )
+            return {
+                "title": "Pantry Hub: door sensor not found",
+                "message": (
+                    f"Saved door sensor `{self.entity_id}` not found in Home "
+                    f"Assistant (renamed or deleted?). {fallback} Pick it again "
+                    f"in {where}, or correct `door_entity` in the app's "
+                    "configuration."
+                ),
+            }
+        return {
+            "title": "Pantry Hub: door sensor unavailable",
+            "message": (
+                f"`{self.entity_id}` is unavailable. {fallback} Check the "
+                "sensor's battery and connection."
+            ),
+        }
 
     # Websocket -----------------------------------------------------------------
 
@@ -308,6 +367,7 @@ class HomeAssistantDoor:
                 self._ws = None
                 self.connected = False
                 if not self._stopping.is_set():
+                    self.raw_state = None
                     self._set(Door.UNKNOWN)  # lost connection ≠ open door
             failures += 1
             delay = min(self.max_backoff, self.min_backoff * 2 ** min(failures, 6))
@@ -387,13 +447,14 @@ class HomeAssistantDoor:
             added = (event.get("a") or {}).get(entity)
             if isinstance(added, dict):
                 self._seen = True
-                self._set(door_from_state(added.get("s")))
+                self.missing = False
+                self._apply_raw(added.get("s"))
             changed = (event.get("c") or {}).get(entity)
             plus = changed.get("+") if isinstance(changed, dict) else None
             if isinstance(plus, dict) and "s" in plus:
-                self._set(door_from_state(plus["s"]))
+                self._apply_raw(plus["s"])
             if entity in (event.get("r") or []):
-                self._set(Door.UNKNOWN)
+                self._set_missing()  # removed from HA
             if not self._seen and not event.get("a"):
-                # Subscribed, but HA doesn't know the entity: unavailable.
-                self._set(Door.UNKNOWN)
+                # Subscribed, but HA doesn't know the entity.
+                self._set_missing()

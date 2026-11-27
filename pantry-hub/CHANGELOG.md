@@ -16,6 +16,14 @@
   (`binary_sensor.…` or empty), so typos fail there instead of at start.
 - Without a Home Assistant token (local development) the app no longer
   refuses to start; the door stays unknown.
+- **Inverted** checkbox next to the door picker, for sensors that report
+  `on` when closed and can't be changed at the device. The Settings page
+  shows the live interpreted and raw state (`Door: open (raw: on)`).
+- A saved door sensor that no longer exists in Home Assistant gets its own
+  notification: "Saved door sensor … not found in Home Assistant (renamed or
+  deleted?)", instead of the generic "unavailable" text.
+- Fixed: switching to another door sensor while the door was already
+  unknown never started the 2-minute "unavailable" notification timer.
 
 ## 0.3.1
 

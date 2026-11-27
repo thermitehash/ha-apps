@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable
 import html
+import json
 import logging
 import secrets
 import time
@@ -51,6 +52,11 @@ def _e(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def _js(value: str) -> str:
+    """Quote ``value`` as a JSON string that is safe inside a ``<script>``."""
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
 def _ago(ts: float | None) -> str:
     if not ts:
         return "never"
@@ -91,6 +97,7 @@ class WebUI:
         self.app[ALLOW_KEY] = allow
         self.app.router.add_get("/", self.index)
         self.app.router.add_get("/settings", self.settings)
+        self.app.router.add_get("/settings/door-state", self.door_state)
         self.app.router.add_post(
             "/settings/door", self._form(self._set_door, page="settings")
         )
@@ -212,7 +219,12 @@ class WebUI:
         return "Sweep not started (one is running, or reading_mode is continuous)"
 
     async def _set_door(self, form: dict[str, str]) -> str:
-        return await self.hub.set_door_entity(form.get("door_entity", ""))
+        message = await self.hub.set_door_entity(form.get("door_entity", ""))
+        inverted = form.get("inverted") == "on"
+        if inverted != self.hub.door_inverted:
+            await self.hub.set_door_inverted(inverted)
+            message += "; inverted" if inverted else "; not inverted"
+        return message
 
     async def _resync(self, form: dict[str, str]) -> str:
         report = await self.hub.resync()
@@ -258,6 +270,21 @@ class WebUI:
             f'<a href="{_e(base)}/settings">Choose the pantry door sensor</a>.</div>'
         )
 
+    async def door_state(self, request: web.Request) -> web.Response:
+        """Live door status (polled by the Settings page)."""
+        return web.json_response(self.hub.door_status())
+
+    @staticmethod
+    def door_line(status: dict[str, object]) -> str:
+        """``Door: open (raw: on)`` (plain text, also built by the page's script)."""
+        if not status["entity_id"]:
+            return "Door: no sensor"
+        if status["missing"]:
+            return "Door: unknown (sensor not found in Home Assistant)"
+        raw = status["raw"] if status["raw"] is not None else "none"
+        inverted = ", inverted" if status["inverted"] else ""
+        return f"Door: {status['door']} (raw: {raw}{inverted})"
+
     async def settings(self, request: web.Request) -> web.Response:
         """Render the Settings page (door sensor picker)."""
         hub = self.hub
@@ -279,7 +306,9 @@ class WebUI:
             )
         else:
             active = "None (not needed with <code>reading_mode: continuous</code>)."
-        door_state = hub.machine.door.value if entity else None
+        base = request.headers.get("X-Ingress-Path", "").rstrip("/")
+        live = self.door_line(hub.door_status())
+        inverted_checked = " checked" if hub.door_inverted else ""
         error = ""
         candidates: list[DoorCandidate] = []
         try:
@@ -322,14 +351,40 @@ class WebUI:
 {self._nav(request)}
 {f'<div class="msg">{_e(flash)}</div>' if flash else ""}
 <h2>Pantry door sensor</h2>
-<p>In use: {active}{f" Door: <b>{_e(door_state)}</b>." if door_state else ""}</p>
+<p>In use: {active}</p>
+<p><b id="door-live">{_e(live)}</b> <span class="muted">(live)</span></p>
 {f'<p class="bad">{_e(error)}</p>' if error else ""}
 <form method="post" action="settings/door">
 <input type="hidden" name="csrf" value="{self.token}">
 <label for="door_entity">Door sensor</label><br>
 <select id="door_entity" name="door_entity">
-<option value=""{none_selected}>— none —</option>{groups}</select>
+<option value=""{none_selected}>— none —</option>{groups}</select><br>
+<label title="Swap open and closed for a sensor that reports on = closed">
+<input type="checkbox" name="inverted"{inverted_checked}> Inverted (sensor reports <code>on</code> when closed)</label><br>
 <button>Save</button></form>
+<p class="muted">Fix an inverted sensor at the device first if you can: wire the reed switch the
+other way (NC/NO), or set the sensor's own invert parameter. Use the checkbox only for sensors
+that can't be changed. Watch the live line above: open the door and it should say
+<b>open</b>. If the raw state is already right, leave the box unticked (inverting twice
+makes it wrong again).</p>
+<script>
+(function () {{
+  var el = document.getElementById("door-live");
+  function line(s) {{
+    if (!s.entity_id) return "Door: no sensor";
+    if (s.missing) return "Door: unknown (sensor not found in Home Assistant)";
+    return "Door: " + s.door + " (raw: " + (s.raw === null ? "none" : s.raw) +
+      (s.inverted ? ", inverted" : "") + ")";
+  }}
+  function poll() {{
+    fetch({_js(base + "/settings/door-state")}, {{credentials: "same-origin"}})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (s) {{ el.textContent = line(s); }})
+      .catch(function () {{}});
+  }}
+  setInterval(poll, 2000);
+}})();
+</script>
 <p class="muted">Lists every <code>binary_sensor</code> in Home Assistant: door, garage door,
 opening and window sensors first. <code>on</code> must mean open. The choice is stored in
 Pantry Hub's database; <code>door_entity</code> in the app options, if set, takes precedence.</p>
