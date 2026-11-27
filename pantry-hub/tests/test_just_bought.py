@@ -135,8 +135,10 @@ async def test_event_and_catch_up_deduped(
         payload(clock, item_id="it-2", name="Oats", upc="0002", quantity_received=1),
     ]
     await start(rig, ha)
-    # Caught up at start.
-    await eventually(lambda: len(ha.rest("kroger_restock", "recent_received")) == 1)
+    # Caught up at start. (Wait for the rows, not the call: the fake records
+    # the call when it arrives, before Pantry Hub has stored the answer.)
+    await eventually(lambda: has_rows(rig, 2))
+    assert len(ha.rest("kroger_restock", "recent_received")) == 1
     assert [r["name"] for r in await rows(rig)] == ["Oats", "Kroger Black Beans"]
     # The same item as a live event: no duplicate. A new one: added.
     await ha.fire_event("kroger_restock_received", payload(clock))
@@ -147,21 +149,21 @@ async def test_event_and_catch_up_deduped(
     clock.advance(60)
     await ha.fire_event("kroger_restock_received", payload(clock))
     await eventually(lambda: has_rows(rig, 4))
-    # Reconnect → catch up again, still deduped.
+    # Reconnect → catch up again: the old items stay deduped, an item
+    # delivered while disconnected is picked up.
+    kroger.recent.append(payload(clock, item_id="it-4", name="Flour", upc="0004"))
     await ha.drop()
-    await eventually(lambda: len(ha.rest("kroger_restock", "recent_received")) == 2)
-    assert rig.h.ha_events is not None
-    await asyncio.wait_for(rig.h.ha_events.subscribed.wait(), 5)
-    assert len(await rows(rig)) == 4
+    await eventually(lambda: has_rows(rig, 5))
+    assert len(ha.rest("kroger_restock", "recent_received")) == 2
     # Malformed events are ignored.
     await ha.fire_event("kroger_restock_received", {"item_id": "x"})
     await asyncio.sleep(0.05)
-    assert len(await rows(rig)) == 4
+    assert len(await rows(rig)) == 5
     async with WebClient(rig.h) as c:
         state = await c.state()
     jb = state["just_bought"]
     assert jb["available"] is True
-    assert jb["to_tag"] == 3 + 1 + 3 + 3
+    assert jb["to_tag"] == 3 + 1 + 3 + 3 + 3
     assert jb["station"] == STATION
     first = jb["rows"][0]
     assert first["size"] == "15 oz" and first["to_tag"] == 3
