@@ -172,7 +172,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 - **Ports**: door mode (default) needs no incoming port: HA → reader **TCP 8888**. Continuous mode: UDP **8888** on 192.168.1.38. UDP **1111** mapped for the reader's announcements (MAC). Ingress 8099 internal; no host networking.
 - **Firewall**: door mode: allow TCP 192.168.1.38 → reader:8888 (with return traffic). Continuous mode: UDP reader → 192.168.1.38:8888. Station → Mosquitto TCP 1883.
 - **Reader provisioning**: work mode **command** (the hub also switches it at start); no UDP destination needed in door mode.
-- **Door sensor**: a Home Assistant `binary_sensor` for the pantry door (`on` = open) is required for the default mode.
+- **Door sensor**: a Home Assistant `binary_sensor` for the pantry door (`on` = open), chosen in the web UI (**Settings**) or set as `door_entity`. Door mode starts without one (v0.3.2) but then only sweeps every `closed_sweep_interval_s` and asks for a sensor.
 - **Disk**: free space first (86% full). The image is a small Alpine Python image; the SQLite DB is tiny. State is republished on change, with counters at most once a minute, to keep the recorder small.
 - **Grocy app** needs its port enabled and ssl off (or certificates) for `http://a0d7b954-grocy`.
 - **Power**: linking station needs **5 V ≥ 2 A USB-C** (QRCode2 + U107). Reader conducted power **≤ 27 dBm** (8.3 dBi SP11, FCC 36 dBm EIRP).
