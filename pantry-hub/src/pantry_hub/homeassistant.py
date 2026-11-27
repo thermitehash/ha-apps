@@ -38,6 +38,7 @@ SUPERVISOR_WS = "ws://supervisor/core/websocket"
 NOTIFICATION_ID = "pantry_hub_door_unavailable"
 NEEDED_NOTIFICATION_ID = "pantry_hub_door_needed"
 READER_CONFIG_NOTIFICATION_ID = "pantry_hub_reader_config"
+DEAD_PORT_NOTIFICATION_ID = "pantry_hub_dead_port"
 #: Device classes listed first in the picker, in this order.
 DOOR_CLASSES = ("door", "garage_door", "opening", "window")
 

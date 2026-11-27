@@ -31,7 +31,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import re
 import time
@@ -75,6 +75,8 @@ class WindowResult:
     end_reason: str | None = None
     stop_acknowledged: bool | None = None
     unique_count: int = 0
+    #: Tag reports per antenna port (``SweepResult.per_antenna_counts``).
+    per_antenna: dict[int, int] = field(default_factory=dict)
 
 
 def _default_client(host: str, port: int, **kwargs: Any) -> UR4Client:
@@ -278,6 +280,7 @@ class ReaderSession:
             end_reason=str(result.end_reason),
             stop_acknowledged=result.stop_acknowledged,
             unique_count=result.unique_count,
+            per_antenna=dict(result.per_antenna_counts),
         )
 
     async def probe(self) -> float | None:

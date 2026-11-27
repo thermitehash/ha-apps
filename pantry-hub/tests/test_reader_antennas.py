@@ -115,7 +115,7 @@ async def test_verify_mismatch_means_no_inventory(fake: FakeUR4) -> None:
     assert "start_inventory" not in fake.names()
     assert s.online is False
     assert s.last_config_error is not None
-    assert "read back antennas [1, 2, 3, 4], wanted [1]" in s.last_config_error
+    assert "antennas read back as [1, 2, 3, 4], expected [1]" in s.last_config_error
     assert s.antennas_enabled is None
 
 

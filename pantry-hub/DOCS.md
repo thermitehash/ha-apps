@@ -151,6 +151,26 @@ verified) and `last_config_error`.
   open port can damage the reader, and it wastes read time on a port that
   can't see anything.
 
+### Dead port warning
+
+The UR4 can't tell whether an antenna is plugged in, so Pantry Hub watches
+how many reads each enabled port gets in completed sweeps (aborted sweeps
+don't count):
+
+- **Two or more ports**: a port with no reads in each of the last 5 sweeps,
+  while the other ports read at least 10 times in total over those sweeps.
+- **One port**: no reads in 5 sweeps while tags were in the pantry when the
+  silence started.
+
+Home Assistant then shows "Antenna on port N gave no reads in 5 sweeps —
+check its cable and connection." It clears as soon as that port reads again
+(in any window, including continuous reading). It's a warning only: reading
+and presence carry on unchanged. `sensor.pantry_hub_reader_activity` shows
+`per_port_reads_last_sweep` and `dead_ports`.
+
+A port can also be quiet for a good reason (nothing within its reach), so
+treat the warning as "check the cable", not proof of a fault.
+
 `reading_mode: continuous` leaves the reader alone (it runs in its own auto
 mode there); set antennas and power when provisioning it.
 
