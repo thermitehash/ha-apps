@@ -1,12 +1,15 @@
 # Pantry Hub build report
-- App version: 0.2.0 (0.1.0 was never merged/released; both are in PR #1)
+- App version: 0.3.0 (0.1.0 and 0.2.0 were never merged/released; all three are in PR #1) · linking station firmware 0.2.0
 - aiochainway version used: v0.2.0 (`f188a02`, ships `aiochainway.testing.FakeUR4`)
-- Date / PR / Commit / CI (per job): 2026-11-26 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / code verified at `de48568` (this report is committed on top) / CI on `de48568`, all green:
-  - Lint: Ruff + mypy ✅ · HA app linter ✅ · yamllint ✅ · ESPHome linking station (C++ host tests, `esphome config`, `esphome compile`) ✅ · Version bump (0.2.0) ✅
-  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (coverage gate 90%)
-  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
+- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / CI_V030
 
 ## Summary
+**v0.3.0** (Q8): an "already in stock" session at the linking station, started by a printed mode card instead of a button gesture.
+- In link mode, scanning the QR card `PANTRY-HUB:IN-STOCK` toggles the session. While it's active, the link-mode pulse is dim amber instead of dim blue, and every link publishes `"in_stock": true` on both the barcode and tag messages. It ends when link mode exits (60 s idle or double-click) or when the card is scanned again. In Kroger mode the card is ignored (amber double blink).
+- Printable card: `docs/mode-card-in-stock.pdf` (US Letter, two credit-card-sized cards at real size) and `docs/mode-card-in-stock.png` (300 dpi); regenerate with `script/make_mode_card.py`. The QR was verified to decode to the exact payload (OpenCV), including at 25 % scale.
+- Station mode logic moved into `esphome/linking-station/include/link_mode.h` (pure C++, host-tested); the YAML lambdas only call it. New HA entity on the station: `In-stock session`.
+- Hub: no code change (it already accepts `in_stock` from v0.2.0); a contract test pins the firmware ↔ hub interface.
+
 **v0.2.0** applies the open-question decisions:
 - **Q1 "already in stock"**: per-link option (web UI checkbox; `"in_stock": true` in the station's barcode or tag message). It skips the add of the current presence cycle (or the next arrival if the tag isn't in the pantry), only that cycle. Default off. The departure of that cycle still consumes one unit, by amount at the Pantry location, because Grocy counted it.
 - **Q2 ambiguous consume without a stock entry id**: never resent. It's failed for review (`resolution = review`), counted in `sensor.pantry_hub_grocy_queue` (`failed`, plus a new `review` attribute), listed in the web UI with **Consume now** / **Dismiss**, and included in the resync report (`review_ops`).
@@ -62,13 +65,21 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 - Modes: **Kroger** (default, LED off when idle, existing result colours) → barcode calls **`kroger_restock.scan_upc`** with `upc` + **`source: esphome`** (from `ha-kroger-restock` `esphome/kroger-scanner-atoms3.yaml` / `services.yaml`). **Link**: double-click toggles; slow dim blue pulse; auto-exit after 60 s idle; exit shows a 250 ms cyan flash, then LED off. Results: green linked, amber unknown barcode, magenta already linked, red error/timeout.
 - Button: double-click = link mode; short press (after ~350 ms) = `kroger_restock.print_list`; hold 1–6 s = `kroger_restock.sync`.
 - Beep: switch "Link result beep (unverified)", default off; sends `m14_beep_cmd` (default `21 63 42 01`, the M14 "beep on decode" command) 1/2/3×. Marked unverified.
+- **In-stock session (firmware 0.2.0)**: in link mode, scanning the mode card (QR `PANTRY-HUB:IN-STOCK`, case-insensitive) toggles it. Pulse: dim blue (0, 0.2, 1) → dim amber (1, 0.55, 0). Barcode and tag messages carry `"in_stock": true` while it's active. It ends on link-mode exit (double-click, 60 s idle) or a second card scan; card scans count as activity for the idle timer; a scan in Kroger mode is ignored. Entity: `binary_sensor` In-stock session.
 - MQTT is used for the linking topics only (`discovery: false`); the native API is kept for Kroger mode.
 
 ## HA entities created
 `binary_sensor.pantry_hub_reader_online`, `sensor.pantry_hub_present_tags`, `sensor.pantry_hub_unlinked_tags`, `sensor.pantry_hub_grocy_queue` (attributes: failed (includes review), review, online, last_error), `sensor.pantry_hub_last_link`, `sensor.pantry_hub_resync_differences` (added: holds the resync report), `event.pantry_hub_item` (`arrived`/`departed`), `button.pantry_hub_resync`. All under one device "Pantry Hub" via device-based discovery (`homeassistant/device/pantry_hub/config`) using `default_entity_id`.
-Linking station adds: `binary_sensor` Link mode, `text_sensor` Last linked tag, `switch` Link result beep (unverified).
+Linking station adds: `binary_sensor` Link mode, `binary_sensor` In-stock session (firmware 0.2.0), `text_sensor` Last linked tag, `switch` Link result beep (unverified).
 
 ## Spec changes vs. this spec
+v0.3.0:
+- The card toggles the session only in link mode (in Kroger mode it's treated like any other non-product QR: amber double blink), so it can't start a session that would then apply to Kroger scans.
+- `in_stock` is sent on both the barcode and the tag message during a session (the hub accepts either; sending both is harmless and survives a dropped message).
+- The card payload match is case-insensitive and ignores surrounding CR/LF/spaces.
+- Station mode logic was extracted into `include/link_mode.h` so the behaviour is unit-testable without hardware; install now copies `include/` alongside `components/`.
+- Card size: 85 × 55 mm (credit card); the PDF page is US Letter with two copies and a "print at 100%" note.
+
 v0.2.0:
 - Q1 interpretation: skipping the add means the tag *owns* the unit Grocy already counted for that cycle, so its departure still consumes one unit, by amount at the Pantry location. Without that, Grocy would never decrease for existing stock. If the tag isn't in the pantry when linked, the skip applies to its next arrival (the "current" cycle hasn't started).
 - Q1 linking station firmware: not changed; it doesn't send `in_stock` yet. Use the web UI (or any MQTT client) for existing stock. A station gesture can be added later.
@@ -95,7 +106,9 @@ Q1–Q3 are resolved in v0.2.0 (above). Q4–Q7 stay as first-run hardware check
 6. **UDP source IP through the Supervisor's Docker bridge**: expected to be preserved (DNAT); if `dropped_sources` rises, NAT is rewriting it.
 7. HA 2026.11 MQTT discovery `default_entity_id` (replacement for `object_id`): verify the entity IDs on first run.
 
-New: 8. Should the linking station get a gesture for "already in stock" (e.g. triple-click before scanning), so existing stock can be tagged without the web UI?
+Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the M14 reads the printed card (QR enabled, as the wall scanner already sees QR on packaging) and that a laminated card still reads under the base's illumination.
+
+(Was: 8. Should the linking station get a gesture for "already in stock" (e.g. triple-click before scanning), so existing stock can be tagged without the web UI?
 
 ## Hardware/setup impact (ports, firewall, disk, power supply)
 - **Ports**: UDP **8888** on 192.168.1.38 (UR4 → hub, host port configurable under Network); ingress 8099 internal; no host networking.
@@ -106,7 +119,9 @@ New: 8. Should the linking station get a gesture for "already in stock" (e.g. tr
 - U107 needs mounting beside the scanner, antenna facing out (housing doesn't fit; separate ha-kroger-restock PR later).
 
 ## Test results (tests, coverage, property tests, fault injection)
-- **149 pytest tests** pass locally (Python 3.14.6, Linux; two full runs); CI runs ubuntu-latest and macos-latest. **Coverage 95%** (branch) for `pantry_hub` (gate 90%): `__main__` 98, `grocy` 96, `hub` 94, `linking` 94, `store` 93, `web` 99, `worker` 91, `mqtt` 86, `presence`/`config`/`discovery` 100.
+- **v0.3.0 tests**: `esphome/linking-station/tests/test_link_mode.cpp` (host, g++ -Werror; run in CI's ESPHome job): card/product/ignored classification (case, CR/LF, dashes, short codes, URLs); card ignored in Kroger mode; session on → amber + in-stock on every link; card again → off, still linking, blue; ends on double-click and on idle exit; doesn't come back on re-entering link mode. `pantry-hub/tests/test_firmware_contract.py`: card payload identical in firmware and generator; PNG/PDF present; barcode **and** tag publishes carry `in_stock` during a session; the hub reads exactly that JSON bool; link-mode exit ends the session. Mutation: dropping `in_stock` from the tag message → caught. Removing the reset in `exit_link()` is unobservable (in-stock also requires link mode, and entering link mode resets it), so session-end behaviour holds through two independent guards.
+- **153 pytest tests** pass locally for v0.3.0 (Python 3.14.6, Linux); ruff, mypy --strict, yamllint and `esphome config` clean.
+- v0.2.0: **149 pytest tests** pass locally (Python 3.14.6, Linux; two full runs); CI runs ubuntu-latest and macos-latest. **Coverage 95%** (branch) for `pantry_hub` (gate 90%): `__main__` 98, `grocy` 96, `hub` 94, `linking` 94, `store` 93, `web` 99, `worker` 91, `mqtt` 86, `presence`/`config`/`discovery` 100.
 - **v0.2.0 regression tests** (`tests/test_v020_decisions.py`, `tests/test_worker.py`):
   - Q1: in-stock link while present (no add; departure consumes the pre-existing unit; next arrival adds); while absent (next arrival skipped only); default off; relink in-stock doesn't undo a queued add; MQTT `in_stock` on the barcode and on the tag message; web UI checkbox end to end.
   - Q2: lost-answer consume without a stock id → review, sent exactly once; Retry refused; Dismiss; Consume now (worker and web); a crash mid-request → review; consumes *with* a stock id keep the existing check; review count in the MQTT state and `review_ops` in the resync report; under-consume (not double) on 5xx.
@@ -139,12 +154,13 @@ New: 8. Should the linking station get a gesture for "already in stock" (e.g. tr
 | 14 | (v0.2.0, behaviour) A failed add retried after the item left would add a unit that is never consumed | open question Q3 | presence check before replay; cancel add + consume | `test_q3_*` (4 tests) |
 | 15 | (v0.2.0, behaviour) An ambiguous consume without a stock id was resent, risking a double consume | open question Q2 | review instead of resend | `test_q2_*` (5 tests) |
 | 16 | (v0.2.0, behaviour) Tagging existing stock double-counted it | open question Q1 | "already in stock" per-link skip | `test_q1_*` (7 tests) |
+| 17 | (v0.3.0, feature gap) Existing stock could only be marked in-stock from the web UI | open question Q8 | mode-card in-stock session in the firmware | `test_link_mode.cpp`, `test_firmware_contract.py` |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.
 2. Mosquitto + MQTT integration up; create a `linking-station` HA user for MQTT.
 3. Grocy app: enable a port, ssl off, create the **Pantry** location and an **API key**; Grocy HACS integration set up.
-4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.2.0`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
+4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.0`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
 5. Check the entity IDs in HA match the list above (`default_entity_id`).
 6. Provision the UR4 from the Mac with `aiochainway` v0.2.0: static IP on the IoT VLAN, region USA, power ≤ 27 dBm, auto mode, UDP destination `192.168.1.38:8888`; add the firewall rule.
 7. Put one tagged item in range: `reader_online` on, `bad_frames` 0, `dropped_sources` 0 (else set `allowed_reader_ip`). An unlinked arrival appears in the web UI.
@@ -157,3 +173,4 @@ New: 8. Should the linking station get a gesture for "already in stock" (e.g. tr
 14. Import the low-stock → Kroger Restock automation from `docs/automations.md`.
 15. (v0.2.0) Tag one item Grocy already counts with **already in stock** in the web UI: on arrival, no Grocy add; on departure, Grocy −1.
 16. (v0.2.0) Check the web UI's Failed operations list stays empty in normal use; if a **Review** row appears, check Grocy, then Consume now / Dismiss.
+17. (v0.3.0) Print `docs/mode-card-in-stock.pdf` at 100 %. Double-click (blue pulse), scan the card → amber pulse and the **In-stock session** entity on. Link one item Grocy already counts → the linked message mentions "already in stock"; its arrival adds nothing. Scan the card again → blue. Scan it in Kroger mode → amber double blink, nothing else.
