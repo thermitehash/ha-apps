@@ -18,6 +18,17 @@ configuration:
       per_window (default): connect for each sweep or continuous window and
       disconnect afterwards. persistent: keep one connection open (ping every
       60 s, reconnect automatically).
+  reader_antennas:
+    name: Reader antenna ports
+    description: >-
+      UR4 antenna ports to enable (1-4). Bench: [1]. Two Vulcan SP11s: [1, 2].
+      Every enabled port must have an antenna connected. Applied and verified
+      before any inventory (door mode).
+  reader_power_dbm:
+    name: Reader power (dBm)
+    description: >-
+      Power for each enabled antenna, 5-30 dBm. Must not exceed
+      max_reader_power_dbm (27 for 8.3 dBi antennas).
   door_entity:
     name: Door sensor
     description: >-

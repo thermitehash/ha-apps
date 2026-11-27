@@ -37,6 +37,7 @@ _LOGGER = logging.getLogger(__name__)
 SUPERVISOR_WS = "ws://supervisor/core/websocket"
 NOTIFICATION_ID = "pantry_hub_door_unavailable"
 NEEDED_NOTIFICATION_ID = "pantry_hub_door_needed"
+READER_CONFIG_NOTIFICATION_ID = "pantry_hub_reader_config"
 #: Device classes listed first in the picker, in this order.
 DOOR_CLASSES = ("door", "garage_door", "opening", "window")
 
@@ -321,6 +322,20 @@ class HomeAssistantDoor:
                 "sensor's battery and connection."
             ),
         }
+
+    async def notify(self, notification_id: str, title: str, message: str) -> bool:
+        """Raise (or update) a persistent notification; False if not connected."""
+        return await self._call_service(
+            "persistent_notification",
+            "create",
+            {"notification_id": notification_id, "title": title, "message": message},
+        )
+
+    async def dismiss(self, notification_id: str) -> bool:
+        """Dismiss a persistent notification; False if not connected."""
+        return await self._call_service(
+            "persistent_notification", "dismiss", {"notification_id": notification_id}
+        )
 
     # Websocket -----------------------------------------------------------------
 

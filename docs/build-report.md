@@ -1,14 +1,21 @@
 # Pantry Hub build report
-- App version: 0.3.2 (door sensor picker + inverted sensors; 0.1.0–0.3.1 were released together in PR #1, 0.3.2 is in PR #2) · linking station firmware 0.2.0
-- Branches: PR #2 (`claude/kind-ritchie-58v2e4` → `main`) was started from `main` at `873bd33`, the merge commit of PR #1, so it contains all of PR #1. PR #1 is merged (not open). Its merge published `ghcr.io/thermitehash/pantry-hub:0.3.1` (amd64 + aarch64 + manifest, release tagged). Merging PR #2 publishes 0.3.2 and leaves `main` at 0.3.2.
-- aiochainway version used: v0.3.0 (`git+https://github.com/thermitehash/aiochainway@v0.3.0`; unchanged)
-- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#2](https://github.com/thermitehash/ha-apps/pull/2) / code verified at `589c4c1` (this report is committed on top) / CI on `589c4c1`, all green:
-  - Lint: Ruff + mypy ✅ · HA app linter ✅ (accepts the `match(...)` schema) · yamllint ✅ · ESPHome linking station ✅ · Version bump (0.3.2) ✅
-  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (260 tests, coverage gate 90%) · Sweep-now repeat ×200 (macOS) ✅
+- App version: 0.3.3 (reader antenna/power enforcement; 0.1.0–0.3.1 released in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3) · linking station firmware 0.2.0
+- Branches: PR #3 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `0acda6e`, the merge of PR #2 (which published 0.3.2). Merging PR #3 publishes 0.3.3.
+- aiochainway version used: v0.3.0 (unchanged). v0.4.0 (`ensure_config()`, `get_antenna_status()`) isn't tagged yet; see "Spec changes" for the adapter.
+- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#3](https://github.com/thermitehash/ha-apps/pull/3) / code verified at `97c760b` (this report is committed on top) / CI on `97c760b`, all green:
+  - Lint: Ruff + mypy ✅ · HA app linter ✅ (accepts the `reader_antennas` list schema) · yamllint ✅ · ESPHome linking station ✅ · Version bump (0.3.3) ✅
+  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (274 tests, coverage gate 90%) · Sweep-now repeat ×200 (macOS) ✅
   - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
-  - Note: on `a674051`, Pytest ubuntu-latest hung in a test-fixture teardown and was cancelled at the 20-min limit (bug 24, fixed in `589c4c1`).
 
 ## Summary
+**v0.3.3, reader antenna/power enforcement** (door mode):
+- New options `reader_antennas` (list of ports 1–4, non-empty, default `[1]`; schema `- int(1,4)`) and `reader_power_dbm` (`int(5,30)`, default 27). `reader_power_dbm > max_reader_power_dbm` refuses to start: "reader_power_dbm 27 is above max_reader_power_dbm 20: lower reader_power_dbm …".
+- On every new reader connection, before any inventory (per_window: each window; persistent: first connect and after every auto-reconnect via `on_reconnect`, or after a failure), the antenna mask and per-antenna power are read. If they differ: `set_antennas` (aiochainway always sends the save flag `0x01`) and `set_power` for each enabled antenna whose power differs, then read back and verify. A matching reader gets **no writes**. Disabled ports' power is left alone.
+- No inventory starts until the read-back matches. A failed set or a mismatching read-back → window ends `config_failed`, no `start_inventory`, `reader_online` false, persistent notification `pantry_hub_reader_config` ("Pantry Hub: Reader antenna settings could not be applied", with the error and "check that every enabled port has an antenna connected"), retry after `retry_s` (60 s). Dismissed when the settings verify.
+- `sensor.pantry_hub_reader_activity` attributes: `antennas_enabled`, `reader_power_dbm`, `config_applied` (ISO timestamp of the last verify), `last_config_error`.
+- The between-window reader check (connect + ping) never configures; continuous (UDP auto) mode never configures.
+- Docs: bench `reader_antennas: [1]`, final `[1, 2]` for the two SP11s; every enabled port must have an antenna connected. The setup guide's provisioning example now enables `[1]`, not all four ports.
+
 **v0.3.2, door sensor picker**:
 - Web UI **Settings** page (ingress): a dropdown of every `binary_sensor` from Home Assistant (websocket `get_states`), device classes door → garage_door → opening → window first (in that order), then the rest; within a group by friendly name, then entity id. Each option shows friendly name — entity id (current state). **Save** stores the choice in the app DB (`meta.door_entity`).
 - Precedence: `door_entity` in the app options wins if set; otherwise the web UI choice. The Settings page states the active source; `sensor.pantry_hub_reader_activity` gains `door_entity_source` (`options` | `web_ui` | null) and `door_sensor_needed` attributes, and `door_entity` now shows the effective entity. Changing the web choice re-subscribes on the open websocket (no restart).
@@ -99,11 +106,20 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 - MQTT is used for the linking topics only (`discovery: false`); the native API is kept for Kroger mode.
 
 ## HA entities created
+(v0.3.3: `sensor.pantry_hub_reader_activity` gains `antennas_enabled`, `reader_power_dbm`, `config_applied`, `last_config_error`; no new entities.)
 (v0.3.2: `sensor.pantry_hub_reader_activity` gains the attributes `door_entity_source` and `door_sensor_needed`; no new entities.)
 `binary_sensor.pantry_hub_reader_online`, `sensor.pantry_hub_present_tags`, `sensor.pantry_hub_unlinked_tags`, `sensor.pantry_hub_grocy_queue` (attributes: failed (includes review), review, online, last_error), `sensor.pantry_hub_last_link`, `sensor.pantry_hub_resync_differences` (added: holds the resync report), `event.pantry_hub_item` (`arrived`/`departed`), `button.pantry_hub_resync`, and (v0.3.0) `sensor.pantry_hub_reader_activity` (idle/continuous/sweep; attributes: reading mode, door, sweeps completed/aborted, last sweep/attempt, reader id, departures allowed, door notification), `sensor.pantry_hub_last_sweep` (timestamp), `button.pantry_hub_sweep_now`. All under one device "Pantry Hub" via device-based discovery (`homeassistant/device/pantry_hub/config`, identifiers `pantry_hub` + `chainway_<reader id>`) using `default_entity_id`.
 Linking station adds: `binary_sensor` Link mode, `binary_sensor` In-stock session (firmware 0.2.0), `text_sensor` Last linked tag, `switch` Link result beep (unverified).
 
 ## Spec changes vs. this spec
+v0.3.3:
+- **aiochainway v0.4.0 not tagged**: implemented against v0.3.0's `get_antennas` / `get_power_all` / `set_antennas` / `set_power` behind a small adapter, `pantry_hub/reader_config.py` (`ensure_config(client, ReaderConfig) -> AppliedConfig`, raising `ReaderConfigError`). `ReaderSession` only calls that function. When v0.4.0 is tagged: pin it, make the adapter call `UR4Client.ensure_config()` / `get_antenna_status()`, and delete the local read/compare/verify code, so the verify logic isn't duplicated long-term (written in the module docstring).
+- **"After every reconnect"**: with `per_window` every window is a new connection, so the settings are read (two short commands) before every window; writes still happen only on a difference. With `persistent` they're verified once per connection (initial, after `auto_reconnect`, or after a failure).
+- **Save flag**: v0.3.0's `set_antennas` always sends the SDK's save flag; there's no separate parameter. `set_power` has no save flag in the protocol; power is re-checked on every connection anyway.
+- **Power read-back** is compared as whole dBm (the reader reports dBm × 100).
+- **Door mode only**: continuous mode leaves the reader in its own auto mode and never sends it configuration commands.
+- Supersedes v0.1.0 spec change 9 ("the hub never configures the reader"): in door mode it now enforces antennas and power.
+
 v0.3.2:
 - **Notification link**: the persistent notification links to the app's ingress panel (`/hassio/ingress/<slug>`, slug derived from the container hostname the Supervisor sets, e.g. `1a2b3c4d-pantry-hub` → `1a2b3c4d_pantry_hub`). HA can't deep-link into a sub-page of an ingress panel, so it opens the status page, which shows a "needs a door sensor" banner with a link to Settings. If the hostname isn't recognised, the message says "Open Pantry Hub's web UI → Settings".
 - **Also relaxed**: `depart_requires_door_closed` (continuous mode) no longer requires `door_entity` in the options; the web UI choice counts too. With neither, the door is unknown, so timer departures wait (as before for an unknown door), and the same notification asks for a sensor.
@@ -163,6 +179,8 @@ Q1–Q3 are resolved in v0.2.0 (above). Q4–Q7 stay as first-run hardware check
 6. **UDP source IP through the Supervisor's Docker bridge**: expected to be preserved (DNAT); if `dropped_sources` rises, NAT is rewriting it.
 7. HA 2026.11 MQTT discovery `default_entity_id` (replacement for `object_id`): verify the entity IDs on first run.
 
+v0.3.3 adds hardware check 14: on the real UR4, confirm the antenna setting survives a power cycle (the save flag) and whether power does too (it's re-checked on every connection either way); and that `get_power` reports whole dBm, so the read-back comparison doesn't flap. Follow-up: switch `reader_config.py` to aiochainway v0.4.0's `ensure_config()` once it's tagged.
+
 v0.3.1 adds hardware check 13 (hardware validation §E.2): does the UR4 keep an idle TCP session open (and for how long)? If it does, `reader_connection: persistent` can become the default; until then `per_window`. Also check whether the reader acknowledges stop (the log says "didn't acknowledge stop" if not; sweeps still count).
 
 Door-driven reading (v0.3.0) adds hardware checks: 10. confirm a 45 s command-mode sweep covers the whole pantry with the 4 SP11 antennas (the tag count per sweep is logged); 11. whether the UR4's UDP 1111 announcements reach HA at all (expected not, across VLANs); 12. the door sensor's `on` = open convention (an inverted sensor needs a template binary_sensor).
@@ -178,10 +196,18 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 - **Door sensor**: a Home Assistant `binary_sensor` for the pantry door (`on` = open), chosen in the web UI (**Settings**) or set as `door_entity`. Door mode starts without one (v0.3.2) but then only sweeps every `closed_sweep_interval_s` and asks for a sensor.
 - **Disk**: free space first (86% full). The image is a small Alpine Python image; the SQLite DB is tiny. State is republished on change, with counters at most once a minute, to keep the recorder small.
 - **Grocy app** needs its port enabled and ssl off (or certificates) for `http://a0d7b954-grocy`.
+- **Antennas** (v0.3.3): `reader_antennas: [1]` on the bench, `[1, 2]` with both SP11s. Every enabled port must have an antenna connected; Pantry Hub enables exactly these ports on the reader.
 - **Power**: linking station needs **5 V ≥ 2 A USB-C** (QRCode2 + U107). Reader conducted power **≤ 27 dBm** (8.3 dBi SP11, FCC 36 dBm EIRP).
 - U107 needs mounting beside the scanner, antenna facing out (housing doesn't fit; separate ha-kroger-restock PR later).
 
 ## Test results (tests, coverage, property tests, fault injection)
+- **v0.3.3** (274 pytest tests total, coverage 95%; ruff, mypy --strict, yamllint clean). `tests/test_reader_antennas.py` (14, `FakeUR4`):
+  - **Factory defaults corrected**: a reader at antennas [1, 2, 3, 4] / 30 dBm → `get_antennas`, `set_antennas`, `set_power`, `get_antennas` (read back), all before the first `start_inventory`; ends at mask `0x01`, port 1 at 27 dBm, port 2 untouched; exactly 2 writes; `antennas_enabled [1]`, `config_applied` set.
+  - **Matching reader → zero writes** over 3 windows (still verified on each new connection); only a wrong power → exactly one `set_power`.
+  - **Verify mismatch** (a fake reader that acknowledges the antenna write but keeps [1, 2, 3, 4]) → `config_failed`, no `start_inventory`, `reader_online` false, error "read back antennas [1, 2, 3, 4], wanted [1]". A failing `set_antennas` → the same, then the retry succeeds.
+  - **Reconnect re-applies**: persistent mode, the reader is reset to factory defaults and drops the connection → `auto_reconnect` → the next window re-applies (second `set_antennas`); with no change on the same connection, no further reads. per_window: a mask changed between windows is corrected on the next connection.
+  - **Power over cap → refuse to start**; options validation (empty list, port 0/5, booleans, non-list, power 4/31) and dedupe/sort (`[2, 1, 2]` → `(1, 2)`); config.yaml options and schema.
+  - **Hub**: a stuck reader → notification `pantry_hub_reader_config` with the title and the "every enabled port has an antenna" hint, no inventory, no completed sweep, `reader_online` false, `last_config_error` set; once the reader accepts the setting, the next retry verifies, a sweep completes, the notification is dismissed and the attributes show `[1]`, 27 dBm, `config_applied`. Continuous mode never configures. The probe never configures.
 - **v0.3.2** (260 pytest tests total, coverage 95%; ruff, mypy --strict, yamllint clean). `tests/test_door_picker.py` (26):
   - **Inverted + live display**: raw `on` with inverted → closed (continuous stops), raw `off` → open (continuous starts), `unavailable` stays unknown; the line reads `Door: closed (raw: on, inverted)` / `Door: open (raw: off, inverted)`; the checkbox survives a restart and unticking flips it back (`Door: closed (raw: off)`). Web: the page shows the live line and the checkbox; `settings/door-state` returns entity, source, inverted, door, raw, missing, needed and follows the door as it changes; saving with the box ticked stores `door_inverted = 1` and re-renders checked; an ingress path containing `</script>` can't break out of the page's script.
   - **Not found**: a web choice that doesn't exist → `missing`, line "Door: unknown (sensor not found in Home Assistant)", notification titled "door sensor not found" starting "Saved door sensor `binary_sensor.gone` not found in Home Assistant (renamed or deleted?)." with the Settings link; it's found again once it exists. A sensor that exists but is `unavailable` still gets the generic text; one deleted from HA (`r` event) gets the not-found text.
@@ -253,7 +279,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 1. Free HA disk space below ~75%; take a backup.
 2. Mosquitto + MQTT integration up; create a `linking-station` HA user for MQTT.
 3. Grocy app: enable a port, ssl off, create the **Pantry** location and an **API key**; Grocy HACS integration set up.
-4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.2`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
+4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.3`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
 5. Check the entity IDs in HA match the list above (`default_entity_id`).
 6. Provision the UR4 from the Mac with `aiochainway` v0.3.0: static IP on the IoT VLAN, region USA, power ≤ 27 dBm, **command mode** (door mode, default); add the firewall rule HA → reader TCP 8888. (Continuous fallback: auto mode + UDP destination `192.168.1.38:8888`, UDP rule reader → HA.)
 7. Put one tagged item in range, open the door: `reader_online` on, `reader_activity` = continuous; an unlinked arrival appears in the web UI.
@@ -272,3 +298,4 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 20. (v0.3.1) Hardware validation §E.2: with the door closed, watch the log for the idle reader check every 10 min. To test `reader_connection: persistent`, set it, restart, and leave the door closed for over an hour: sweeps should keep completing on one connection (no "Reader unreachable"). If the reader drops idle sessions, stay on `per_window`.
 21. (v0.3.2) Leave `door_entity` empty, start: a "choose the pantry door sensor" notification appears. Follow it → the web UI banner → **Settings**: the pantry door contact is near the top (door class). Save; open the pantry door → `reader_activity` = continuous. Set `door_entity` in the configuration to something else → Settings says the options are in use.
 22. (v0.3.2) With the door shut, the Settings line should read `Door: closed (raw: off)`. If it says open, first try the sensor's own invert parameter or rewire NC/NO; only then tick **Inverted** and confirm the line flips. Rename the door entity in HA: after 2 min, "Saved door sensor … not found" appears; pick it again.
+23. (v0.3.3) With one antenna on port 1, start with `reader_antennas: [1]`: the log shows "Reader antennas [1, 2, 3, 4], configured [1]: setting them (saved)" once (a factory-default reader), then nothing on later windows; `reader_activity` shows `antennas_enabled: [1]`, `reader_power_dbm: 27` and `config_applied`. Power-cycle the reader: it should still be [1] (no write logged). After mounting both SP11s on ports 1 and 2, set `[1, 2]`.

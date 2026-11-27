@@ -39,6 +39,7 @@ from .discovery import (
 )
 from .grocy import GrocyError, StockBackend
 from .homeassistant import (
+    READER_CONFIG_NOTIFICATION_ID,
     SUPERVISOR_WS,
     DoorCandidate,
     HomeAssistantDoor,
@@ -55,6 +56,7 @@ from .reader import (
     WindowResult,
     reader_unique_id,
 )
+from .reader_config import ReaderConfig
 from .reading import Activity, Plan, ReadingConfig, ReadingPlanner
 from .store import Link, Store, iso
 from .worker import GrocyWorker
@@ -170,8 +172,17 @@ class Hub:
             connection="persistent"
             if options.reader_connection == "persistent"
             else "per_window",
+            # Door mode drives the reader in command mode: enforce the antenna
+            # mask and power before any inventory. (Continuous mode leaves the
+            # reader in auto mode and never configures it.)
+            config=ReaderConfig.of(options.reader_antennas, options.reader_power_dbm)
+            if door_mode
+            else None,
+            clock=wall,
             **session_kwargs,
         )
+        #: The "antenna settings could not be applied" notification is up.
+        self._config_notified = False
         self.probe_every_s = probe_every_s
         #: Last time a window or probe talked to the reader (monotonic).
         self._last_contact = monotonic()
@@ -506,11 +517,40 @@ class Hub:
         finally:
             self._window = None
         self._last_contact = self.monotonic()
+        if not task.cancelled():
+            await self._reader_config_notice(task.result())
         if task.cancelled():
             return WindowResult(
                 False, 0, 0.0, "aborted (door change or sweep request)"
             ), True
         return task.result(), False
+
+    async def _reader_config_notice(self, result: WindowResult) -> None:
+        """Raise / dismiss "Reader antenna settings could not be applied"."""
+        failed = result.end_reason == "config_failed"
+        if failed == self._config_notified:
+            return
+        source = self.door_source
+        if failed:
+            message = (
+                "Pantry Hub couldn't set or verify the reader's antennas "
+                f"(wanted {list(self.options.reader_antennas)} at "
+                f"{self.options.reader_power_dbm} dBm): {result.error}. No "
+                "inventory runs until they match; it retries automatically. "
+                "Check that every enabled port has an antenna connected."
+            )
+            if source is not None:
+                self._config_notified = await source.notify(
+                    READER_CONFIG_NOTIFICATION_ID,
+                    "Pantry Hub: Reader antenna settings could not be applied",
+                    message,
+                )
+            else:
+                _LOGGER.error("Reader antenna settings could not be applied")
+        elif source is not None:
+            await source.dismiss(READER_CONFIG_NOTIFICATION_ID)
+            self._config_notified = False
+        self.mark_dirty()
 
     async def _idle(self, seconds: float) -> None:
         self._wake.clear()
@@ -791,6 +831,12 @@ class Hub:
                 "last_attempt": self.last_sweep_attempt,
                 "reader_id": self.reader_id,
                 "reader_connection": self.session.connection,
+                "antennas_enabled": self.session.antennas_enabled,
+                "reader_power_dbm": self.session.power_dbm,
+                "config_applied": iso(self.session.config_applied)
+                if self.session.config_applied
+                else None,
+                "last_config_error": self.session.last_config_error,
                 "reader_error": self.session.last_error if self.door_mode else None,
             },
         }

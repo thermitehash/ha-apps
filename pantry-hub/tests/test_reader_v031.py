@@ -78,14 +78,14 @@ async def test_persistent_holds_one_connection(fake: FakeUR4) -> None:
         await fake.wait_for_connections(1)
         await asyncio.sleep(0.1)
         assert fake.connections == 1
-        assert made == [
-            {
-                "timeout": 1.0,
-                "stop_on_connect": True,
-                "keepalive_interval_s": 60.0,
-                "auto_reconnect": True,
-            }
-        ]
+        assert len(made) == 1
+        assert made[0].pop("on_reconnect") == s._on_reconnect  # re-verify config
+        assert made[0] == {
+            "timeout": 1.0,
+            "stop_on_connect": True,
+            "keepalive_interval_s": 60.0,
+            "auto_reconnect": True,
+        }
     finally:
         await s.close()
     assert s._client is None

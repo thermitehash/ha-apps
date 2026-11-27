@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.3
+
+- **Reader antennas and power are enforced** (door mode). New options
+  `reader_antennas` (default `[1]`) and `reader_power_dbm` (default 27,
+  must be ≤ `max_reader_power_dbm` or the app refuses to start). On every
+  new reader connection, before any inventory, the antenna mask and
+  per-antenna power are read; if they differ they're set (antennas saved on
+  the reader) and read back. A matching reader gets no writes.
+- If the settings can't be applied or don't verify: no inventory,
+  `reader_online` off, a "Reader antenna settings could not be applied"
+  notification, and a retry on the normal schedule.
+- New `reader_activity` attributes: `antennas_enabled`, `reader_power_dbm`,
+  `config_applied`, `last_config_error`.
+- Bench setup is `reader_antennas: [1]`; the final install with two SP11s is
+  `[1, 2]`. Every enabled port must have an antenna connected.
+
 ## 0.3.2
 
 - **Door sensor picker** in the web UI (**Settings**): a dropdown of every

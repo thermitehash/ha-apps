@@ -18,6 +18,11 @@
 * Between windows the hub calls :meth:`ReaderSession.probe` (connect + ping
   + disconnect, or a ping on the persistent connection) to keep
   ``reader_online`` honest.
+* Antennas and power (``reader_antennas``, ``reader_power_dbm``): on every
+  new connection, before any inventory, the antenna mask and per-antenna
+  power are read; if they differ they're set (antennas with the save flag,
+  power per enabled antenna) and read back. Nothing is written to a reader
+  that already matches. No inventory runs until the read-back matches.
 * The reader's trigger mode (work mode 2) is never used.
 * The device unique ID is the reader's MAC from ``aiochainway.discover()``
   (passive listen on UDP 1111), falling back to ``host:port``.
@@ -29,6 +34,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import logging
 import re
+import time
 from typing import Any, Literal
 
 from aiochainway import (
@@ -40,6 +46,8 @@ from aiochainway import (
     discover,
 )
 
+from .reader_config import ReaderConfig, ReaderConfigError, ensure_config
+
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TCP_PORT = 8888
@@ -48,6 +56,8 @@ CONNECT_RETRIES = 3
 KEEPALIVE_INTERVAL_S = 60.0
 
 ConnectionMode = Literal["per_window", "persistent"]
+
+
 TagFn = Callable[[TagRead], None]
 #: ``factory(host, port, **client_kwargs) -> UR4Client`` (tests point it at FakeUR4).
 ClientFactory = Callable[..., UR4Client]
@@ -84,6 +94,8 @@ class ReaderSession:
         timeout: float = CONNECT_TIMEOUT,
         keepalive_interval_s: float = KEEPALIVE_INTERVAL_S,
         connect_retries: int = CONNECT_RETRIES,
+        config: ReaderConfig | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         """Create; nothing connects until a window or probe runs."""
         self.host = host
@@ -100,6 +112,19 @@ class ReaderSession:
         self.version: str | None = None
         self.mode_checked = False
         self.last_result: SweepResult | None = None
+        #: Wanted antennas/power (None: leave the reader as it is).
+        self.config = config
+        self._clock = clock
+        #: The persistent connection's settings were verified since it opened.
+        self._config_verified = False
+        #: Verified on the reader: enabled antennas and their power.
+        self.antennas_enabled: list[int] | None = None
+        self.power_dbm: int | None = None
+        #: When the settings last verified (wall time) and the last failure.
+        self.config_applied: float | None = None
+        self.last_config_error: str | None = None
+        #: Number of setting writes sent (tests: none on a matching reader).
+        self.config_writes = 0
 
     # Connections -----------------------------------------------------------------
 
@@ -108,16 +133,28 @@ class ReaderSession:
         if self.connection == "persistent":
             kwargs["keepalive_interval_s"] = self.keepalive_interval_s
             kwargs["auto_reconnect"] = True
+            kwargs["on_reconnect"] = self._on_reconnect
         return self._factory(self.host, self.port, **kwargs)
 
-    async def _acquire(self) -> UR4Client:
-        """Return a connected client (new per window, or the persistent one)."""
+    def _on_reconnect(self) -> None:
+        # auto_reconnect opened a new connection: check the settings again.
+        self._config_verified = False
+
+    async def _acquire(self, *, configure: bool = True) -> UR4Client:
+        """Return a connected client (new per window, or the persistent one).
+
+        With ``configure``, the antenna/power settings are verified (and
+        applied if needed) on every new connection before it's returned.
+        """
+        fresh = True
         if self.connection == "persistent":
             if self._client is None:
                 self._client = self._new_client()
             if not self._client.connected:
+                self._config_verified = False
                 await self._client.connect(retries=self.connect_retries)
             client = self._client
+            fresh = not self._config_verified
         else:
             client = self._new_client()
             try:
@@ -125,9 +162,29 @@ class ReaderSession:
             except BaseException:
                 await client.close()
                 raise
-        if not self.mode_checked:
-            await self._ensure_command_mode(client)
+        try:
+            if not self.mode_checked:
+                await self._ensure_command_mode(client)
+            if configure and fresh and self.config is not None:
+                await self._ensure_config(client, self.config)
+                self._config_verified = True
+        except BaseException:
+            await self._release(client, failed=True)
+            raise
         return client
+
+    async def _ensure_config(self, client: UR4Client, want: ReaderConfig) -> None:
+        """Verify (and apply if needed) antennas + power; record the outcome."""
+        try:
+            applied = await ensure_config(client, want)
+        except ReaderConfigError as err:
+            self.last_config_error = str(err) or type(err).__name__
+            raise
+        self.config_writes += applied.writes
+        self.antennas_enabled = applied.antennas
+        self.power_dbm = applied.power_dbm
+        self.config_applied = self._clock()
+        self.last_config_error = None
 
     async def _release(self, client: UR4Client, *, failed: bool) -> None:
         if self.connection == "persistent" and not failed:
@@ -159,6 +216,7 @@ class ReaderSession:
         self.online = False
         self.last_error = str(err) or type(err).__name__
         self.mode_checked = False  # re-check after the reader comes back
+        self._config_verified = False
         return self.last_error
 
     # Windows -------------------------------------------------------------------
@@ -172,6 +230,13 @@ class ReaderSession:
         tags = 0
         try:
             client = await self._acquire()
+        except ReaderConfigError as err:
+            error = self._failed(err)
+            _LOGGER.warning(
+                "Reader antenna settings could not be applied: %s (no inventory)",
+                error,
+            )
+            return WindowResult(False, 0, 0.0, error, "config_failed")
         except (ChainwayError, OSError) as err:
             error = self._failed(err)
             _LOGGER.warning("Reader unreachable: %s", error)
@@ -218,7 +283,7 @@ class ReaderSession:
     async def probe(self) -> float | None:
         """Check the reader between windows: ping round trip in seconds, or None."""
         try:
-            client = await self._acquire()
+            client = await self._acquire(configure=False)
         except (ChainwayError, OSError) as err:
             self._failed(err)
             return None
