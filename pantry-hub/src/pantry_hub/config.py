@@ -168,14 +168,6 @@ def parse_options(
             f"door_entity must be a binary_sensor entity id, got {door_entity!r} "
             "(e.g. binary_sensor.pantry_door)"
         )
-    if reading_mode == "door" and not door_entity:
-        raise ConfigError(
-            "door_entity is required when reading_mode is door: set the pantry "
-            "door contact (e.g. binary_sensor.pantry_door), or use reading_mode: "
-            "continuous"
-        )
-    if requires_door and not door_entity:
-        raise ConfigError("depart_requires_door_closed is on but door_entity is empty")
     if "door_entity_topic" in raw and raw.get("door_entity_topic"):
         raise ConfigError(
             "door_entity_topic (MQTT) was replaced by door_entity (a Home "

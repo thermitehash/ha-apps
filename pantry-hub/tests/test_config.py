@@ -69,17 +69,8 @@ def test_env_ports_and_overrides() -> None:
         ({"arrive_reads": 2.5}, "arrive_reads"),
         ({"arrive_window_s": "10"}, "arrive_window_s"),
         ({"depart_after_s": 30, "arrive_window_s": 60}, "must be longer"),
-        (
-            {
-                "depart_requires_door_closed": True,
-                "reading_mode": "continuous",
-                "door_entity": "",
-            },
-            "door_entity is empty",
-        ),
         ({"depart_requires_door_closed": "yes"}, "true or false"),
         ({"door_entity_topic": "a/b"}, "replaced by door_entity"),
-        ({"reading_mode": "door", "door_entity": ""}, "door_entity is required"),
         ({"door_entity": "sensor.door"}, "binary_sensor"),
         ({"reading_mode": "trigger"}, "reading_mode"),
         ({"reader_connection": "always"}, "reader_connection"),

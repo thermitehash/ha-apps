@@ -1,13 +1,16 @@
 # Pantry Hub build report
-- App version: 0.3.1 (adopts aiochainway v0.3.0; 0.1.0–0.3.1 are unreleased and all in PR #1) · linking station firmware 0.2.0
-- aiochainway version used: v0.3.0 (`git+https://github.com/thermitehash/aiochainway@v0.3.0`; sweep results, `wait_for_connections`, `ScriptedTag`)
-- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / code verified at `1d992d4` (this report is committed on top) / CI on `1d992d4`, all green:
-  - Lint: Ruff + mypy ✅ · HA app linter ✅ · yamllint ✅ · ESPHome linking station (C++ host tests, `esphome config`, `esphome compile`) ✅ · Version bump (0.3.1) ✅
-  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (236 tests, coverage gate 90%) · **Sweep-now repeat ×200 (macOS) ✅ 200 passed in 130 s**
-  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
-  - Note: on `21b60e9`, Lint and Build were green but Pytest ubuntu-latest failed once in `test_state_not_republished_for_traffic_counters_alone` (a test race, bug 22); fixed in `1d992d4`.
+- App version: 0.3.2 (door sensor picker; 0.1.0–0.3.1 were released together in PR #1, 0.3.2 is in PR #2) · linking station firmware 0.2.0
+- aiochainway version used: v0.3.0 (`git+https://github.com/thermitehash/aiochainway@v0.3.0`; unchanged)
+- Date / PR / Commit / CI (per job): 2026-11-27 / CI_PENDING
 
 ## Summary
+**v0.3.2, door sensor picker**:
+- Web UI **Settings** page (ingress): a dropdown of every `binary_sensor` from Home Assistant (websocket `get_states`), device classes door → garage_door → opening → window first (in that order), then the rest; within a group by friendly name, then entity id. Each option shows friendly name — entity id (current state). **Save** stores the choice in the app DB (`meta.door_entity`).
+- Precedence: `door_entity` in the app options wins if set; otherwise the web UI choice. The Settings page states the active source; `sensor.pantry_hub_reader_activity` gains `door_entity_source` (`options` | `web_ui` | null) and `door_sensor_needed` attributes, and `door_entity` now shows the effective entity. Changing the web choice re-subscribes on the open websocket (no restart).
+- Door mode with no door entity from either source starts anyway in the **needs door sensor** state: door unknown → closed schedule (a sweep every `closed_sweep_interval_s`, hourly by default), a banner on the web UI, and a persistent notification (`pantry_hub_door_needed`) linking to the web UI. It's dismissed once a sensor is chosen and raised again if the choice is cleared.
+- `reader_host` stays required. An unreachable reader at start is **not fatal** (confirmed: start never contacts the reader; a new test starts `run()` in door mode against a closed TCP port, with no door entity, and gets the web UI up).
+- Schema: `door_entity: match(^(binary_sensor\.[a-z0-9_]+)?$)`, so typos fail when the configuration is saved. The app's runtime check uses the same rule.
+
 **v0.3.1, aiochainway v0.3.0**:
 - Every reading window (continuous or sweep) is `async with client.inventory(duration=…) as sweep: async for tag in sweep`. Presence still comes from the iterated tags. A sweep counts toward departures only if `sweep.result.completed` (`end_reason == duration_elapsed`). Pantry Hub's own completion inference is deleted: a reader drop is `connection_lost`, an abort by the hub (door event, "sweep now") is `stopped`, and neither is completed. A completed sweep without a stop acknowledgement still counts; it's logged at INFO.
 - New option `reader_connection` (`per_window` default | `persistent`). per_window: a new `UR4Client(stop_on_connect=True)` per window, `connect(retries=3)`, closed after the window; a continuous window holds its one connection for its whole duration. persistent: one client with `keepalive_interval_s=60` and `auto_reconnect=True`, closed after a failure and on shutdown. per_window stays the default until hardware validation §E.2 shows whether the UR4 keeps idle sessions.
@@ -90,10 +93,19 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 - MQTT is used for the linking topics only (`discovery: false`); the native API is kept for Kroger mode.
 
 ## HA entities created
+(v0.3.2: `sensor.pantry_hub_reader_activity` gains the attributes `door_entity_source` and `door_sensor_needed`; no new entities.)
 `binary_sensor.pantry_hub_reader_online`, `sensor.pantry_hub_present_tags`, `sensor.pantry_hub_unlinked_tags`, `sensor.pantry_hub_grocy_queue` (attributes: failed (includes review), review, online, last_error), `sensor.pantry_hub_last_link`, `sensor.pantry_hub_resync_differences` (added: holds the resync report), `event.pantry_hub_item` (`arrived`/`departed`), `button.pantry_hub_resync`, and (v0.3.0) `sensor.pantry_hub_reader_activity` (idle/continuous/sweep; attributes: reading mode, door, sweeps completed/aborted, last sweep/attempt, reader id, departures allowed, door notification), `sensor.pantry_hub_last_sweep` (timestamp), `button.pantry_hub_sweep_now`. All under one device "Pantry Hub" via device-based discovery (`homeassistant/device/pantry_hub/config`, identifiers `pantry_hub` + `chainway_<reader id>`) using `default_entity_id`.
 Linking station adds: `binary_sensor` Link mode, `binary_sensor` In-stock session (firmware 0.2.0), `text_sensor` Last linked tag, `switch` Link result beep (unverified).
 
 ## Spec changes vs. this spec
+v0.3.2:
+- **Notification link**: the persistent notification links to the app's ingress panel (`/hassio/ingress/<slug>`, slug derived from the container hostname the Supervisor sets, e.g. `1a2b3c4d-pantry-hub` → `1a2b3c4d_pantry_hub`). HA can't deep-link into a sub-page of an ingress panel, so it opens the status page, which shows a "needs a door sensor" banner with a link to Settings. If the hostname isn't recognised, the message says "Open Pantry Hub's web UI → Settings".
+- **Also relaxed**: `depart_requires_door_closed` (continuous mode) no longer requires `door_entity` in the options; the web UI choice counts too. With neither, the door is unknown, so timer departures wait (as before for an unknown door), and the same notification asks for a sensor.
+- **No HA token** (local development only; under the Supervisor there always is one): the app starts instead of refusing; the door stays unknown and the picker says the API is unavailable.
+- Saving a choice while `door_entity` is set in the options stores it anyway (used once the option is cleared) and says so.
+- If the saved entity no longer exists in HA, the picker still shows it, marked "not found in Home Assistant".
+- Not changed: the door picker isn't exposed over MQTT; changing it needs the web UI (or the option).
+
 v0.3.1:
 - **Probe period**: "every 10 min while idle" is measured from the last contact with the reader (end of a window, or the last probe), so with the door closed and hourly sweeps the probe runs about 5 times between sweeps, and never while sweeps come more often than every 10 min.
 - **Persistent mode and failures**: after a window or probe fails, the persistent client is closed and the next window builds a fresh one (`connect(retries=3)`). `auto_reconnect` covers drops between windows; it doesn't revive a sweep that was cut short (aiochainway ends that stream as `connection_lost`, as intended).
@@ -164,6 +176,14 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 - U107 needs mounting beside the scanner, antenna facing out (housing doesn't fit; separate ha-kroger-restock PR later).
 
 ## Test results (tests, coverage, property tests, fault injection)
+- **v0.3.2** (256 pytest tests total, coverage 95%; ruff, mypy --strict, yamllint clean). `tests/test_door_picker.py` (22):
+  - **Picker list/sorting**: door (two, by name case-insensitively) → garage_door → opening → window → others by name; a sensor without a friendly name sorts by its entity id; non-`binary_sensor` and malformed states are skipped; state and device class carried through. `fetch_states` against the fake HA websocket (`get_states`), a failed `get_states`, and a refused token.
+  - **Schema regex**: the `match(...)` regex is read from `config.yaml` and checked against 10 values (empty, valid ids, wrong domain, upper case, empty object id, space, missing dot, two dots, trailing space); the runtime parser agrees on all of them. Door mode and `depart_requires_door_closed` without `door_entity` are now valid.
+  - **Precedence**: options set + a different web choice → options in use (an open web-chosen door is ignored), the web choice is still saved, the message says the options win; options empty → web choice in use, followed live (open → continuous); invalid entity refused; the web choice survives a restart.
+  - **Needs door sensor**: no entity → `door_sensor_needed`, notification `pantry_hub_door_needed` with the ingress link, closed-schedule sweeps continue (startup + scheduled); choosing a sensor dismisses it and follows the door; clearing it returns to the state and raises the notification again.
+  - **Start**: `run()` in door mode with no door entity, no HA token and an unreachable reader port starts, serves the web UI with the banner, and stops cleanly.
+  - **Web UI**: Settings lists the entities in the right order with escaped labels and optgroups; Save (CSRF) stores the choice and redirects to Settings under the ingress path; a stale token → 403; an invalid value → message, nothing saved; HA listing failing → error shown, saved choice kept and marked "not found"; options source shown; no token → "not available".
+  - `resolve_home_assistant` (Supervisor, dev env, none) and `ingress_settings_url` (hostname → slug, unknown host → none).
 - **v0.3.1** (236 pytest tests total, coverage 94%; ruff, mypy --strict, yamllint clean):
   - `test_reader_v031.py` (10, all against `FakeUR4`): per_window passes `timeout` + `stop_on_connect=True`, opens one connection per window (3 windows → `wait_for_connections(3)`) and holds nothing between them; persistent passes `keepalive_interval_s=60` + `auto_reconnect=True` and uses **one** connection for 3 windows + a probe; persistent recovers after a mid-window drop (new connection, next window completed); probe = connect + `get_version` + disconnect, no inventory; unreachable probe → offline; **mid-sweep drop** (`disconnect_after_s`, tag absent so it *would* be a miss) → `connection_lost`, not completed, `missed == 0`, counted as aborted; **missing stop ack** (`no_stop_ack`) → `duration_elapsed`, completed, `stop_acknowledged False`, INFO log "didn't acknowledge stop"; cancelled window → `stopped`, not completed.
   - **Flicker** (`ScriptedTag`, 20 tags always in the field, 20 sweeps of 0.1 s at `tag_interval` 0.01 s, i.e. ~10 read rounds per sweep, `depart_after_missed_sweeps=2`): **p = 0.6 → 0 false departures** (asserted; 0 of 400 tag-sweeps even missed). **p = 0.3, observed false-departure rate**: the seeded CI test saw 0 in 400 tag-sweeps (9 missed, 2.2 %). Over 10 seeds (4,000 tag-sweeps): **1 false departure = 0.025 % per tag-sweep**, misses 2.7 %, matching the model (miss = 0.7¹⁰ ≈ 2.8 %, two in a row ≈ 0.08 %). A real 45 s sweep has far more read rounds, so these rates are an upper bound for tags read 30 % of the time.
@@ -223,7 +243,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 1. Free HA disk space below ~75%; take a backup.
 2. Mosquitto + MQTT integration up; create a `linking-station` HA user for MQTT.
 3. Grocy app: enable a port, ssl off, create the **Pantry** location and an **API key**; Grocy HACS integration set up.
-4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.1`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
+4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.2`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
 5. Check the entity IDs in HA match the list above (`default_entity_id`).
 6. Provision the UR4 from the Mac with `aiochainway` v0.3.0: static IP on the IoT VLAN, region USA, power ≤ 27 dBm, **command mode** (door mode, default); add the firewall rule HA → reader TCP 8888. (Continuous fallback: auto mode + UDP destination `192.168.1.38:8888`, UDP rule reader → HA.)
 7. Put one tagged item in range, open the door: `reader_online` on, `reader_activity` = continuous; an unlinked arrival appears in the web UI.
@@ -240,3 +260,4 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 18. (v0.3.0) Set `door_entity`. Log: `Sweep (startup)` → `Sweep done: N tag report(s)`; `sensor.pantry_hub_last_sweep` set. Open the door → `reader_activity` = continuous; close → `Sweep (door_closed)` → idle. Press **Sweep now**. Pull the door sensor's battery → after 2 min a "door sensor unavailable" notification, sweeps hourly; put it back → notification gone.
 19. (v0.3.0) Take one tagged item out with the door closed: Grocy −1 after 2 completed sweeps (set `closed_sweep_interval_s` low, e.g. 120, to test). Restart the app: nothing departs until 2 sweeps complete.
 20. (v0.3.1) Hardware validation §E.2: with the door closed, watch the log for the idle reader check every 10 min. To test `reader_connection: persistent`, set it, restart, and leave the door closed for over an hour: sweeps should keep completing on one connection (no "Reader unreachable"). If the reader drops idle sessions, stay on `per_window`.
+21. (v0.3.2) Leave `door_entity` empty, start: a "choose the pantry door sensor" notification appears. Follow it → the web UI banner → **Settings**: the pantry door contact is near the top (door class). Save; open the pantry door → `reader_activity` = continuous. Set `door_entity` in the configuration to something else → Settings says the options are in use.

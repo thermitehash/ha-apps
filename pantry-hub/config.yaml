@@ -1,6 +1,6 @@
 # https://developers.home-assistant.io/docs/apps/configuration
 name: Pantry Hub
-version: "0.3.1"
+version: "0.3.2"
 slug: pantry_hub
 description: >-
   RFID pantry inventory: Chainway UR4 reads become Grocy stock, with a
@@ -55,7 +55,7 @@ schema:
   reader_tcp_port: port
   reading_mode: list(door|continuous)
   reader_connection: list(per_window|persistent)
-  door_entity: str?
+  door_entity: match(^(binary_sensor\.[a-z0-9_]+)?$)
   open_continuous_s: int(0,86400)
   open_sweep_interval_s: int(30,86400)
   sweep_s: int(5,3600)
