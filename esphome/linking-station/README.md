@@ -55,6 +55,26 @@ the U107. Logs go over USB-CDC (`hardware_uart: USB_SERIAL_JTAG`).
 Leaving link mode (by double-click or after 60 s idle) shows one short cyan
 flash, then the LED goes off.
 
+### In-stock session (mode card)
+
+For tagging stock Grocy already counts. Print
+[`docs/mode-card-in-stock.pdf`](../../docs/mode-card-in-stock.pdf) (or the
+PNG) at 100%: a credit-card-sized card with the QR code
+`PANTRY-HUB:IN-STOCK`.
+
+1. Double-click: link mode (dim **blue** pulse).
+2. Scan the card: the pulse turns dim **amber**. That's the in-stock session.
+3. Link items as usual. Every link is published with `"in_stock": true`,
+   so Pantry Hub skips the Grocy add for that item's current (or next)
+   arrival. When it leaves the pantry, one unit is still consumed.
+4. End the session by scanning the card again (back to blue), by
+   double-clicking (leaves link mode), or by 60 s of inactivity.
+
+The card does nothing in Kroger mode (amber double blink, like any other
+QR code). The **In-stock session** binary sensor shows the state in Home
+Assistant. Mode logic lives in [`include/link_mode.h`](include/link_mode.h)
+and is unit-tested on the host.
+
 ### U107 radio
 
 - TX power defaults to **15 dBm** (`u107_tx_power_dbm`), low so only the item
@@ -81,8 +101,8 @@ find a direct buzzer command in M5Stack's M14 manual, put it in
 
 ## Install
 
-1. Copy `kroger-scanner.yaml` and the `components/` folder into your ESPHome
-   config folder (keep them side by side).
+1. Copy `kroger-scanner.yaml`, the `components/` folder and the `include/`
+   folder into your ESPHome config folder (keep them side by side).
 2. `secrets.yaml`: copy [`secrets.yaml.example`](secrets.yaml.example) and
    fill it in. **Keep the wall scanner's existing `kroger_scanner_api_key`**
    so Home Assistant stays paired. Add an MQTT user (a Home Assistant user,
@@ -96,7 +116,7 @@ find a direct buzzer command in M5Stack's M14 manual, put it in
 
 MQTT is used only for the linking topics. MQTT discovery is off, so the
 device's entities come from the native API as before (new: **Link mode**,
-**Last linked tag**, **Link result beep (unverified)**).
+**In-stock session**, **Last linked tag**, **Link result beep (unverified)**).
 
 ## Validate and test locally
 
@@ -105,6 +125,7 @@ pip install esphome
 cp secrets.yaml.example secrets.yaml   # dummy values are fine for validation
 esphome config kroger-scanner.yaml
 g++ -std=c++17 -Wall -Wextra -Werror -Icomponents/jrd4035 tests/test_jrd4035_protocol.cpp -o /tmp/t && /tmp/t
+g++ -std=c++17 -Wall -Wextra -Werror -Iinclude tests/test_link_mode.cpp -o /tmp/l && /tmp/l
 ```
 
 The protocol code (`jrd4035_protocol.h`) has no ESPHome dependencies and is

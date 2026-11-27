@@ -126,9 +126,11 @@ linked it, the add happens right away, once.
 ### Already in stock
 
 Tagging something Grocy already counts (stock that was on the shelf before
-you started)? Link it with **already in stock**: tick the checkbox in the
-web UI's Link form, or send `"in_stock": true` in the station's barcode or
-tag message. The add for its current arrival (or the next one, if the tag
+you started)? Link it with **already in stock**: at the linking station,
+scan the printed **mode card** (`docs/mode-card-in-stock.pdf`) in link mode
+(the pulse turns amber; every link in that session is in-stock), or tick the
+checkbox in the web UI's Link form. Over MQTT this is `"in_stock": true` in
+the station's barcode or tag message. The add for its current arrival (or the next one, if the tag
 isn't in the pantry right now) is skipped. When it leaves, one unit is
 still consumed at the Pantry location. Every later arrival is added
 normally. Off by default.

@@ -52,13 +52,16 @@ Then **put the item in the pantry**. Its arrival (3 reads within 10 s)
 adds one unit to Grocy at the Pantry location. Linking itself never changes
 stock, so nothing is counted twice.
 
-> **Existing stock:** if Grocy already counts an item you're tagging for
-> the first time, link it as **already in stock**: in the Pantry Hub page,
-> type its barcode in the Link form and tick "already in stock". Its
-> current (or next) arrival isn't added again, and when it leaves one unit
-> is still consumed. New shopping needs nothing special: tag it on the way
-> in and its arrival adds it. (The linking station itself doesn't send
-> `in_stock` yet; use the web UI for existing stock.)
+> **Existing stock:** if Grocy already counts the items you're tagging for
+> the first time, use the **in-stock mode card**
+> ([PDF](mode-card-in-stock.pdf) · [PNG](mode-card-in-stock.png), print at
+> 100%). In link mode, scan the card: the pulse turns from blue to
+> **amber**. Every item you link now is "already in stock": its current (or
+> next) arrival isn't added to Grocy again, and when it leaves one unit is
+> still consumed. Scan the card again, double-click, or wait 60 s to end the
+> session. New shopping needs nothing special: tag it on the way in (blue
+> pulse) and its arrival adds it. The web UI's Link form has the same
+> option as a checkbox.
 
 ## Taking things out
 

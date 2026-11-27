@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- **In-stock session at the linking station**: print the mode card
+  (`docs/mode-card-in-stock.pdf`). In link mode, scan it to start an
+  "already in stock" session: the pulse turns from dim blue to dim amber and
+  every link is sent with `"in_stock": true`, so tagging stock Grocy already
+  counts no longer needs the web UI. Scan it again, double-click, or leave
+  link mode idle for 60 s to end the session. Requires reflashing the
+  linking station (firmware 0.2.0). No change in the hub itself; a contract
+  test keeps the firmware and the hub in step.
+
 ## 0.2.0
 
 - **Already in stock** (existing stock): link a tag with "already in stock"

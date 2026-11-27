@@ -1,6 +1,6 @@
 # https://developers.home-assistant.io/docs/apps/configuration
 name: Pantry Hub
-version: "0.2.0"
+version: "0.3.0"
 slug: pantry_hub
 description: >-
   RFID pantry inventory: Chainway UR4 reads become Grocy stock, with a

@@ -169,4 +169,4 @@ def test_main_runs_until_refusal(
 
 
 def test_version() -> None:
-    assert app_version() == "0.2.0"
+    assert app_version() == "0.3.0"

@@ -59,11 +59,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: JRD-4035 protocol unit tests (host)
+      - name: Host unit tests (JRD-4035 protocol, link mode / in-stock session)
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -Icomponents/jrd4035 \
             tests/test_jrd4035_protocol.cpp -o /tmp/jrd4035_tests
           /tmp/jrd4035_tests
+          g++ -std=c++17 -Wall -Wextra -Werror -Iinclude \
+            tests/test_link_mode.cpp -o /tmp/link_mode_tests
+          /tmp/link_mode_tests
       - run: pip install esphome==2026.11.1
       - name: Validate config (esphome config)
         run: |

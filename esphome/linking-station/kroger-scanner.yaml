@@ -16,6 +16,10 @@
 #   polls for up to 15 s and publishes the strongest tag to .../tag. The
 #   hub's .../result shows as: green = linked, amber = unknown barcode,
 #   magenta = tag already linked, red = error / timeout.
+#   In-stock session: in link mode, scan the printed mode card (QR
+#   "PANTRY-HUB:IN-STOCK", docs/mode-card-in-stock.pdf) to toggle it. The
+#   pulse turns dim amber and every link is sent with "in_stock": true (Grocy
+#   already counts the unit). It ends with link mode or a second card scan.
 #   The U107 radio only transmits during that scan (the module sleeps
 #   otherwise), so the wall scanner never reads tagged items nearby.
 #
@@ -53,7 +57,9 @@ esphome:
   friendly_name: ${friendly_name}
   project:
     name: thermitehash.pantry_linking_station
-    version: "0.1.0"
+    version: "0.2.0"
+  includes:
+    - include/link_mode.h
   on_boot:
     priority: -100
     then:
@@ -132,9 +138,9 @@ time:
     id: ha_time
 
 globals:
-  - id: link_mode
-    type: bool
-    initial_value: "false"
+  # Kroger / link mode and the "already in stock" session (include/link_mode.h).
+  - id: link_state
+    type: link_mode::State
   - id: link_last_activity
     type: uint32_t
     initial_value: "0"
@@ -152,24 +158,37 @@ uart:
         timeout: 20ms
       sequence:
         - lambda: |-
-            std::string code;
-            for (uint8_t b : bytes) {
-              if (b >= '0' && b <= '9') {
-                code += static_cast<char>(b);
-              } else if (b == '\r' || b == '\n' || b == ' ' || b == '-') {
-                continue;
-              } else {
+            // Classification and mode handling live in include/link_mode.h
+            // (unit-tested on the host).
+            auto scan = link_mode::classify(std::string(bytes.begin(), bytes.end()));
+            switch (id(link_state).on_scan(scan)) {
+              case link_mode::Action::KROGER_SCAN:
+                id(last_barcode).publish_state(scan.code);
+                id(send_scan).execute(scan.code);
+                break;
+              case link_mode::Action::LINK_BARCODE:
+                id(last_barcode).publish_state(scan.code);
+                id(link_barcode).execute(scan.code);
+                break;
+              case link_mode::Action::SESSION_ON:
+                ESP_LOGI("link", "In-stock session on: links skip the next Grocy add");
+                id(touch_link_mode).execute();
+                id(link_idle_led).execute();
+                break;
+              case link_mode::Action::SESSION_OFF:
+                ESP_LOGI("link", "In-stock session off");
+                id(touch_link_mode).execute();
+                id(link_idle_led).execute();
+                break;
+              case link_mode::Action::CARD_OUTSIDE_LINK:
+                ESP_LOGI("link", "In-stock card ignored: double-click for link mode first");
+                id(blink_ignored).execute();
+                break;
+              case link_mode::Action::IGNORED:
+              default:
                 ESP_LOGD("scanner", "Ignoring non-product code");
                 id(blink_ignored).execute();
-                return;
-              }
-            }
-            if (code.size() < 4) return;
-            id(last_barcode).publish_state(code);
-            if (id(link_mode)) {
-              id(link_barcode).execute(code);
-            } else {
-              id(send_scan).execute(code);
+                break;
             }
   - id: u107_uart
     rx_pin: ${u107_rx_pin}
@@ -192,6 +211,7 @@ jrd4035:
           root["epc"] = epc;
           root["rssi"] = rssi;
           root["ts"] = id(ha_time).now().is_valid() ? id(ha_time).now().timestamp : 0;
+          if (id(link_state).in_stock()) root["in_stock"] = true;
   on_timeout:
     - logger.log: "No tag read; the hub will report a timeout"
 
@@ -255,10 +275,15 @@ binary_sensor:
         then:
           - script.execute: sync_cart
   - platform: template
+    id: in_stock_session_sensor
+    name: In-stock session
+    icon: mdi:package-variant-closed-check
+    lambda: return id(link_state).in_stock();
+  - platform: template
     id: link_mode_sensor
     name: Link mode
     icon: mdi:link-variant
-    lambda: return id(link_mode);
+    lambda: return id(link_state).link_mode();
 
 switch:
   - platform: template
@@ -275,7 +300,7 @@ interval:
       - if:
           condition:
             lambda: |-
-              return id(link_mode) && !id(u107).is_scanning() &&
+              return id(link_state).link_mode() && !id(u107).is_scanning() &&
                      millis() - id(link_last_activity) > ${link_idle_timeout_ms};
           then:
             - logger.log: "Link mode idle for 60 s; back to Kroger mode"
@@ -345,7 +370,7 @@ script:
     then:
       - if:
           condition:
-            lambda: return id(link_mode);
+            lambda: return id(link_state).link_mode();
           then:
             - script.execute: exit_link_mode
           else:
@@ -353,19 +378,16 @@ script:
 
   - id: enter_link_mode
     then:
-      - globals.set:
-          id: link_mode
-          value: "true"
+      - lambda: id(link_state).enter_link();
       - script.execute: touch_link_mode
       - logger.log: "Link mode on"
       - script.execute: link_idle_led
 
   - id: exit_link_mode
     then:
-      - lambda: id(u107).stop_scan();
-      - globals.set:
-          id: link_mode
-          value: "false"
+      - lambda: |-
+          id(u107).stop_scan();
+          id(link_state).exit_link();  // also ends any in-stock session
       - logger.log: "Link mode off"
       # Visible exit: one quick cyan flash, then LED off (Kroger idle).
       - light.turn_on:
@@ -384,17 +406,19 @@ script:
           id: link_last_activity
           value: !lambda "return millis();"
 
+  # Link mode: dim blue pulse; with an in-stock session: dim amber pulse.
   - id: link_idle_led
+    mode: restart
     then:
       - if:
           condition:
-            lambda: return id(link_mode);
+            lambda: return id(link_state).link_mode();
           then:
             - light.turn_on:
                 id: status_led
-                red: 0.0
-                green: 0.2
-                blue: 1.0
+                red: !lambda "return id(link_state).idle_color().r;"
+                green: !lambda "return id(link_state).idle_color().g;"
+                blue: !lambda "return id(link_state).idle_color().b;"
                 effect: link_pulse
 
   - id: link_barcode
@@ -412,6 +436,7 @@ script:
                 payload: |-
                   root["barcode"] = code;
                   root["ts"] = id(ha_time).now().is_valid() ? id(ha_time).now().timestamp : 0;
+                  if (id(link_state).in_stock()) root["in_stock"] = true;
             - lambda: |-
                 // Poll the U107 for up to link_tag_timeout.
                 id(u107).start_scan(${link_tag_timeout_ms});
