@@ -59,6 +59,8 @@ TICK_S = 1.0
 STATE_EVERY_S = 60.0
 TOUCH_EVERY_S = 30.0
 PROBE_EVERY_S = 60.0
+#: Door mode: connect + ping + disconnect this often while idle.
+PROBE_IDLE_S = 600.0
 
 _COUNTERS = ("last_datagram", "datagrams", "tags", "bad_frames", "dropped_sources")
 
@@ -115,6 +117,7 @@ class Hub:
         client_factory: ClientFactory | None = None,
         discover_fn: DiscoverFn | None = None,
         retry_s: float = 60.0,
+        probe_every_s: float = PROBE_IDLE_S,
         door_notify_after_s: float = 120.0,
     ) -> None:
         """Create; call :meth:`start`."""
@@ -155,8 +158,16 @@ class Hub:
         if client_factory is not None:
             session_kwargs["client_factory"] = client_factory
         self.session = ReaderSession(
-            options.reader_host, options.reader_tcp_port, **session_kwargs
+            options.reader_host,
+            options.reader_tcp_port,
+            connection="persistent"
+            if options.reader_connection == "persistent"
+            else "per_window",
+            **session_kwargs,
         )
+        self.probe_every_s = probe_every_s
+        #: Last time a window or probe talked to the reader (monotonic).
+        self._last_contact = monotonic()
         self.activity = Activity.IDLE if door_mode else Activity.CONTINUOUS
         self.last_sweep: dict[str, Any] | None = None
         self.last_sweep_attempt: dict[str, Any] | None = None
@@ -302,6 +313,7 @@ class Hub:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self._flush_seen()
+        await self.session.close()
         await self.worker.stop()
         if self.mqtt is not None:
             await self.mqtt.stop()
@@ -383,6 +395,7 @@ class Hub:
             raise
         finally:
             self._window = None
+        self._last_contact = self.monotonic()
         if task.cancelled():
             return WindowResult(
                 False, 0, 0.0, "aborted (door change or sweep request)"
@@ -402,7 +415,7 @@ class Hub:
                 plan = planner.next(self.monotonic())
                 if plan.activity is Activity.IDLE:
                     self._set_activity(Activity.IDLE)
-                    await self._idle(plan.duration)
+                    await self._idle_or_probe(plan.duration)
                 elif plan.activity is Activity.CONTINUOUS:
                     await self._continuous(plan)
                 else:
@@ -413,6 +426,21 @@ class Hub:
                 _LOGGER.exception("Error in the reading loop; retrying")
                 self._set_activity(Activity.IDLE)
                 await self._idle(self.reading_config.retry_s)
+
+    async def _idle_or_probe(self, seconds: float) -> None:
+        """Idle; ping the reader every ``probe_every_s`` without a window."""
+        due = self._last_contact + self.probe_every_s
+        now = self.monotonic()
+        if now >= due:
+            rtt = await self.session.probe()
+            self._last_contact = self.monotonic()
+            if rtt is None:
+                _LOGGER.info("Idle reader check failed: %s", self.session.last_error)
+            else:
+                _LOGGER.debug("Idle reader check: ping %.3f s", rtt)
+            self.mark_dirty()
+            return
+        await self._idle(min(seconds, due - now))
 
     async def _continuous(self, plan: Plan) -> None:
         assert self.planner is not None
@@ -648,6 +676,7 @@ class Hub:
                 "last_sweep": self.last_sweep,
                 "last_attempt": self.last_sweep_attempt,
                 "reader_id": self.reader_id,
+                "reader_connection": self.session.connection,
                 "reader_error": self.session.last_error if self.door_mode else None,
             },
         }

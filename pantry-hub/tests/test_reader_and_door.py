@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from aiochainway import DiscoveredReader, TagRead, UR4Client, WorkMode
-from aiochainway.testing import FakeUR4, tag_record
+from aiochainway.testing import FakeUR4, ScriptedTag, tag_record
 import pytest
 
 from pantry_hub.homeassistant import NOTIFICATION_ID, HomeAssistantDoor
@@ -32,7 +32,7 @@ async def fake() -> AsyncIterator[FakeUR4]:
 def session_for(fake: FakeUR4) -> ReaderSession:
     return ReaderSession(
         "192.168.99.202",
-        client_factory=lambda h, p, t: UR4Client(fake.host, fake.port, timeout=t),
+        client_factory=lambda h, p, **kw: UR4Client(fake.host, fake.port, **kw),
         timeout=1.0,
     )
 
@@ -82,40 +82,13 @@ async def test_cancelled_window_stops_the_reader(fake: FakeUR4) -> None:
     await eventually(lambda: fake.names().count("stop_inventory") >= 2)
 
 
-class _EmptyInventory:
-    def __aiter__(self) -> _EmptyInventory:
-        return self
-
-    async def __anext__(self) -> TagRead:
-        raise StopAsyncIteration
-
-
-class _StubClient:
-    """A reader that answers but reads no tags: an explicit empty result."""
-
-    async def __aenter__(self) -> _StubClient:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        return None
-
-    async def get_version(self) -> str:
-        return "stub"
-
-    async def get_work_mode(self) -> WorkMode:
-        return WorkMode.COMMAND
-
-    async def stop_inventory(self) -> None:
-        return None
-
-    def inventory(self, duration: float | None = None) -> _EmptyInventory:
-        return _EmptyInventory()
-
-
-async def test_explicit_empty_result_is_a_completed_window() -> None:
-    s = ReaderSession("x", client_factory=lambda h, p, t: _StubClient())  # type: ignore[arg-type,return-value]
+async def test_explicit_empty_result_is_a_completed_window(fake: FakeUR4) -> None:
+    """The reader answers but no tag is in the field: still a completed sweep."""
+    fake.scenario = [ScriptedTag(EPC, present_from=1e9)]
+    s = session_for(fake)
     result = await s.run_window(0.1, lambda tag: None)
     assert result.completed and result.tags == 0
+    assert result.end_reason == "duration_elapsed"
 
 
 async def test_unique_id_from_discovered_mac() -> None:

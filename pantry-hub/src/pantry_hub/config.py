@@ -29,6 +29,7 @@ DEFAULT_WEB_PORT = 8099
 MAX_SAFE_READER_POWER_DBM = 27
 LOG_LEVELS = ("debug", "info", "warning", "error")
 READING_MODES = ("door", "continuous")
+READER_CONNECTIONS = ("per_window", "persistent")
 DOOR_ENTITY_RE = re.compile(r"^binary_sensor\.[a-z0-9_]+$")
 SUPERVISOR_MQTT_URL = "http://supervisor/services/mqtt"
 
@@ -63,6 +64,9 @@ class Options:
     closed_sweep_interval_s: float = 3600.0
     depart_after_missed_sweeps: int = 2
     reader_tcp_port: int = 8888
+    #: per_window: connect for each window (default until hardware validation
+    #: §E.2); persistent: one connection with keepalive + auto-reconnect.
+    reader_connection: str = "per_window"
     max_reader_power_dbm: int = 27
     log_level: str = "info"
     udp_port: int = DEFAULT_UDP_PORT
@@ -187,6 +191,11 @@ def parse_options(
             f"({open_interval}) and closed_sweep_interval_s ({closed_interval})"
         )
     missed = _int(raw, "depart_after_missed_sweeps", 2, 1, 20)
+    connection = _str(raw, "reader_connection", "per_window").lower()
+    if connection not in READER_CONNECTIONS:
+        raise ConfigError(
+            f"reader_connection must be one of {', '.join(READER_CONNECTIONS)}"
+        )
     power = _int(raw, "max_reader_power_dbm", MAX_SAFE_READER_POWER_DBM, 0, 30)
     if power > MAX_SAFE_READER_POWER_DBM:
         raise ConfigError(
@@ -217,6 +226,7 @@ def parse_options(
         closed_sweep_interval_s=float(closed_interval),
         depart_after_missed_sweeps=missed,
         reader_tcp_port=_int(raw, "reader_tcp_port", 8888, 1, 65535),
+        reader_connection=connection,
         max_reader_power_dbm=power,
         log_level=log_level,
         udp_port=int(env.get("PANTRY_HUB_UDP_PORT", DEFAULT_UDP_PORT)),

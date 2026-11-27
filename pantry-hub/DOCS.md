@@ -47,6 +47,7 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
 | `reader_host` | — | The UR4's IP address. |
 | `reader_tcp_port` | `8888` | The UR4's TCP command port. |
 | `reading_mode` | `door` | **door**: the hub drives the reader in command mode over TCP, from the door sensor (see below). **continuous**: the reader's own auto mode pushes every read over UDP (the 0.1/0.2 behaviour); a fallback. The reader's trigger mode is never used. |
+| `reader_connection` | `per_window` | **per_window**: connect for each sweep or continuous window (retrying the connect up to 3 times) and disconnect afterwards; a continuous window keeps its one connection for its whole length. **persistent**: keep one connection open, pinged every 60 s and reconnected automatically. `per_window` is the default until it's known whether the UR4 keeps idle TCP sessions open. |
 | `door_entity` | — | The pantry door contact in Home Assistant, a `binary_sensor` (`on` = open). Required for `reading_mode: door`. |
 | `open_continuous_s` | `600` | After the door opens, read continuously this long. |
 | `open_sweep_interval_s` | `300` | Then, while the door stays open, sweep this often. |
@@ -101,6 +102,13 @@ sensor unavailable ──▶ same as closed (never "open forever"), plus a
   `depart_after_s` timer also applies, counting only continuous reading time.
 - **Restart**: one sweep at start; nothing departs until 2 sweeps have
   completed since the restart.
+- Each window is an aiochainway inventory whose result says how it ended.
+  Only a window that ran its full duration counts as a completed sweep. If
+  the reader doesn't acknowledge the stop at the end, the sweep still counts
+  (the duration elapsed) and the log says so.
+- **Between windows** the hub checks the reader every 10 minutes (connect,
+  ping, disconnect) so `reader_online` stays accurate. The check is skipped
+  if a window ran in those 10 minutes.
 - The hub puts the reader in **command mode** itself (it starts and stops
   every inventory over TCP); if the reader was in auto mode it's switched
   and a warning is logged.
@@ -202,7 +210,7 @@ normally. Off by default.
 | `sensor.pantry_hub_last_link` | Product of the most recent link; attributes: EPC, barcode, station, time. |
 | `sensor.pantry_hub_resync_differences` | Products whose Grocy pantry amount differs from the linked tags present, after the last resync. |
 | `event.pantry_hub_item` | `arrived` / `departed`, with product and EPC. |
-| `sensor.pantry_hub_reader_activity` | `idle` / `continuous` / `sweep`. Attributes: reading mode, door state, sweeps completed/aborted, last sweep and last attempt, reader id, whether departures are allowed yet, whether the door notification is up. |
+| `sensor.pantry_hub_reader_activity` | `idle` / `continuous` / `sweep`. Attributes: reading mode, door state, sweeps completed/aborted, last sweep and last attempt, reader id, reader connection mode, whether departures are allowed yet, whether the door notification is up. |
 | `sensor.pantry_hub_last_sweep` | Time of the last completed sweep. |
 | `button.pantry_hub_sweep_now` | Sweep now (door mode). During a continuous window it sweeps, then continuous reading resumes. |
 | `button.pantry_hub_resync` | Compare and report. Resync never changes Grocy; fix differences there. |

@@ -52,6 +52,7 @@ class DoorRig:
         self,
         broker: BrokerHandle | None = None,
         discover: Callable[[float], Awaitable[list[Any]]] | None = None,
+        probe_every_s: float = 600.0,
         **opts: Any,
     ) -> Hub:
         base: dict[str, Any] = {
@@ -85,7 +86,10 @@ class DoorRig:
             bind_host="127.0.0.1",
             ha_url=self.ha.url,
             ha_token=TOKEN,
-            client_factory=lambda h, p, t: UR4Client(fake.host, fake.port, timeout=1.0),
+            client_factory=lambda h, p, **kw: UR4Client(
+                fake.host, fake.port, **(kw | {"timeout": 1.0})
+            ),
+            probe_every_s=probe_every_s,
             discover_fn=discover or no_discovery,
             retry_s=0.3,
             door_notify_after_s=0.3,
@@ -350,8 +354,8 @@ async def test_sweep_now_during_continuous_then_resumes(
     await eventually(lambda: rig.h.activity is Activity.CONTINUOUS, timeout=5)
     done = rig.h.machine.sweeps_completed
     assert rig.h.request_sweep()
-    await rig.sweeps(done + 1, timeout=12)
-    await eventually(lambda: rig.h.activity is Activity.CONTINUOUS, timeout=8)
+    await rig.sweeps(done + 1)
+    await eventually(lambda: rig.h.activity is Activity.CONTINUOUS)
     assert rig.h.last_sweep is not None and rig.h.last_sweep["reason"] == "requested"
 
 
@@ -417,3 +421,45 @@ async def test_state_json_is_serialisable(rig: DoorRig, ha: FakeHomeAssistant) -
     await rig.start()
     await rig.sweeps(1)
     json.dumps(rig.h.state())
+
+
+async def test_idle_probe_keeps_reader_online_between_windows(
+    rig: DoorRig, ha: FakeHomeAssistant
+) -> None:
+    """Idle with the door closed: connect + ping + disconnect each period."""
+    await ha.set_state(DOOR, "off")
+    await rig.start(probe_every_s=0.3, closed_sweep_interval_s=60.0)
+    await rig.sweeps(1)
+    await eventually(lambda: rig.h.activity is Activity.IDLE)
+    starts = rig.fake.names().count("start_inventory")
+    pings = rig.fake.names().count("get_version")
+    conns = rig.fake.connections
+    await eventually(lambda: rig.fake.names().count("get_version") >= pings + 2)
+    await rig.fake.wait_for_connections(conns + 2)
+    assert rig.fake.names().count("start_inventory") == starts  # no window ran
+    assert rig.h.reader_online()
+    assert rig.h.state()["reading"]["reader_connection"] == "per_window"
+
+
+async def test_idle_probe_skipped_when_windows_ran(
+    rig: DoorRig, ha: FakeHomeAssistant
+) -> None:
+    """Sweeps more often than the probe period: no probe is ever needed."""
+    await ha.set_state(DOOR, "off")
+    await rig.start(probe_every_s=1.5, closed_sweep_interval_s=0.4)
+    await rig.sweeps(4)
+    # Command mode was checked once (one get_version); a probe would add more.
+    assert rig.fake.names().count("get_version") == 1
+
+
+async def test_persistent_connection_option(
+    rig: DoorRig, ha: FakeHomeAssistant
+) -> None:
+    await ha.set_state(DOOR, "off")
+    await rig.start(
+        reader_connection="persistent", sweep_s=0.2, closed_sweep_interval_s=0.4
+    )
+    await rig.sweeps(3)
+    await rig.fake.wait_for_connections(1)
+    assert rig.fake.connections == 1  # one connection across every sweep
+    assert rig.h.session.connection == "persistent"

@@ -1,13 +1,16 @@
 # Pantry Hub build report
-- App version: 0.3.0 (door-driven reading + Q8 mode card; 0.1.0–0.3.0 are unreleased and all in PR #1) · linking station firmware 0.2.0
-- aiochainway version used: v0.2.0 (`f188a02`, ships `aiochainway.testing.FakeUR4`)
-- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / code verified at `813acf0` (this report is committed on top) / CI on `813acf0`, all green:
-  - Lint: Ruff + mypy ✅ · HA app linter ✅ · yamllint ✅ · ESPHome linking station (C++ host tests incl. link_mode, `esphome config`, `esphome compile`) ✅ · Version bump (0.3.0) ✅
-  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (222 tests, coverage gate 90%)
-  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
-  - Note: on `2914a8c`, macOS failed once in `test_sweep_now_during_continuous_then_resumes` (see Test results); passed on `813acf0`.
+- App version: 0.3.1 (adopts aiochainway v0.3.0; 0.1.0–0.3.1 are unreleased and all in PR #1) · linking station firmware 0.2.0
+- aiochainway version used: v0.3.0 (`git+https://github.com/thermitehash/aiochainway@v0.3.0`; sweep results, `wait_for_connections`, `ScriptedTag`)
+- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / CI_PENDING
 
 ## Summary
+**v0.3.1, aiochainway v0.3.0**:
+- Every reading window (continuous or sweep) is `async with client.inventory(duration=…) as sweep: async for tag in sweep`. Presence still comes from the iterated tags. A sweep counts toward departures only if `sweep.result.completed` (`end_reason == duration_elapsed`). Pantry Hub's own completion inference is deleted: a reader drop is `connection_lost`, an abort by the hub (door event, "sweep now") is `stopped`, and neither is completed. A completed sweep without a stop acknowledgement still counts; it's logged at INFO.
+- New option `reader_connection` (`per_window` default | `persistent`). per_window: a new `UR4Client(stop_on_connect=True)` per window, `connect(retries=3)`, closed after the window; a continuous window holds its one connection for its whole duration. persistent: one client with `keepalive_interval_s=60` and `auto_reconnect=True`, closed after a failure and on shutdown. per_window stays the default until hardware validation §E.2 shows whether the UR4 keeps idle sessions.
+- `reader_online` between windows (door mode): connect + `ping()` + disconnect every 10 min while idle, skipped when a window ran in that period (every window or probe resets the timer). `sensor.pantry_hub_reader_activity` gains a `reader_connection` attribute.
+- Tests read connection counts only through `FakeUR4.wait_for_connections()`. New `ScriptedTag` flicker tests, mid-sweep drop, and missing-stop-ack tests (see Test results).
+- macOS flake: `test_sweep_now_during_continuous_then_resumes` is back to its original 8 s waits, and a dedicated macOS CI job runs it 200× (`pytest-repeat`, `--count=200 -x`). Job timeout 20 min on every test job.
+
 **v0.3.0, door-driven reading** (default `reading_mode: door`):
 - The hub drives the UR4 in **command mode over TCP** with aiochainway `UR4Client.inventory(duration=…)`. It never uses the reader's trigger mode (work mode 2) and switches the reader to command mode at start if needed. Auto/UDP stays as `reading_mode: continuous`.
 - The door comes from a Home Assistant entity (`door_entity`, a `binary_sensor`) over the Supervisor's Core websocket (`subscribe_entities`). Door opens → continuous reading for `open_continuous_s` (600), then a `sweep_s` (45) sweep every `open_sweep_interval_s` (300). Door closes → one sweep, then stop. Closed → a sweep every `closed_sweep_interval_s` (3600).
@@ -87,6 +90,13 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 Linking station adds: `binary_sensor` Link mode, `binary_sensor` In-stock session (firmware 0.2.0), `text_sensor` Last linked tag, `switch` Link result beep (unverified).
 
 ## Spec changes vs. this spec
+v0.3.1:
+- **Probe period**: "every 10 min while idle" is measured from the last contact with the reader (end of a window, or the last probe), so with the door closed and hourly sweeps the probe runs about 5 times between sweeps, and never while sweeps come more often than every 10 min.
+- **Persistent mode and failures**: after a window or probe fails, the persistent client is closed and the next window builds a fresh one (`connect(retries=3)`). `auto_reconnect` covers drops between windows; it doesn't revive a sweep that was cut short (aiochainway ends that stream as `connection_lost`, as intended).
+- **Continuous (UDP) mode** is unchanged: its optional `reader_tcp_probe` still runs `get_version` every minute.
+- **20-min job timeout**: wasn't in `test.yml` yet; added as `timeout-minutes: 20` to both the Pytest matrix and the new macOS repeat job.
+- `WindowResult` now also carries `end_reason`, `stop_acknowledged` and `unique_count` from aiochainway's `SweepResult` (logged per sweep).
+
 v0.3.0 door-driven reading:
 - **Version**: 0.3.0 (your title), not 0.4.0. 0.3.0 hadn't been released (it held only Q8), so both are in 0.3.0.
 - **"Repair issue in HA"**: apps have no API to create Repairs entries (only integrations do). Implemented as a persistent notification with a fixed id (`pantry_hub_door_unavailable`), raised after the door has been unavailable for 120 s and dismissed on recovery, plus `door_unavailable_notified` on `sensor.pantry_hub_reader_activity`.
@@ -131,6 +141,8 @@ Q1–Q3 are resolved in v0.2.0 (above). Q4–Q7 stay as first-run hardware check
 6. **UDP source IP through the Supervisor's Docker bridge**: expected to be preserved (DNAT); if `dropped_sources` rises, NAT is rewriting it.
 7. HA 2026.11 MQTT discovery `default_entity_id` (replacement for `object_id`): verify the entity IDs on first run.
 
+v0.3.1 adds hardware check 13 (hardware validation §E.2): does the UR4 keep an idle TCP session open (and for how long)? If it does, `reader_connection: persistent` can become the default; until then `per_window`. Also check whether the reader acknowledges stop (the log says "didn't acknowledge stop" if not; sweeps still count).
+
 Door-driven reading (v0.3.0) adds hardware checks: 10. confirm a 45 s command-mode sweep covers the whole pantry with the 4 SP11 antennas (the tag count per sweep is logged); 11. whether the UR4's UDP 1111 announcements reach HA at all (expected not, across VLANs); 12. the door sensor's `on` = open convention (an inverted sensor needs a template binary_sensor).
 
 Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the M14 reads the printed card (QR enabled, as the wall scanner already sees QR on packaging) and that a laminated card still reads under the base's illumination.
@@ -148,6 +160,12 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 - U107 needs mounting beside the scanner, antenna facing out (housing doesn't fit; separate ha-kroger-restock PR later).
 
 ## Test results (tests, coverage, property tests, fault injection)
+- **v0.3.1** (236 pytest tests total, coverage 94%; ruff, mypy --strict, yamllint clean):
+  - `test_reader_v031.py` (10, all against `FakeUR4`): per_window passes `timeout` + `stop_on_connect=True`, opens one connection per window (3 windows → `wait_for_connections(3)`) and holds nothing between them; persistent passes `keepalive_interval_s=60` + `auto_reconnect=True` and uses **one** connection for 3 windows + a probe; persistent recovers after a mid-window drop (new connection, next window completed); probe = connect + `get_version` + disconnect, no inventory; unreachable probe → offline; **mid-sweep drop** (`disconnect_after_s`, tag absent so it *would* be a miss) → `connection_lost`, not completed, `missed == 0`, counted as aborted; **missing stop ack** (`no_stop_ack`) → `duration_elapsed`, completed, `stop_acknowledged False`, INFO log "didn't acknowledge stop"; cancelled window → `stopped`, not completed.
+  - **Flicker** (`ScriptedTag`, 20 tags always in the field, 20 sweeps of 0.1 s at `tag_interval` 0.01 s, i.e. ~10 read rounds per sweep, `depart_after_missed_sweeps=2`): **p = 0.6 → 0 false departures** (asserted; 0 of 400 tag-sweeps even missed). **p = 0.3, observed false-departure rate**: the seeded CI test saw 0 in 400 tag-sweeps (9 missed, 2.2 %). Over 10 seeds (4,000 tag-sweeps): **1 false departure = 0.025 % per tag-sweep**, misses 2.7 %, matching the model (miss = 0.7¹⁰ ≈ 2.8 %, two in a row ≈ 0.08 %). A real 45 s sweep has far more read rounds, so these rates are an upper bound for tags read 30 % of the time.
+  - Hub (`test_door_reading.py`, +3): idle probe every period with no inventory and `reader_online` true; probe skipped while sweeps come more often than the probe period (exactly one `get_version`, from the command-mode check); `reader_connection: persistent` → one connection across 3+ sweeps. Config: default `per_window`, case-insensitive, invalid value refused.
+  - Existing reader tests moved to the new client factory signature (`factory(host, port, **client_kwargs)`); the explicit-empty test now uses a `ScriptedTag` that is never present instead of a stub client.
+  - **macOS flake**: `test_sweep_now_during_continuous_then_resumes` restored to 8 s (`rig.sweeps(done + 1)`, default `eventually`). Locally (Linux) 20/20 repeats pass in 13 s. MACOS_REPEAT_PENDING
 - **v0.3.0 door-driven reading tests** (222 pytest tests total, coverage 94%):
   - `test_reading.py` (17): every planner transition: startup sweep (including the door report at start not aborting it); start while open; closed schedule; open → continuous → sweeps every open interval; close → immediate sweep → closed schedule; failed close sweep retried after retry_s; failed scheduled/startup sweeps retried; unavailable = closed, never continuous; closed ↔ unknown doesn't abort; sweep now (closed and during continuous); reopening restarts the window; repeated reports aren't changes; invalid config. Hypothesis flapping property (open/close/unavailable/done/fail/now): continuous only while open, and a close always leads to a sweep (now, or within retry_s).
   - `test_presence_sweeps.py` (11): arrival inside a sweep; departure after exactly 2 missed completed sweeps; a read between sweeps resets misses; aborted sweeps never count; restart rule for sweep and timer departures; timer frozen while idle and running while continuous (exact accounting across windows). Hypothesis door-mode property with restarts and aborted sweeps.
@@ -193,14 +211,16 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 | 17 | (v0.3.0, feature gap) Existing stock could only be marked in-stock from the web UI | open question Q8 | mode-card in-stock session in the firmware | `test_link_mode.cpp`, `test_firmware_contract.py` |
 | 18 | (v0.3.0) Firmware didn't compile: an ESPHome `globals` entry of the custom type `link_mode::State` was generated as `int` | CI `esphome compile` | the state is a function-local static behind `link_mode::state()` in the header; no global | CI `esphome compile`; `test_link_mode.cpp` checks the shared instance |
 | 19 | (v0.3.0) A failed startup sweep cleared a close sweep queued behind it (one "pending" slot), and failed pending sweeps were retried immediately (a tight loop while the reader is offline) | Hypothesis flapping property (`open, close, done_fail`) | separate startup/close/requested flags; failed pending sweeps retry after `retry_s` | `test_failed_startup_sweep_keeps_pending_close_sweep`, `test_close_sweep_retried_if_it_fails` |
+| 20 | (v0.3.1) A cancelled (aborted) window left `ReaderSession.last_result` unset, because the CancelledError skipped the line that stored it | new test `test_cancelled_window_is_stopped_not_completed` | the result is stored in the `finally` block, before the connection is released | same test |
+| 21 | (v0.3.0→0.3.1) macOS-only timeout in `test_sweep_now_during_continuous_then_resumes` | macOS CI (once, `2914a8c`) | root cause in the test double: `FakeUR4` registered connections late under kqueue (fixed in aiochainway v0.3.0, `wait_for_connections`); wait restored to 8 s | macOS CI job, 200 repeats |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.
 2. Mosquitto + MQTT integration up; create a `linking-station` HA user for MQTT.
 3. Grocy app: enable a port, ssl off, create the **Pantry** location and an **API key**; Grocy HACS integration set up.
-4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.0`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
+4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.1`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
 5. Check the entity IDs in HA match the list above (`default_entity_id`).
-6. Provision the UR4 from the Mac with `aiochainway` v0.2.0: static IP on the IoT VLAN, region USA, power ≤ 27 dBm, **command mode** (door mode, default); add the firewall rule HA → reader TCP 8888. (Continuous fallback: auto mode + UDP destination `192.168.1.38:8888`, UDP rule reader → HA.)
+6. Provision the UR4 from the Mac with `aiochainway` v0.3.0: static IP on the IoT VLAN, region USA, power ≤ 27 dBm, **command mode** (door mode, default); add the firewall rule HA → reader TCP 8888. (Continuous fallback: auto mode + UDP destination `192.168.1.38:8888`, UDP rule reader → HA.)
 7. Put one tagged item in range, open the door: `reader_online` on, `reader_activity` = continuous; an unlinked arrival appears in the web UI.
 8. Flash the linking station (keep the existing API key); fit the U107 beside the scanner, antenna out; **5 V ≥ 2 A** supply. Check Kroger mode still works (scan → feedback colour).
 9. Double-click → blue pulse. Scan a known product, hold its tag: green. If no tag is ever read, swap `u107_rx_pin`/`u107_tx_pin`. Watch the log for "Module rejected TX power" and adjust `u107_tx_power_dbm`.
@@ -214,3 +234,4 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 17. (v0.3.0) Print `docs/mode-card-in-stock.pdf` at 100 %. Double-click (blue pulse), scan the card → amber pulse and the **In-stock session** entity on. Link one item Grocy already counts → the linked message mentions "already in stock"; its arrival adds nothing. Scan the card again → blue. Scan it in Kroger mode → amber double blink, nothing else.
 18. (v0.3.0) Set `door_entity`. Log: `Sweep (startup)` → `Sweep done: N tag report(s)`; `sensor.pantry_hub_last_sweep` set. Open the door → `reader_activity` = continuous; close → `Sweep (door_closed)` → idle. Press **Sweep now**. Pull the door sensor's battery → after 2 min a "door sensor unavailable" notification, sweeps hourly; put it back → notification gone.
 19. (v0.3.0) Take one tagged item out with the door closed: Grocy −1 after 2 completed sweeps (set `closed_sweep_interval_s` low, e.g. 120, to test). Restart the app: nothing departs until 2 sweeps complete.
+20. (v0.3.1) Hardware validation §E.2: with the door closed, watch the log for the idle reader check every 10 min. To test `reader_connection: persistent`, set it, restart, and leave the door closed for over an hour: sweeps should keep completing on one connection (no "Reader unreachable"). If the reader drops idle sessions, stay on `per_window`.

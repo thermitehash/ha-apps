@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.1
+
+- Uses **aiochainway v0.3.0**. Every reading window is an
+  `async with client.inventory(duration=…)` block, and a sweep counts toward
+  departures only if aiochainway reports it **completed** (the duration
+  elapsed). Pantry Hub's own completion guesswork is gone: a reader drop is
+  `connection_lost` and an abort (door, "sweep now") is `stopped`. Neither
+  counts as a miss. A missing stop acknowledgement doesn't stop a sweep
+  counting; it is logged.
+- New option `reader_connection`: `per_window` (default) connects for each
+  window with `stop_on_connect` and 3 connect retries, then disconnects.
+  `persistent` keeps one connection (60 s keepalive, automatic reconnect).
+- `reader_online` between windows: connect + ping + disconnect every
+  10 minutes while idle, skipped if a window ran in that time.
+- `sensor.pantry_hub_reader_activity` gains a `reader_connection` attribute.
+
 ## 0.3.0
 
 - **Door-driven reading** (new default, `reading_mode: door`): Pantry Hub

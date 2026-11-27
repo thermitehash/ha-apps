@@ -82,6 +82,7 @@ def test_env_ports_and_overrides() -> None:
         ({"reading_mode": "door", "door_entity": ""}, "door_entity is required"),
         ({"door_entity": "sensor.door"}, "binary_sensor"),
         ({"reading_mode": "trigger"}, "reading_mode"),
+        ({"reader_connection": "always"}, "reader_connection"),
         ({"sweep_s": 400}, "sweep_s"),
         ({"depart_after_missed_sweeps": 0}, "depart_after_missed_sweeps"),
         ({"max_reader_power_dbm": 30}, "FCC"),
@@ -104,6 +105,9 @@ def test_door_mode_defaults() -> None:
     assert (o.open_continuous_s, o.open_sweep_interval_s, o.sweep_s) == (600, 300, 45)
     assert (o.closed_sweep_interval_s, o.depart_after_missed_sweeps) == (3600, 2)
     assert o.reader_tcp_port == 8888
+    assert o.reader_connection == "per_window"
+    p = parse_options({**GOOD, "reader_connection": "Persistent"}, env={})
+    assert p.reader_connection == "persistent"
     c = parse_options({**GOOD, "reading_mode": "continuous", "door_entity": ""}, env={})
     assert c.reading_mode == "continuous"
 

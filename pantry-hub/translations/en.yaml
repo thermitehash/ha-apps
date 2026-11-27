@@ -12,6 +12,12 @@ configuration:
       door (default): the hub drives the reader in command mode from the door
       sensor (continuous while open, sweeps otherwise). continuous: the
       reader's auto mode pushes every read over UDP.
+  reader_connection:
+    name: Reader connection
+    description: >-
+      per_window (default): connect for each sweep or continuous window and
+      disconnect afterwards. persistent: keep one connection open (ping every
+      60 s, reconnect automatically).
   door_entity:
     name: Door sensor
     description: >-
