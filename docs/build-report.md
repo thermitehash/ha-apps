@@ -77,7 +77,7 @@ v0.3.0:
 - The card toggles the session only in link mode (in Kroger mode it's treated like any other non-product QR: amber double blink), so it can't start a session that would then apply to Kroger scans.
 - `in_stock` is sent on both the barcode and the tag message during a session (the hub accepts either; sending both is harmless and survives a dropped message).
 - The card payload match is case-insensitive and ignores surrounding CR/LF/spaces.
-- Station mode logic was extracted into `include/link_mode.h` so the behaviour is unit-testable without hardware; install now copies `include/` alongside `components/`.
+- Station mode logic was extracted into `include/link_mode.h` (one shared `link_mode::state()`) so the behaviour is unit-testable without hardware; install now copies `include/` alongside `components/`.
 - Card size: 85 × 55 mm (credit card); the PDF page is US Letter with two copies and a "print at 100%" note.
 
 v0.2.0:
@@ -155,6 +155,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 | 15 | (v0.2.0, behaviour) An ambiguous consume without a stock id was resent, risking a double consume | open question Q2 | review instead of resend | `test_q2_*` (5 tests) |
 | 16 | (v0.2.0, behaviour) Tagging existing stock double-counted it | open question Q1 | "already in stock" per-link skip | `test_q1_*` (7 tests) |
 | 17 | (v0.3.0, feature gap) Existing stock could only be marked in-stock from the web UI | open question Q8 | mode-card in-stock session in the firmware | `test_link_mode.cpp`, `test_firmware_contract.py` |
+| 18 | (v0.3.0) Firmware didn't compile: an ESPHome `globals` entry of the custom type `link_mode::State` was generated as `int` | CI `esphome compile` | the state is a function-local static behind `link_mode::state()` in the header; no global | CI `esphome compile`; `test_link_mode.cpp` checks the shared instance |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.

@@ -139,4 +139,12 @@ class State {
   bool in_stock_ = false;
 };
 
+// The station's single mode state (one instance per firmware image).
+// A function-local static avoids ESPHome globals, which don't support
+// custom class types.
+inline State &state() {
+  static State instance;
+  return instance;
+}
+
 }  // namespace link_mode

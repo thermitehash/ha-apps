@@ -38,7 +38,7 @@ def test_firmware_sends_in_stock_on_barcode_and_tag_during_session() -> None:
         blocks = _publish_blocks(suffix)
         assert blocks, f"no publish to .../{suffix}"
         assert any(
-            'if (id(link_state).in_stock()) root["in_stock"] = true;' in b
+            'if (link_mode::state().in_stock()) root["in_stock"] = true;' in b
             for b in blocks
         ), f".../{suffix} does not carry in_stock during a session"
 
@@ -52,7 +52,7 @@ def test_hub_reads_the_field_the_firmware_sends() -> None:
 
 def test_session_ends_with_link_mode() -> None:
     exit_block = YAML.split("- id: exit_link_mode", 1)[1].split("\n  - id:", 1)[0]
-    assert "id(link_state).exit_link()" in exit_block
+    assert "link_mode::state().exit_link()" in exit_block
     assert re.search(
         r"void exit_link\(\) \{\s*link_ = false;\s*in_stock_ = false;", HEADER
     )

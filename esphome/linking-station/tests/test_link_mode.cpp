@@ -63,6 +63,12 @@ int main() {
   assert(!s.in_stock() && !s.link_mode());
   assert(s.on_scan(upc) == Action::KROGER_SCAN);
 
+  // The firmware's single shared instance.
+  assert(&state() == &state());
+  state().enter_link();
+  assert(state().link_mode());
+  state().exit_link();
+
   std::puts("link_mode tests passed");
   return 0;
 }
