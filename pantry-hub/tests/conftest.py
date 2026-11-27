@@ -18,6 +18,7 @@ from pantry_hub.config import Options
 from pantry_hub.store import Store
 
 from .fake_grocy import API_KEY, FakeGrocy
+from .fake_ha import FakeHomeAssistant
 
 settings.register_profile("ci", max_examples=300, deadline=None)
 settings.register_profile("dev", max_examples=60, deadline=None)
@@ -75,6 +76,7 @@ def make_options(**overrides: Any) -> Options:
         "arrive_reads": 2,
         "arrive_window_s": 5.0,
         "depart_after_s": 60.0,
+        "reading_mode": "continuous",
         "udp_port": 0,
     }
     base.update(overrides)
@@ -91,6 +93,14 @@ async def store(tmp_path: Path) -> AsyncIterator[Store]:
     s = await Store.open(tmp_path / "test.db")
     yield s
     await s.close()
+
+
+@pytest.fixture
+async def ha() -> AsyncIterator[FakeHomeAssistant]:
+    h = FakeHomeAssistant()
+    await h.start()
+    yield h
+    await h.stop()
 
 
 @pytest.fixture

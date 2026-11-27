@@ -2,14 +2,37 @@
 
 ## 0.3.0
 
-- **In-stock session at the linking station**: print the mode card
-  (`docs/mode-card-in-stock.pdf`). In link mode, scan it to start an
+- **Door-driven reading** (new default, `reading_mode: door`): Pantry Hub
+  drives the UR4 in **command mode over TCP** (aiochainway
+  `inventory()`), from your pantry door sensor (`door_entity`, a Home
+  Assistant `binary_sensor`). Door opens → continuous reading for
+  `open_continuous_s` (600 s), then a `sweep_s` (45 s) sweep every
+  `open_sweep_interval_s` (300 s). Door closes → one sweep, then stop.
+  Closed → a sweep every `closed_sweep_interval_s` (3600 s). The reader's
+  trigger mode is never used. The old auto/UDP behaviour stays available as
+  `reading_mode: continuous`.
+- **Departures from sweeps**: a present item departs after being missing
+  from `depart_after_missed_sweeps` (2) completed sweeps in a row. A sweep
+  only counts if the reader stayed online for the whole window; aborted
+  sweeps never count as misses. The `depart_after_s` timer now counts only
+  continuous reading time (paused while the reader is idle).
+- **Door sensor unavailable**: falls back to the closed-door sweep schedule
+  (never treated as open) and raises a persistent notification in Home
+  Assistant, dismissed when the sensor reports again.
+- **Restart**: one sweep at start; nothing departs until 2 sweeps have
+  completed.
+- New entities: `sensor.pantry_hub_reader_activity` (idle / continuous /
+  sweep), `sensor.pantry_hub_last_sweep`, `button.pantry_hub_sweep_now`.
+- The reader's MAC (from its UDP 1111 announcements) is added to the device
+  identifiers; fallback `host:port`.
+- **Breaking**: `door_entity_topic` (MQTT) is replaced by `door_entity` (a
+  Home Assistant entity); the app now uses the Home Assistant API.
+- **In-stock session at the linking station** (mode card): print
+  `docs/mode-card-in-stock.pdf`. In link mode, scan it to start an
   "already in stock" session: the pulse turns from dim blue to dim amber and
-  every link is sent with `"in_stock": true`, so tagging stock Grocy already
-  counts no longer needs the web UI. Scan it again, double-click, or leave
-  link mode idle for 60 s to end the session. Requires reflashing the
-  linking station (firmware 0.2.0). No change in the hub itself; a contract
-  test keeps the firmware and the hub in step.
+  every link is sent with `"in_stock": true`. Scan it again, double-click,
+  or leave link mode idle for 60 s to end it. Needs the linking station
+  firmware 0.2.0.
 
 ## 0.2.0
 

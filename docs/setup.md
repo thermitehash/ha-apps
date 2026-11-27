@@ -131,8 +131,10 @@ aiochainway --help
    described in `bringup-macos.md` (the reader's IP is changed once from the
    CLI, never from HA). Reserve that IP in your DHCP server too.
 2. **Provision**: region USA, antennas you've connected, **power ≤ 27 dBm**,
-   work mode **auto**, UDP destination **`192.168.1.38:8888`**. The
-   `provision` helper (Python) does it in one go:
+   work mode **command** (Pantry Hub's default `reading_mode: door` starts
+   and stops every inventory itself over TCP; it also switches the reader to
+   command mode at start if needed). Don't use the reader's trigger mode.
+   The `provision` helper (Python) does it in one go:
 
    ```python
    import asyncio
@@ -140,27 +142,33 @@ aiochainway --help
 
    asyncio.run(provision(
        "192.168.99.202",
-       udp_dest=("192.168.1.38", 8888),
        region=FrequencyRegion.USA,
        antennas=[1, 2, 3, 4],
        power=25,              # dBm; never above 27 with the 8.3 dBi SP11s
-       work_mode=WorkMode.AUTO,
+       work_mode=WorkMode.COMMAND,
        confirm=True,
    ))
    ```
 
+   Fallback (`reading_mode: continuous`): `work_mode=WorkMode.AUTO` plus
+   `udp_dest=("192.168.1.38", 8888)`.
+
    The 27 dBm ceiling: Vulcan SP11 antennas are 8.3 dBi, and FCC Part 15
    allows 36 dBm EIRP → 36 − 8.3 = 27.7 dBm conducted, minus nothing for
    cable loss to be safe.
-3. **Firewall**: allow **UDP from the reader's IP to `192.168.1.38:8888`**
-   (IoT VLAN → HA). Nothing else is needed; with `reader_tcp_probe: true`,
-   also allow TCP from HA to the reader's TCP port (8888).
+3. **Firewall** (door mode): allow **TCP from `192.168.1.38` to the reader's
+   port 8888** (HA → IoT VLAN), with return traffic. Continuous mode instead
+   needs **UDP from the reader to `192.168.1.38:8888`**.
+4. **Door sensor**: pick the pantry door contact in Home Assistant (a
+   `binary_sensor`, `on` = open) and set it as `door_entity`.
 
-Check: with tags in range, `binary_sensor.pantry_hub_reader_online` turns on
-and `sensor.pantry_hub_present_tags` counts up. If `dropped_sources` (an
-attribute of the reader sensor) rises, datagrams come from an unexpected IP;
-NAT between the VLANs can do that. Set `allowed_reader_ip` to the address
-the log shows.
+Check: the log shows `Sweep (startup)` then `Sweep done`;
+`sensor.pantry_hub_last_sweep` gets a time and
+`binary_sensor.pantry_hub_reader_online` turns on. Open the door:
+`sensor.pantry_hub_reader_activity` shows `continuous`, and tags in range
+count up in `sensor.pantry_hub_present_tags`. (Continuous mode: if
+`dropped_sources` rises, set `allowed_reader_ip` to the address the log
+shows.)
 
 ## 7. Linking station
 
@@ -176,8 +184,9 @@ See [automations.md](automations.md) for low stock → Kroger Restock.
 
 | What | Where | Rule |
 |---|---|---|
-| UR4 → Pantry Hub | UDP 8888 on 192.168.1.38 | allow from the reader's IP (IoT VLAN) |
-| Pantry Hub → UR4 (optional probe) | TCP 8888 on the reader | only if `reader_tcp_probe: true` |
+| Pantry Hub → UR4 (door mode, default) | TCP 8888 on the reader | allow from 192.168.1.38 (HA → IoT VLAN) |
+| UR4 → Pantry Hub (continuous mode) | UDP 8888 on 192.168.1.38 | allow from the reader's IP (IoT VLAN) |
+| UR4 announcements (optional) | UDP 1111 broadcast | only arrive if reader and HA share a segment; for the MAC device id |
 | Linking station → Mosquitto | TCP 1883 on 192.168.1.38 | allow from the station's IP |
 | Linking station ↔ HA API | TCP 6053 on the station | as today |
 | Grocy direct port | e.g. TCP 9192 | LAN only; needed so other apps can reach Grocy |

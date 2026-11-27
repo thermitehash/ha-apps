@@ -1,9 +1,15 @@
-"""The Pantry Hub service: UDP reads → presence → Grocy journal + MQTT."""
+"""The Pantry Hub service: reader windows → presence → Grocy journal + MQTT.
+
+``reading_mode: door`` (default): the hub drives the UR4 in command mode over
+TCP, from the Home Assistant door entity (see :mod:`pantry_hub.reading`).
+``reading_mode: continuous``: the reader's auto mode pushes UDP (fallback).
+"""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
+import contextlib
 from dataclasses import dataclass, field
 import json
 import logging
@@ -27,13 +33,23 @@ from .discovery import (
     RESYNC_COMMAND_TOPIC,
     RESYNC_RESULT_TOPIC,
     STATE_TOPIC,
+    SWEEP_COMMAND_TOPIC,
     discovery_payload,
     linking_result_topic,
 )
 from .grocy import GrocyError, StockBackend
+from .homeassistant import SUPERVISOR_WS, HomeAssistantDoor
 from .linking import LinkingManager, LinkResult, best_before_for
 from .mqtt import MqttLink
 from .presence import Door, PresenceConfig, PresenceEvent, PresenceMachine
+from .reader import (
+    ClientFactory,
+    DiscoverFn,
+    ReaderSession,
+    WindowResult,
+    reader_unique_id,
+)
+from .reading import Activity, Plan, ReadingConfig, ReadingPlanner
 from .store import Link, Store, iso
 from .worker import GrocyWorker
 
@@ -43,38 +59,6 @@ TICK_S = 1.0
 STATE_EVERY_S = 60.0
 TOUCH_EVERY_S = 30.0
 PROBE_EVERY_S = 60.0
-
-_OPEN = {"on", "open", "true", "1", "opened"}
-_CLOSED = {"off", "closed", "false", "0", "close"}
-
-
-def parse_door(payload: bytes) -> Door:
-    """Door contact payload → :class:`Door`.
-
-    Accepts ``ON``/``OFF``, ``open``/``closed``, ``true``/``false``, ``1``/``0``
-    (``ON`` = open, as HA door binary sensors do) and zigbee2mqtt JSON
-    ``{"contact": true}`` (``contact: true`` = closed).
-    """
-    text = payload.decode("utf-8", "replace").strip()
-    if text.startswith("{"):
-        try:
-            data = json.loads(text)
-        except ValueError:
-            return Door.UNKNOWN
-        if isinstance(data, dict):
-            if isinstance(data.get("contact"), bool):
-                return Door.CLOSED if data["contact"] else Door.OPEN
-            for key in ("state", "door", "value"):
-                if key in data:
-                    return parse_door(str(data[key]).encode())
-        return Door.UNKNOWN
-    low = text.lower()
-    if low in _OPEN:
-        return Door.OPEN
-    if low in _CLOSED:
-        return Door.CLOSED
-    return Door.UNKNOWN
-
 
 _COUNTERS = ("last_datagram", "datagrams", "tags", "bad_frames", "dropped_sources")
 
@@ -126,8 +110,16 @@ class Hub:
         bind_host: str = "0.0.0.0",
         tag_timeout: float | None = None,
         rssi_window: float | None = None,
+        ha_url: str | None = None,
+        ha_token: str | None = None,
+        client_factory: ClientFactory | None = None,
+        discover_fn: DiscoverFn | None = None,
+        retry_s: float = 60.0,
+        door_notify_after_s: float = 120.0,
     ) -> None:
         """Create; call :meth:`start`."""
+        door_mode = options.reading_mode == "door"
+        self.door_mode = door_mode
         self.options = options
         self.store = store
         self.backend = backend
@@ -142,8 +134,46 @@ class Hub:
                 arrive_window_s=options.arrive_window_s,
                 depart_after_s=options.depart_after_s,
                 depart_requires_door_closed=options.depart_requires_door_closed,
+                depart_after_missed_sweeps=(
+                    options.depart_after_missed_sweeps if door_mode else 0
+                ),
+                # Restart rule: no departures until 2 completed sweeps.
+                min_sweeps_before_departure=2 if door_mode else 0,
             )
         )
+        self.reading_config = ReadingConfig(
+            open_continuous_s=options.open_continuous_s,
+            open_sweep_interval_s=options.open_sweep_interval_s,
+            sweep_s=options.sweep_s,
+            closed_sweep_interval_s=options.closed_sweep_interval_s,
+            retry_s=retry_s,
+        )
+        self.planner: ReadingPlanner | None = (
+            ReadingPlanner(self.reading_config, monotonic()) if door_mode else None
+        )
+        session_kwargs: dict[str, Any] = {}
+        if client_factory is not None:
+            session_kwargs["client_factory"] = client_factory
+        self.session = ReaderSession(
+            options.reader_host, options.reader_tcp_port, **session_kwargs
+        )
+        self.activity = Activity.IDLE if door_mode else Activity.CONTINUOUS
+        self.last_sweep: dict[str, Any] | None = None
+        self.last_sweep_attempt: dict[str, Any] | None = None
+        self.reader_id = f"ur4_{options.reader_host}:{options.reader_tcp_port}"
+        self.reader_id_source = "host"
+        self._discover_fn = discover_fn
+        self._wake = asyncio.Event()
+        self._window: asyncio.Task[WindowResult] | None = None
+        self.door_source: HomeAssistantDoor | None = None
+        if options.door_entity and ha_token:
+            self.door_source = HomeAssistantDoor(
+                options.door_entity,
+                ha_token,
+                self._on_door,
+                url=ha_url or SUPERVISOR_WS,
+                notify_after_s=door_notify_after_s,
+            )
         self.worker = GrocyWorker(store, backend, clock=wall, on_change=self.mark_dirty)
         linking_kwargs: dict[str, float] = {}
         if tag_timeout is not None:
@@ -164,9 +194,12 @@ class Hub:
         self.listener: UR4UdpListener | None = None
         self.mqtt: MqttLink | None = None
         if mqtt_settings is not None:
-            subs = [LINKING_SUB, HA_STATUS_TOPIC, RESYNC_COMMAND_TOPIC]
-            if options.door_entity_topic:
-                subs.append(options.door_entity_topic)
+            subs = [
+                LINKING_SUB,
+                HA_STATUS_TOPIC,
+                RESYNC_COMMAND_TOPIC,
+                SWEEP_COMMAND_TOPIC,
+            ]
             self.mqtt = MqttLink(
                 mqtt_settings,
                 subscriptions=subs,
@@ -189,27 +222,52 @@ class Hub:
 
     async def start(self) -> None:
         """Restore state and start every task."""
+        stored_id = await self.store.get_meta("reader_id")
+        if stored_id:
+            self.reader_id, self.reader_id_source = stored_id, "stored"
         restored = await self.store.present_epcs()
         self.machine.restore(restored, self.monotonic())
         if restored:
-            _LOGGER.info(
-                "Restored %d tag(s) as present; none will depart for %.0f s",
-                len(restored),
-                self.options.depart_after_s,
-            )
+            if self.door_mode:
+                _LOGGER.info(
+                    "Restored %d tag(s) as present; none will depart until 2 "
+                    "sweeps have completed",
+                    len(restored),
+                )
+            else:
+                _LOGGER.info(
+                    "Restored %d tag(s) as present; none will depart for %.0f s",
+                    len(restored),
+                    self.options.depart_after_s,
+                )
         self.worker.start()
-        allowed = self.options.reader_source_ip
-        self.listener = await UR4UdpListener.start(
-            (self.bind_host, self.options.udp_port),
-            callback=self._on_tag,
-            allowed_sources=[allowed] if allowed else None,
-        )
-        _LOGGER.info(
-            "Listening for UR4 reads on UDP %s:%d (accepting %s)",
-            self.bind_host,
-            self.options.udp_port,
-            allowed or "any source",
-        )
+        if self.door_mode:
+            _LOGGER.info(
+                "Door-driven reading: UR4 %s:%d in command mode, door %s",
+                self.options.reader_host,
+                self.options.reader_tcp_port,
+                self.options.door_entity,
+            )
+            self._loops.append(
+                asyncio.create_task(self._reading_loop(), name="pantry_hub.reading")
+            )
+        else:
+            allowed = self.options.reader_source_ip
+            self.listener = await UR4UdpListener.start(
+                (self.bind_host, self.options.udp_port),
+                callback=self._on_tag,
+                allowed_sources=[allowed] if allowed else None,
+            )
+            _LOGGER.info(
+                "Continuous reading: listening for UR4 reads on UDP %s:%d "
+                "(accepting %s)",
+                self.bind_host,
+                self.options.udp_port,
+                allowed or "any source",
+            )
+        if self.door_source is not None:
+            self.door_source.start()
+        self._spawn(self._resolve_reader_id(), "pantry_hub.reader_id")
         self._loops.append(
             asyncio.create_task(self._event_loop(), name="pantry_hub.events")
         )
@@ -229,6 +287,8 @@ class Hub:
         _LOGGER.info("Stopping Pantry Hub")
         if self.listener is not None:
             await self.listener.stop()
+        if self.door_source is not None:
+            await self.door_source.stop()
         tick_tasks = [t for t in self._loops if t.get_name() != "pantry_hub.events"]
         for task in tick_tasks:
             task.cancel()
@@ -260,10 +320,149 @@ class Hub:
         """Ask the next tick to re-read counters and publish state."""
         self._dirty_flag = True
 
-    # UDP -----------------------------------------------------------------------
+    # Reading -------------------------------------------------------------------
+
+    async def _resolve_reader_id(self) -> None:
+        """Reader MAC from UDP 1111 announcements (else host:port), kept in the DB."""
+        if self.reader_id_source == "stored" and not self.reader_id.count(":"):
+            return  # a MAC-based id is already stored
+        rid, source = await reader_unique_id(
+            self.options.reader_host,
+            self.options.reader_tcp_port,
+            discover_fn=self._discover_fn,
+        )
+        if source == "mac" or self.reader_id_source != "stored":
+            self.reader_id, self.reader_id_source = rid, source
+            await self.store.set_meta("reader_id", rid)
+            _LOGGER.info("Reader unique id: %s (from %s)", rid, source)
+            if self.mqtt is not None and self.mqtt.connected:
+                await self.publish_discovery()
+
+    def _on_door(self, door: Door) -> None:
+        """Door entity changed (open / closed / unknown)."""
+        now = self.monotonic()
+        self.machine.set_door(door, now)
+        if self.planner is not None and self.planner.set_door(door, now):
+            self._abort_window()
+            self._wake.set()
+        self.mark_dirty()
+
+    def request_sweep(self) -> bool:
+        """``button.pantry_hub_sweep_now``: sweep as soon as possible."""
+        if self.planner is None or self.activity is Activity.SWEEP:
+            return False
+        self.planner.request_sweep()
+        if self.activity is Activity.CONTINUOUS:
+            self._abort_window()  # sweep now; continuous resumes afterwards
+        self._wake.set()
+        return True
+
+    def _abort_window(self) -> None:
+        if self._window is not None and not self._window.done():
+            self._window.cancel()
+
+    def _set_activity(self, activity: Activity) -> None:
+        if activity is not self.activity:
+            self.activity = activity
+            _LOGGER.debug("Reader activity: %s", activity.value)
+            self.mark_dirty()
+
+    async def _run_window(self, duration: float) -> tuple[WindowResult, bool]:
+        """Run one window; return (result, aborted_by_hub)."""
+        task = asyncio.create_task(
+            self.session.run_window(duration, self._on_tag), name="pantry_hub.window"
+        )
+        self._window = task
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            self._window = None
+        if task.cancelled():
+            return WindowResult(
+                False, 0, 0.0, "aborted (door change or sweep request)"
+            ), True
+        return task.result(), False
+
+    async def _idle(self, seconds: float) -> None:
+        self._wake.clear()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._wake.wait(), max(seconds, 0.0))
+
+    async def _reading_loop(self) -> None:
+        assert self.planner is not None
+        planner = self.planner
+        while True:
+            try:
+                plan = planner.next(self.monotonic())
+                if plan.activity is Activity.IDLE:
+                    self._set_activity(Activity.IDLE)
+                    await self._idle(plan.duration)
+                elif plan.activity is Activity.CONTINUOUS:
+                    await self._continuous(plan)
+                else:
+                    await self._sweep(plan)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("Error in the reading loop; retrying")
+                self._set_activity(Activity.IDLE)
+                await self._idle(self.reading_config.retry_s)
+
+    async def _continuous(self, plan: Plan) -> None:
+        assert self.planner is not None
+        self._set_activity(Activity.CONTINUOUS)
+        _LOGGER.info("Door open: reading continuously for up to %.0f s", plan.duration)
+        result, aborted_by_hub = await self._run_window(plan.duration)
+        self.mark_dirty()
+        if result.completed:
+            self.planner.continuous_done()
+        elif not aborted_by_hub:
+            # Reader offline: don't spin; try again after retry_s (or a door event).
+            self._set_activity(Activity.IDLE)
+            await self._idle(self.reading_config.retry_s)
+
+    async def _sweep(self, plan: Plan) -> None:
+        assert self.planner is not None
+        self._set_activity(Activity.SWEEP)
+        reason = plan.reason.value if plan.reason else "scheduled"
+        _LOGGER.info("Sweep (%s) for %.0f s", reason, plan.duration)
+        self.machine.start_sweep()
+        result, aborted_by_hub = await self._run_window(plan.duration)
+        now = self.monotonic()
+        completed = result.completed
+        for event in self.machine.finish_sweep(completed, now):
+            self._events.put_nowait(event)
+        self.planner.sweep_done(completed, now)
+        record = {
+            "at": iso(self.wall()),
+            "reason": reason,
+            "completed": completed,
+            "tags": result.tags,
+            "error": result.error,
+        }
+        self.last_sweep_attempt = record
+        if completed:
+            self.last_sweep = record
+            _LOGGER.info("Sweep done: %d tag report(s)", result.tags)
+        else:
+            _LOGGER.info(
+                "Sweep %s; it does not count towards departures",
+                "aborted" if aborted_by_hub else "failed",
+            )
+        self.mark_dirty()
+
+    def _accruing(self) -> bool:
+        """Whether unseen time counts now (only while reading continuously)."""
+        return self.activity is Activity.CONTINUOUS
+
+    # Tag reads -----------------------------------------------------------------
 
     def _on_tag(self, tag: TagRead) -> None:
-        """UDP callback (runs in the event loop; must stay fast)."""
+        """Tag callback for UDP and TCP windows (runs in the loop; stays fast)."""
         try:
             now = self.monotonic()
             self.reader.last_traffic = now
@@ -346,7 +545,7 @@ class Hub:
             try:
                 now = self.monotonic()
                 self._track_reader_traffic(now)
-                for event in self.machine.tick(now):
+                for event in self.machine.tick(now, accrue=self._accruing()):
                     self._events.put_nowait(event)
                 if now - last_touch >= TOUCH_EVERY_S:
                     last_touch = now
@@ -382,7 +581,13 @@ class Hub:
             await asyncio.sleep(PROBE_EVERY_S)
 
     def reader_online(self) -> bool:
-        """UDP traffic (or a TCP probe answer) within ``reader_offline_after_s``."""
+        """Door mode: the last window/check reached the reader.
+
+        Continuous mode: UDP traffic (or a TCP probe answer) within
+        ``reader_offline_after_s``.
+        """
+        if self.door_mode:
+            return bool(self.session.online)
         now = self.monotonic()
         limit = self.options.reader_offline_after_s
         for ts in (self.reader.last_traffic, self.reader.last_probe_ok):
@@ -426,6 +631,23 @@ class Hub:
                 "last_error": self.worker.last_error,
             },
             "door": self.machine.door.value,
+            "activity": self.activity.value,
+            "last_sweep": self.last_sweep["at"] if self.last_sweep else None,
+            "reading": {
+                "mode": self.options.reading_mode,
+                "door": self.machine.door.value,
+                "door_entity": self.options.door_entity or None,
+                "door_unavailable_notified": bool(
+                    self.door_source and self.door_source.notified
+                ),
+                "sweeps_completed": self.machine.sweeps_completed,
+                "sweeps_aborted": self.machine.sweeps_aborted,
+                "departures_allowed": self.machine.departures_allowed,
+                "last_sweep": self.last_sweep,
+                "last_attempt": self.last_sweep_attempt,
+                "reader_id": self.reader_id,
+                "reader_error": self.session.last_error if self.door_mode else None,
+            },
         }
 
     async def publish_state(self, force: bool = False) -> None:
@@ -463,7 +685,7 @@ class Hub:
             return
         await self.mqtt.publish(
             DISCOVERY_TOPIC,
-            json.dumps(discovery_payload(self.version)),
+            json.dumps(discovery_payload(self.version, self.reader_id)),
             retain=True,
             qos=1,
             queue=False,
@@ -489,14 +711,12 @@ class Hub:
         if topic == RESYNC_COMMAND_TOPIC:
             self._spawn(self.resync(), "pantry_hub.resync")
             return
-        if self.options.door_entity_topic and topic == self.options.door_entity_topic:
-            door = parse_door(payload)
-            if door is Door.UNKNOWN:
-                _LOGGER.warning(
-                    "Unrecognised door payload on %s: %r", topic, payload[:50]
+        if topic == SWEEP_COMMAND_TOPIC:
+            if not self.request_sweep():
+                _LOGGER.info(
+                    "Sweep now ignored (a sweep is running, or continuous mode)"
                 )
-            self.machine.set_door(door, self.monotonic())
-            self.mark_dirty()
+            return
 
     async def _publish_link_result(self, station: str, result: LinkResult) -> None:
         if self.mqtt is not None:

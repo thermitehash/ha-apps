@@ -8,6 +8,8 @@ Environment (all optional; defaults are for the Home Assistant app):
   outside Home Assistant (otherwise asked from the Supervisor)
 * ``PANTRY_HUB_WEB_ALLOW`` — comma-separated peers allowed to open the web UI
   (default: the ingress proxy only; ``*`` for local development)
+* ``PANTRY_HUB_HA_URL`` / ``PANTRY_HUB_HA_TOKEN`` — Home Assistant websocket
+  and long-lived token for the door entity outside the Supervisor
 * ``PANTRY_HUB_GROCY_WAIT`` — seconds to wait for Grocy at start (default 120)
 """
 
@@ -38,6 +40,7 @@ from .grocy import (
     GrocyRequestError,
     GrocyUnavailable,
 )
+from .homeassistant import SUPERVISOR_WS
 from .hub import Hub
 from .store import Store
 from .web import WebUI
@@ -128,6 +131,22 @@ async def resolve_mqtt(env: Mapping[str, str]) -> MqttSettings:
     return await mqtt_from_supervisor(token)
 
 
+def resolve_home_assistant(
+    env: Mapping[str, str], options: Options
+) -> tuple[str | None, str | None]:
+    """Websocket URL + token for the door entity (Supervisor, or env for dev)."""
+    if not options.door_entity:
+        return None, None
+    token = env.get("PANTRY_HUB_HA_TOKEN") or env.get("SUPERVISOR_TOKEN")
+    url = env.get("PANTRY_HUB_HA_URL") or SUPERVISOR_WS
+    if not token:
+        raise ConfigError(
+            f"door_entity {options.door_entity} needs Home Assistant API access: "
+            "not running under the Supervisor and PANTRY_HUB_HA_TOKEN is not set"
+        )
+    return url, token
+
+
 async def run(
     options: Options,
     data_dir: Path,
@@ -149,13 +168,22 @@ async def run(
         )
         _LOGGER.info(summary)
         mqtt = await resolve_mqtt(env)
+        ha_url, ha_token = resolve_home_assistant(env, options)
     except ConfigError as err:
         _LOGGER.error("Refusing to start: %s", err)
         await grocy.close()
         return 1
     await asyncio.to_thread(data_dir.mkdir, parents=True, exist_ok=True)
     store = await Store.open(data_dir / "pantry_hub.db")
-    hub = Hub(options, store, grocy, mqtt_settings=mqtt, version=version)
+    hub = Hub(
+        options,
+        store,
+        grocy,
+        mqtt_settings=mqtt,
+        version=version,
+        ha_url=ha_url,
+        ha_token=ha_token,
+    )
     allow_env = env.get("PANTRY_HUB_WEB_ALLOW")
     web = WebUI(
         hub,

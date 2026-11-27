@@ -1,10 +1,19 @@
 # Pantry Hub build report
-- App version: 0.3.0 (0.1.0 and 0.2.0 were never merged/released; all three are in PR #1) · linking station firmware 0.2.0
+- App version: 0.3.0 (door-driven reading + Q8 mode card; 0.1.0–0.3.0 are unreleased and all in PR #1) · linking station firmware 0.2.0
 - aiochainway version used: v0.2.0 (`f188a02`, ships `aiochainway.testing.FakeUR4`)
 - Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / CI_V030
 
 ## Summary
-**v0.3.0** (Q8): an "already in stock" session at the linking station, started by a printed mode card instead of a button gesture.
+**v0.3.0, door-driven reading** (default `reading_mode: door`):
+- The hub drives the UR4 in **command mode over TCP** with aiochainway `UR4Client.inventory(duration=…)`. It never uses the reader's trigger mode (work mode 2) and switches the reader to command mode at start if needed. Auto/UDP stays as `reading_mode: continuous`.
+- The door comes from a Home Assistant entity (`door_entity`, a `binary_sensor`) over the Supervisor's Core websocket (`subscribe_entities`). Door opens → continuous reading for `open_continuous_s` (600), then a `sweep_s` (45) sweep every `open_sweep_interval_s` (300). Door closes → one sweep, then stop. Closed → a sweep every `closed_sweep_interval_s` (3600).
+- Departure = present tag missing from `depart_after_missed_sweeps` (2) consecutive **completed** sweeps. The 900 s unseen timer counts only continuous reading time. Aborted sweeps never count.
+- Door unavailable/unknown, or the websocket lost → closed schedule (never "open"), plus a persistent notification after 120 s, auto-dismissed on recovery.
+- Restart → one sweep at start; no departures until 2 completed sweeps.
+- New entities: `sensor.pantry_hub_reader_activity`, `sensor.pantry_hub_last_sweep`, `button.pantry_hub_sweep_now`. The reader's MAC (aiochainway `discover()`, UDP 1111) goes into the device identifiers; fallback `host:port`, persisted in the DB.
+- aiochainway: every reader test uses `aiochainway.testing.FakeUR4` from the pinned v0.2.0; there is no local fake reader.
+
+**v0.3.0, Q8**: an "already in stock" session at the linking station, started by a printed mode card instead of a button gesture.
 - In link mode, scanning the QR card `PANTRY-HUB:IN-STOCK` toggles the session. While it's active, the link-mode pulse is dim amber instead of dim blue, and every link publishes `"in_stock": true` on both the barcode and tag messages. It ends when link mode exits (60 s idle or double-click) or when the card is scanned again. In Kroger mode the card is ignored (amber double blink).
 - Printable card: `docs/mode-card-in-stock.pdf` (US Letter, two credit-card-sized cards at real size) and `docs/mode-card-in-stock.png` (300 dpi); regenerate with `script/make_mode_card.py`. The QR was verified to decode to the exact payload (OpenCV), including at 25 % scale.
 - Station mode logic moved into `esphome/linking-station/include/link_mode.h` (pure C++, host-tested); the YAML lambdas only call it. New HA entity on the station: `In-stock session`.
@@ -47,6 +56,7 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 - Q1: an arrival whose cycle equals the link's `skip_add_cycle` journals a *skipped* add (status done, resolution `in_stock`, nothing sent). The departure then journals a normal consume, by amount, with no stock entry id.
 - Q3: replaying an add first compares its cycle with the persisted presence: `presence.cycle > op.cycle` or (same cycle and `departed`) → cancel add + consume (resolution `cancelled`).
 - Q2: an ambiguous consume with no stock entry id → `failed` + resolution `review`; it can't be blindly retried (Retry is refused). Only **Consume now** (by amount) or **Dismiss** closes it.
+- **Door mode (v0.3.0)**: reads from any window (continuous or sweep) feed the same arrival rule. `finish_sweep(completed)` advances the miss count only for completed sweeps; a read anywhere resets it. `tick(accrue=…)` adds to the unseen timer only while the activity is `continuous`, using an exact per-tag mark so idle time is skipped, not averaged. `min_sweeps_before_departure = 2` blocks both sweep and timer departures after a restart.
 - Journal rules: an arrival journals one add per (EPC, arrival cycle) in the same SQLite transaction as the presence update (`dedupe_key = epc:cycle:add`). A departure journals a consume only if that cycle's add was journaled and didn't fail. Linking a tag that is already present journals that cycle's add once.
 
 ## Linking flow (final topics and payloads)
@@ -73,7 +83,18 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 Linking station adds: `binary_sensor` Link mode, `binary_sensor` In-stock session (firmware 0.2.0), `text_sensor` Last linked tag, `switch` Link result beep (unverified).
 
 ## Spec changes vs. this spec
-v0.3.0:
+v0.3.0 door-driven reading:
+- **Version**: 0.3.0 (your title), not 0.4.0. 0.3.0 hadn't been released (it held only Q8), so both are in 0.3.0.
+- **"Repair issue in HA"**: apps have no API to create Repairs entries (only integrations do). Implemented as a persistent notification with a fixed id (`pantry_hub_door_unavailable`), raised after the door has been unavailable for 120 s and dismissed on recovery, plus `door_unavailable_notified` on `sensor.pantry_hub_reader_activity`.
+- **Door source**: `door_entity` is read over the HA API (`homeassistant_api: true`), replacing `door_entity_topic` (MQTT) from 0.1.0. That's a breaking change for 0.1.0 configs; a clear error says so. `depart_requires_door_closed` remains for `continuous` mode.
+- **MAC via discover()**: aiochainway's `discover()` is passive (it only listens for the reader's UDP 1111 broadcasts) and no TCP command returns the MAC. With the reader on the IoT VLAN and HA on 192.168.1.38, the broadcasts most likely never reach HA (and Docker bridge networking may also drop them), so the `host:port` fallback is the expected result. The MAC is added as an extra device identifier next to `pantry_hub`, so HA keeps a single device whichever id is used.
+- Which door changes abort a window: opening aborts anything; leaving "open" aborts the continuous window; closed ↔ unknown doesn't interrupt a sweep (otherwise the first door report at start would abort the startup sweep).
+- Failed sweeps (reader offline) and failed pending close/requested sweeps retry after `retry_s` = 60 s (internal constant) instead of a whole interval; no tight loop.
+- "Sweep now" while a sweep is running is ignored; during a continuous window it aborts the window, sweeps, and the continuous window resumes until `open_continuous_s` from opening.
+- Added option `reader_tcp_port` (8888). In door mode `binary_sensor.pantry_hub_reader_online` means "the last window reached the reader" (with closed-door sweeps an hour apart, a time-based online check would flap).
+- Container smoke test uses `reading_mode: continuous` (CI has no Home Assistant); door mode is covered by the integration tests.
+
+v0.3.0 Q8:
 - The card toggles the session only in link mode (in Kroger mode it's treated like any other non-product QR: amber double blink), so it can't start a session that would then apply to Kroger scans.
 - `in_stock` is sent on both the barcode and the tag message during a session (the hub accepts either; sending both is harmless and survives a dropped message).
 - The card payload match is case-insensitive and ignores surrounding CR/LF/spaces.
@@ -106,20 +127,30 @@ Q1–Q3 are resolved in v0.2.0 (above). Q4–Q7 stay as first-run hardware check
 6. **UDP source IP through the Supervisor's Docker bridge**: expected to be preserved (DNAT); if `dropped_sources` rises, NAT is rewriting it.
 7. HA 2026.11 MQTT discovery `default_entity_id` (replacement for `object_id`): verify the entity IDs on first run.
 
+Door-driven reading (v0.3.0) adds hardware checks: 10. confirm a 45 s command-mode sweep covers the whole pantry with the 4 SP11 antennas (the tag count per sweep is logged); 11. whether the UR4's UDP 1111 announcements reach HA at all (expected not, across VLANs); 12. the door sensor's `on` = open convention (an inverted sensor needs a template binary_sensor).
+
 Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the M14 reads the printed card (QR enabled, as the wall scanner already sees QR on packaging) and that a laminated card still reads under the base's illumination.
 
 (Was: 8. Should the linking station get a gesture for "already in stock" (e.g. triple-click before scanning), so existing stock can be tagged without the web UI?
 
 ## Hardware/setup impact (ports, firewall, disk, power supply)
-- **Ports**: UDP **8888** on 192.168.1.38 (UR4 → hub, host port configurable under Network); ingress 8099 internal; no host networking.
-- **Firewall**: allow UDP reader IP → 192.168.1.38:8888; station → Mosquitto TCP 1883; optional TCP HA → reader:8888 if `reader_tcp_probe`.
+- **Ports**: door mode (default) needs no incoming port: HA → reader **TCP 8888**. Continuous mode: UDP **8888** on 192.168.1.38. UDP **1111** mapped for the reader's announcements (MAC). Ingress 8099 internal; no host networking.
+- **Firewall**: door mode: allow TCP 192.168.1.38 → reader:8888 (with return traffic). Continuous mode: UDP reader → 192.168.1.38:8888. Station → Mosquitto TCP 1883.
+- **Reader provisioning**: work mode **command** (the hub also switches it at start); no UDP destination needed in door mode.
+- **Door sensor**: a Home Assistant `binary_sensor` for the pantry door (`on` = open) is required for the default mode.
 - **Disk**: free space first (86% full). The image is a small Alpine Python image; the SQLite DB is tiny. State is republished on change, with counters at most once a minute, to keep the recorder small.
 - **Grocy app** needs its port enabled and ssl off (or certificates) for `http://a0d7b954-grocy`.
 - **Power**: linking station needs **5 V ≥ 2 A USB-C** (QRCode2 + U107). Reader conducted power **≤ 27 dBm** (8.3 dBi SP11, FCC 36 dBm EIRP).
 - U107 needs mounting beside the scanner, antenna facing out (housing doesn't fit; separate ha-kroger-restock PR later).
 
 ## Test results (tests, coverage, property tests, fault injection)
-- **v0.3.0 tests**: `esphome/linking-station/tests/test_link_mode.cpp` (host, g++ -Werror; run in CI's ESPHome job): card/product/ignored classification (case, CR/LF, dashes, short codes, URLs); card ignored in Kroger mode; session on → amber + in-stock on every link; card again → off, still linking, blue; ends on double-click and on idle exit; doesn't come back on re-entering link mode. `pantry-hub/tests/test_firmware_contract.py`: card payload identical in firmware and generator; PNG/PDF present; barcode **and** tag publishes carry `in_stock` during a session; the hub reads exactly that JSON bool; link-mode exit ends the session. Mutation: dropping `in_stock` from the tag message → caught. Removing the reset in `exit_link()` is unobservable (in-stock also requires link mode, and entering link mode resets it), so session-end behaviour holds through two independent guards.
+- **v0.3.0 door-driven reading tests** (206 pytest tests total, 3 consecutive full runs green, coverage 94%):
+  - `test_reading.py` (17): every planner transition: startup sweep (including the door report at start not aborting it); start while open; closed schedule; open → continuous → sweeps every open interval; close → immediate sweep → closed schedule; failed close sweep retried after retry_s; failed scheduled/startup sweeps retried; unavailable = closed, never continuous; closed ↔ unknown doesn't abort; sweep now (closed and during continuous); reopening restarts the window; repeated reports aren't changes; invalid config. Hypothesis flapping property (open/close/unavailable/done/fail/now): continuous only while open, and a close always leads to a sweep (now, or within retry_s).
+  - `test_presence_sweeps.py` (11): arrival inside a sweep; departure after exactly 2 missed completed sweeps; a read between sweeps resets misses; aborted sweeps never count; restart rule for sweep and timer departures; timer frozen while idle and running while continuous (exact accounting across windows). Hypothesis door-mode property with restarts and aborted sweeps.
+  - `test_reader_and_door.py` (14): `FakeUR4` windows complete, auto → command mode switch (never trigger), already-command left alone, **reader drop mid-window aborts** (`disconnect_after_tags`), unreachable reader, cancel sends stop, explicit empty result = completed; MAC from `discover()`, `host:port` fallback (nothing found / port busy); HA door: on/off/unavailable/removed, missing entity → unavailable + notification + dismiss on recovery, a short blip doesn't notify, websocket drop → unavailable and reconnect, bad token stays unavailable.
+  - `test_door_reading.py` (12, real time): startup sweep + closed schedule + restart rule; command-mode switch; open → continuous → arrival → Grocy add → close sweep → stop; departure after 2 missed completed sweeps (not after 1) → Grocy consume; **reader drop mid-sweep** (repeated aborted sweeps never count; departs once the reader is back); **door flapping** ×10 (no departure, close sweep runs, aborted windows counted); **sensor unavailable** (continuous stops, notification, closed-interval sweeps, dismiss on recovery); sweep now over MQTT + new entities + MAC identifier + persisted id; sweep now during continuous then resume; restart needs 2 sweeps; unseen timer suspended while idle and running while continuous.
+  - Mutation checks, each caught: aborted sweeps counted as misses; no restart rule; timer always running; unavailable treated as open; door close not triggering a sweep.
+- **v0.3.0 Q8 tests**: `esphome/linking-station/tests/test_link_mode.cpp` (host, g++ -Werror; run in CI's ESPHome job): card/product/ignored classification (case, CR/LF, dashes, short codes, URLs); card ignored in Kroger mode; session on → amber + in-stock on every link; card again → off, still linking, blue; ends on double-click and on idle exit; doesn't come back on re-entering link mode. `pantry-hub/tests/test_firmware_contract.py`: card payload identical in firmware and generator; PNG/PDF present; barcode **and** tag publishes carry `in_stock` during a session; the hub reads exactly that JSON bool; link-mode exit ends the session. Mutation: dropping `in_stock` from the tag message → caught. Removing the reset in `exit_link()` is unobservable (in-stock also requires link mode, and entering link mode resets it), so session-end behaviour holds through two independent guards.
 - **153 pytest tests** pass locally for v0.3.0 (Python 3.14.6, Linux); ruff, mypy --strict, yamllint and `esphome config` clean.
 - v0.2.0: **149 pytest tests** pass locally (Python 3.14.6, Linux; two full runs); CI runs ubuntu-latest and macos-latest. **Coverage 95%** (branch) for `pantry_hub` (gate 90%): `__main__` 98, `grocy` 96, `hub` 94, `linking` 94, `store` 93, `web` 99, `worker` 91, `mqtt` 86, `presence`/`config`/`discovery` 100.
 - **v0.2.0 regression tests** (`tests/test_v020_decisions.py`, `tests/test_worker.py`):
@@ -156,6 +187,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 | 16 | (v0.2.0, behaviour) Tagging existing stock double-counted it | open question Q1 | "already in stock" per-link skip | `test_q1_*` (7 tests) |
 | 17 | (v0.3.0, feature gap) Existing stock could only be marked in-stock from the web UI | open question Q8 | mode-card in-stock session in the firmware | `test_link_mode.cpp`, `test_firmware_contract.py` |
 | 18 | (v0.3.0) Firmware didn't compile: an ESPHome `globals` entry of the custom type `link_mode::State` was generated as `int` | CI `esphome compile` | the state is a function-local static behind `link_mode::state()` in the header; no global | CI `esphome compile`; `test_link_mode.cpp` checks the shared instance |
+| 19 | (v0.3.0) A failed startup sweep cleared a close sweep queued behind it (one "pending" slot), and failed pending sweeps were retried immediately (a tight loop while the reader is offline) | Hypothesis flapping property (`open, close, done_fail`) | separate startup/close/requested flags; failed pending sweeps retry after `retry_s` | `test_failed_startup_sweep_keeps_pending_close_sweep`, `test_close_sweep_retried_if_it_fails` |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.
@@ -175,3 +207,5 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 15. (v0.2.0) Tag one item Grocy already counts with **already in stock** in the web UI: on arrival, no Grocy add; on departure, Grocy −1.
 16. (v0.2.0) Check the web UI's Failed operations list stays empty in normal use; if a **Review** row appears, check Grocy, then Consume now / Dismiss.
 17. (v0.3.0) Print `docs/mode-card-in-stock.pdf` at 100 %. Double-click (blue pulse), scan the card → amber pulse and the **In-stock session** entity on. Link one item Grocy already counts → the linked message mentions "already in stock"; its arrival adds nothing. Scan the card again → blue. Scan it in Kroger mode → amber double blink, nothing else.
+18. (v0.3.0) Set `door_entity`. Log: `Sweep (startup)` → `Sweep done: N tag report(s)`; `sensor.pantry_hub_last_sweep` set. Open the door → `reader_activity` = continuous; close → `Sweep (door_closed)` → idle. Press **Sweep now**. Pull the door sensor's battery → after 2 min a "door sensor unavailable" notification, sweeps hourly; put it back → notification gone.
+19. (v0.3.0) Take one tagged item out with the door closed: Grocy −1 after 2 completed sweeps (set `closed_sweep_interval_s` low, e.g. 120, to test). Restart the app: nothing departs until 2 sweeps complete.

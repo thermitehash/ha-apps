@@ -45,6 +45,14 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
 | Option | Default | Meaning |
 |---|---|---|
 | `reader_host` | — | The UR4's IP address. |
+| `reader_tcp_port` | `8888` | The UR4's TCP command port. |
+| `reading_mode` | `door` | **door**: the hub drives the reader in command mode over TCP, from the door sensor (see below). **continuous**: the reader's own auto mode pushes every read over UDP (the 0.1/0.2 behaviour); a fallback. The reader's trigger mode is never used. |
+| `door_entity` | — | The pantry door contact in Home Assistant, a `binary_sensor` (`on` = open). Required for `reading_mode: door`. |
+| `open_continuous_s` | `600` | After the door opens, read continuously this long. |
+| `open_sweep_interval_s` | `300` | Then, while the door stays open, sweep this often. |
+| `sweep_s` | `45` | Length of one sweep. |
+| `closed_sweep_interval_s` | `3600` | While the door is closed (or the sensor is unavailable), sweep this often. |
+| `depart_after_missed_sweeps` | `2` | A present item departs after being missing from this many *completed* sweeps in a row. |
 | `allowed_reader_ip` | (reader IP) | Only UDP datagrams from this IP are accepted. UDP is unauthenticated, so keep this set. |
 | `reader_tcp_probe` | `false` | Also ask the reader for its version over TCP every minute, so it shows online when no tags are in range. |
 | `reader_offline_after_s` | `120` | No datagram for this long → reader offline. |
@@ -53,17 +61,53 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
 | `grocy_location_id` | `1` | ID of the Pantry location. Arrivals are added there. |
 | `grocy_ui_url` | (empty) | Base URL your browser uses for Grocy, so links in the web UI work. If empty, links use `grocy_url`, which only works inside Home Assistant's network. |
 | `arrive_reads` / `arrive_window_s` | `3` / `10` | A tag must be read this many times within this window before it counts as arrived. This filters out tags carried past the door. |
-| `depart_after_s` | `900` | Not read for this long → departed (one unit consumed). |
-| `depart_requires_door_closed` | `false` | Only count departures while the pantry door is closed (and has been closed for one arrival window). Needs `door_entity_topic`. With this on and no door message received yet, nothing departs. |
-| `door_entity_topic` | (empty) | MQTT topic of the door contact. Accepts `ON`/`OFF`, `open`/`closed`, `true`/`false`, `1`/`0` (ON = open), or zigbee2mqtt JSON `{"contact": true}` (true = closed). |
+| `depart_after_s` | `900` | Not read for this much **reading time** → departed (one unit consumed). The timer only runs while the reader reads continuously (door open, or `continuous` mode); idle time never counts. |
+| `depart_requires_door_closed` | `false` | `continuous` mode only: count timer departures only while `door_entity` reports closed (for one arrival window). |
 | `max_reader_power_dbm` | `27` | Ceiling for reader power. The hub doesn't configure the reader, but refuses values over 27: with 8.3 dBi antennas (Vulcan SP11) that's the FCC 36 dBm EIRP limit. Use the same ceiling when provisioning the reader with `aiochainway`. |
 | `log_level` | `info` | `debug` logs every UDP datagram as hex. |
 
-### Port
+### Ports
 
-The reader sends its reads to UDP **8888** on the Home Assistant host. To
-use a different host port, change it under **Network**. The container
-always listens on 8888 internally. Host networking isn't needed.
+- `reading_mode: door` talks to the reader over **TCP 8888** (outgoing from
+  Home Assistant to the reader). No incoming port is needed.
+- `reading_mode: continuous`: the reader sends its reads to UDP **8888** on
+  the Home Assistant host (change the host port under **Network**).
+- UDP **1111**: the reader's own announcements. Pantry Hub listens for 5 s
+  at start to learn the reader's MAC for the device id. Announcements are
+  broadcasts, so they only arrive if the reader and Home Assistant share a
+  network segment; otherwise the id is `host:port`, which works just as
+  well.
+
+## Door-driven reading (default)
+
+```
+start ───────────────▶ one sweep
+door opens ──────────▶ read continuously for open_continuous_s (600 s),
+                       then a sweep_s (45 s) sweep every open_sweep_interval_s (300 s)
+door closes ─────────▶ one sweep now, then stop
+door closed ─────────▶ a sweep every closed_sweep_interval_s (3600 s)
+sensor unavailable ──▶ same as closed (never "open forever"), plus a
+                       notification in Home Assistant after 2 minutes
+"Sweep now" button ──▶ one sweep now
+```
+
+- **Arrival**: 3 reads within 10 s, in any reading window (continuous or
+  sweep).
+- **Departure**: a present item that is missing from
+  `depart_after_missed_sweeps` (2) **completed** sweeps in a row. A sweep
+  counts only if the reader stayed online for the whole window and answered
+  (with tags, or an empty inventory). A sweep cut short by a reader drop or
+  a door event never counts as a miss. While the door is open, the
+  `depart_after_s` timer also applies, counting only continuous reading time.
+- **Restart**: one sweep at start; nothing departs until 2 sweeps have
+  completed since the restart.
+- The hub puts the reader in **command mode** itself (it starts and stops
+  every inventory over TCP); if the reader was in auto mode it's switched
+  and a warning is logged.
+- Home Assistant apps can't add items to the **Repairs** dashboard (only
+  integrations can), so an unavailable door sensor raises a persistent
+  notification instead. It's dismissed automatically when the sensor
+  reports again.
 
 ## How presence works
 
@@ -81,9 +125,10 @@ unknown ──read──▶ arriving ──3 reads in 10 s──▶ present ◀�
   means never: 2999-12-31).
 - **Departed** (linked tag): Grocy `consume` of that exact stock entry.
 - **Unlinked tag arrived**: added to the unlinked list. Grocy isn't touched.
-- **Restart**: tags that were in the pantry are treated as present for one
-  full `depart_after_s` window, so a restart never consumes everything at
-  once.
+- **Restart**: tags that were in the pantry are treated as present. In door
+  mode nothing departs until 2 sweeps complete; in continuous mode, until one
+  full `depart_after_s` window has passed. A restart never consumes
+  everything at once.
 
 Every Grocy change goes through a journal in `/data/pantry_hub.db`. If
 Grocy is down, changes queue up (`sensor.pantry_hub_grocy_queue`) and replay
@@ -150,13 +195,16 @@ normally. Off by default.
 
 | Entity | What |
 |---|---|
-| `binary_sensor.pantry_hub_reader_online` | A datagram from the reader within `reader_offline_after_s` (or a TCP probe answer). Attributes: datagram/tag/bad-frame/dropped-source counters. |
+| `binary_sensor.pantry_hub_reader_online` | Door mode: the last window reached the reader. Continuous mode: a datagram within `reader_offline_after_s` (or a TCP probe answer). Attributes: datagram/tag/bad-frame/dropped-source counters. |
 | `sensor.pantry_hub_present_tags` | Tags in the pantry (present or briefly missing). |
 | `sensor.pantry_hub_unlinked_tags` | Unlinked tags currently in the pantry. |
 | `sensor.pantry_hub_grocy_queue` | Grocy changes waiting. Attributes: `failed` (includes review), `review`, `online`, `last_error`. |
 | `sensor.pantry_hub_last_link` | Product of the most recent link; attributes: EPC, barcode, station, time. |
 | `sensor.pantry_hub_resync_differences` | Products whose Grocy pantry amount differs from the linked tags present, after the last resync. |
 | `event.pantry_hub_item` | `arrived` / `departed`, with product and EPC. |
+| `sensor.pantry_hub_reader_activity` | `idle` / `continuous` / `sweep`. Attributes: reading mode, door state, sweeps completed/aborted, last sweep and last attempt, reader id, whether departures are allowed yet, whether the door notification is up. |
+| `sensor.pantry_hub_last_sweep` | Time of the last completed sweep. |
+| `button.pantry_hub_sweep_now` | Sweep now (door mode). During a continuous window it sweeps, then continuous reading resumes. |
 | `button.pantry_hub_resync` | Compare and report. Resync never changes Grocy; fix differences there. |
 
 Stock levels come from the Grocy integration (HACS). Pantry Hub doesn't

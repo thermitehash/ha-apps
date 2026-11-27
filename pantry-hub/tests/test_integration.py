@@ -22,6 +22,7 @@ from pantry_hub.store import Link
 
 from .conftest import BrokerHandle, FakeClock, eventually
 from .fake_grocy import FakeGrocy
+from .fake_ha import TOKEN as HA_TOKEN, FakeHomeAssistant
 from .rig import Observer, Rig
 
 EPC_A = "E28011700000020F1A2B3C01"
@@ -115,6 +116,9 @@ async def test_discovery_and_availability(rig: Rig, observer: Observer) -> None:
         "sensor.pantry_hub_resync_differences",
         "event.pantry_hub_item",
         "button.pantry_hub_resync",
+        "sensor.pantry_hub_reader_activity",
+        "sensor.pantry_hub_last_sweep",
+        "button.pantry_hub_sweep_now",
     }
     assert observer.messages[AVAILABILITY_TOPIC][-1] == b"online"
     # HA restart → discovery republished.
@@ -319,39 +323,43 @@ async def test_source_filter_drops_other_senders(
         rig.close()
 
 
-async def test_door_gating_over_mqtt(
+async def test_door_gating_with_ha_entity_in_continuous_mode(
     tmp_path: Path,
     grocy: FakeGrocy,
     broker: BrokerHandle,
     clock: FakeClock,
-    observer: Observer,
+    ha: FakeHomeAssistant,
 ) -> None:
+    """reading_mode continuous + depart_requires_door_closed, door from HA."""
     beans = grocy.add_product("Beans")
+    door = "binary_sensor.pantry_door"
+    await ha.set_state(door, "off")
     rig = Rig(
         tmp_path,
         grocy,
         broker,
         clock,
         depart_requires_door_closed=True,
-        door_entity_topic="zigbee2mqtt/pantry_door",
+        door_entity=door,
     )
     try:
-        await rig.start()
+        await rig.start(ha_url=ha.url, ha_token=HA_TOKEN)
+        await eventually(lambda: rig.h.machine.door.value == "closed")
         await link(rig, EPC_A, beans.id, "Beans")
         await rig.arrive(EPC_A)
         await rig.idle()
-        await observer.publish("zigbee2mqtt/pantry_door", {"contact": False})  # open
+        await ha.set_state(door, "on")  # open
         await eventually(lambda: rig.h.machine.door.value == "open")
         clock.advance(120)
         await asyncio.sleep(0.1)
-        assert rig.h.machine.state(EPC_A).value == "missing"
-        await observer.publish("zigbee2mqtt/pantry_door", {"contact": True})  # closed
+        assert rig.h.machine.state(EPC_A).value == "missing"  # gated while open
+        await ha.set_state(door, "off")
         await eventually(lambda: rig.h.machine.door.value == "closed")
         clock.advance(6)  # door_settle_s = arrive_window_s = 5
         await rig.read_until_state(EPC_A, "unknown")
         await rig.idle()
         assert grocy.amount(beans.id) == 0
-        await observer.publish("zigbee2mqtt/pantry_door", "weird")
+        await ha.set_state(door, "unavailable")
         await eventually(lambda: rig.h.machine.door.value == "unknown")
     finally:
         await rig.stop()

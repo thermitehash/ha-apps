@@ -95,6 +95,7 @@ class WebUI:
         self.app.router.add_post("/consume-now", self._form(self._consume_now))
         self.app.router.add_post("/dismiss-op", self._form(self._dismiss_op))
         self.app.router.add_post("/resync", self._form(self._resync))
+        self.app.router.add_post("/sweep", self._form(self._sweep))
         self._runner: web.AppRunner | None = None
         self._flash: str | None = None
 
@@ -198,6 +199,11 @@ class WebUI:
             return f"Op {op_id} dismissed (no change in Grocy)"
         return f"Op {op_id} is not waiting for review"
 
+    async def _sweep(self, form: dict[str, str]) -> str:
+        if self.hub.request_sweep():
+            return "Sweep requested"
+        return "Sweep not started (one is running, or reading_mode is continuous)"
+
     async def _resync(self, form: dict[str, str]) -> str:
         report = await self.hub.resync()
         if report.error:
@@ -251,6 +257,7 @@ class WebUI:
             ("MQTT", _status(mqtt_ok, "connected", "disconnected", "off")),
             ("Present tags", f"<b>{state['present_tags']}</b>"),
             ("Unlinked present", f"<b>{state['unlinked_tags']}</b>"),
+            ("Reader activity", f"<b>{_e(state['activity'])}</b>"),
             ("Grocy queue", f"<b>{state['grocy_queue']}</b>"),
             ("Failed ops", f"<b>{state['grocy']['failed']}</b>"),
         ]
@@ -345,6 +352,10 @@ class WebUI:
 <p class="muted">Reader {_e(opts.reader_host)} · last datagram {_e(state["reader"]["last_datagram"] or "never")} ·
 bad frames {state["reader"]["bad_frames"]} · dropped sources {state["reader"]["dropped_sources"]} ·
 door {_e(state["door"])}{f" · Grocy error: {_e(state['grocy']['last_error'])}" if state["grocy"]["last_error"] else ""}</p>
+<p class="muted">Reading mode {_e(state["reading"]["mode"])} · last sweep {_e(state["last_sweep"] or "never")} ·
+sweeps completed {state["reading"]["sweeps_completed"]} (aborted {state["reading"]["sweeps_aborted"]}) ·
+reader id {_e(state["reading"]["reader_id"])}{" · <b>departures paused until 2 sweeps complete</b>" if not state["reading"]["departures_allowed"] else ""}
+{self._button("sweep", "Sweep now") if hub.door_mode else ""}</p>
 <h2>Links ({len(links)})</h2>
 <div class="scroll"><table><tr><th>EPC</th><th>Product</th><th>Linked</th><th>Last seen</th><th></th></tr>
 {_rows(link_rows, 5, "No links yet. Use the linking station: double-click its button, scan a barcode, hold the tag near the reader.")}</table></div>

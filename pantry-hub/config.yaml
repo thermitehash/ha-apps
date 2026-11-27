@@ -15,15 +15,27 @@ init: false
 # requires default-valued keys to be left out).
 services:
   - mqtt:need
+# Read the door entity and raise a notification when it's unavailable.
+homeassistant_api: true
 ports:
   8888/udp: 8888
+  1111/udp: 1111
 ports_description:
-  8888/udp: Chainway UR4 auto-mode tag reads (UDP)
+  8888/udp: Chainway UR4 auto-mode tag reads (UDP; reading_mode continuous only)
+  1111/udp: Chainway UR4 announcements (reader MAC for the device id)
 ingress: true
 panel_icon: mdi:fridge-outline
 panel_title: Pantry Hub
 options:
   reader_host: ""
+  reader_tcp_port: 8888
+  reading_mode: door
+  door_entity: ""
+  open_continuous_s: 600
+  open_sweep_interval_s: 300
+  sweep_s: 45
+  closed_sweep_interval_s: 3600
+  depart_after_missed_sweeps: 2
   allowed_reader_ip: ""
   reader_tcp_probe: false
   reader_offline_after_s: 120
@@ -35,11 +47,18 @@ options:
   arrive_window_s: 10
   depart_after_s: 900
   depart_requires_door_closed: false
-  door_entity_topic: ""
   max_reader_power_dbm: 27
   log_level: info
 schema:
   reader_host: str
+  reader_tcp_port: port
+  reading_mode: list(door|continuous)
+  door_entity: str?
+  open_continuous_s: int(0,86400)
+  open_sweep_interval_s: int(30,86400)
+  sweep_s: int(5,3600)
+  closed_sweep_interval_s: int(60,86400)
+  depart_after_missed_sweeps: int(1,20)
   allowed_reader_ip: str?
   reader_tcp_probe: bool
   reader_offline_after_s: int(10,3600)
@@ -51,6 +70,5 @@ schema:
   arrive_window_s: int(1,600)
   depart_after_s: int(30,86400)
   depart_requires_door_closed: bool
-  door_entity_topic: str?
   max_reader_power_dbm: int(0,30)
   log_level: list(debug|info|warning|error)

@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -27,6 +28,8 @@ DEFAULT_WEB_PORT = 8099
 #: FCC limit context: 8.3 dBi antennas, 36 dBm EIRP → 27.7 dBm conducted.
 MAX_SAFE_READER_POWER_DBM = 27
 LOG_LEVELS = ("debug", "info", "warning", "error")
+READING_MODES = ("door", "continuous")
+DOOR_ENTITY_RE = re.compile(r"^binary_sensor\.[a-z0-9_]+$")
 SUPERVISOR_MQTT_URL = "http://supervisor/services/mqtt"
 
 
@@ -50,7 +53,16 @@ class Options:
     arrive_window_s: float = 10.0
     depart_after_s: float = 900.0
     depart_requires_door_closed: bool = False
-    door_entity_topic: str = ""
+    #: "door": command-mode TCP reading driven by the door entity (default);
+    #: "continuous": the reader's auto mode pushing UDP (v0.1/0.2 behaviour).
+    reading_mode: str = "door"
+    door_entity: str = ""
+    open_continuous_s: float = 600.0
+    open_sweep_interval_s: float = 300.0
+    sweep_s: float = 45.0
+    closed_sweep_interval_s: float = 3600.0
+    depart_after_missed_sweeps: int = 2
+    reader_tcp_port: int = 8888
     max_reader_power_dbm: int = 27
     log_level: str = "info"
     udp_port: int = DEFAULT_UDP_PORT
@@ -143,14 +155,38 @@ def parse_options(
             f"arrive_window_s ({arrive_window})"
         )
     requires_door = _bool(raw, "depart_requires_door_closed", False)
-    door_topic = _str(raw, "door_entity_topic")
-    if requires_door and not door_topic:
+    reading_mode = _str(raw, "reading_mode", "door").lower()
+    if reading_mode not in READING_MODES:
+        raise ConfigError(f"reading_mode must be one of {', '.join(READING_MODES)}")
+    door_entity = _str(raw, "door_entity")
+    if door_entity and not DOOR_ENTITY_RE.fullmatch(door_entity):
         raise ConfigError(
-            "depart_requires_door_closed is on but door_entity_topic is empty: "
-            "set the MQTT topic of the pantry door contact"
+            f"door_entity must be a binary_sensor entity id, got {door_entity!r} "
+            "(e.g. binary_sensor.pantry_door)"
         )
-    if door_topic and any(c in door_topic for c in "#+"):
-        raise ConfigError("door_entity_topic must be a single topic, no wildcards")
+    if reading_mode == "door" and not door_entity:
+        raise ConfigError(
+            "door_entity is required when reading_mode is door: set the pantry "
+            "door contact (e.g. binary_sensor.pantry_door), or use reading_mode: "
+            "continuous"
+        )
+    if requires_door and not door_entity:
+        raise ConfigError("depart_requires_door_closed is on but door_entity is empty")
+    if "door_entity_topic" in raw and raw.get("door_entity_topic"):
+        raise ConfigError(
+            "door_entity_topic (MQTT) was replaced by door_entity (a Home "
+            "Assistant binary_sensor) in 0.3.0"
+        )
+    open_continuous = _int(raw, "open_continuous_s", 600, 0, 86400)
+    open_interval = _int(raw, "open_sweep_interval_s", 300, 30, 86400)
+    sweep = _int(raw, "sweep_s", 45, 5, 3600)
+    closed_interval = _int(raw, "closed_sweep_interval_s", 3600, 60, 86400)
+    if sweep >= min(open_interval, closed_interval):
+        raise ConfigError(
+            f"sweep_s ({sweep}) must be shorter than open_sweep_interval_s "
+            f"({open_interval}) and closed_sweep_interval_s ({closed_interval})"
+        )
+    missed = _int(raw, "depart_after_missed_sweeps", 2, 1, 20)
     power = _int(raw, "max_reader_power_dbm", MAX_SAFE_READER_POWER_DBM, 0, 30)
     if power > MAX_SAFE_READER_POWER_DBM:
         raise ConfigError(
@@ -173,7 +209,14 @@ def parse_options(
         arrive_window_s=float(arrive_window),
         depart_after_s=float(depart_after),
         depart_requires_door_closed=requires_door,
-        door_entity_topic=door_topic,
+        reading_mode=reading_mode,
+        door_entity=door_entity,
+        open_continuous_s=float(open_continuous),
+        open_sweep_interval_s=float(open_interval),
+        sweep_s=float(sweep),
+        closed_sweep_interval_s=float(closed_interval),
+        depart_after_missed_sweeps=missed,
+        reader_tcp_port=_int(raw, "reader_tcp_port", 8888, 1, 65535),
         max_reader_power_dbm=power,
         log_level=log_level,
         udp_port=int(env.get("PANTRY_HUB_UDP_PORT", DEFAULT_UDP_PORT)),

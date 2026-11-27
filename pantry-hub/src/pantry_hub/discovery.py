@@ -11,6 +11,7 @@ EVENTS_TOPIC = f"{PREFIX}/events"
 LAST_LINK_TOPIC = f"{PREFIX}/last_link"
 RESYNC_COMMAND_TOPIC = f"{PREFIX}/resync/press"
 RESYNC_RESULT_TOPIC = f"{PREFIX}/resync/result"
+SWEEP_COMMAND_TOPIC = f"{PREFIX}/sweep/press"
 LINKING_SUB = f"{PREFIX}/linking/+/+"
 HA_STATUS_TOPIC = "homeassistant/status"
 DISCOVERY_TOPIC = "homeassistant/device/pantry_hub/config"
@@ -21,8 +22,12 @@ def linking_result_topic(station: str) -> str:
     return f"{PREFIX}/linking/{station}/result"
 
 
-def discovery_payload(version: str) -> dict[str, Any]:
-    """Device-based discovery for every hub entity."""
+def discovery_payload(version: str, reader_id: str | None = None) -> dict[str, Any]:
+    """Device-based discovery for every hub entity.
+
+    ``reader_id`` (the UR4's MAC, else host:port) is added to the device
+    identifiers; ``pantry_hub`` stays, so HA keeps one device either way.
+    """
 
     def sensor(
         key: str, name: str, template: str, icon: str, **extra: Any
@@ -40,7 +45,10 @@ def discovery_payload(version: str) -> dict[str, Any]:
 
     return {
         "device": {
-            "identifiers": ["pantry_hub"],
+            "identifiers": [
+                "pantry_hub",
+                *([f"chainway_{reader_id}"] if reader_id else []),
+            ],
             "name": "Pantry Hub",
             "manufacturer": "thermitehash",
             "model": "Pantry Hub",
@@ -112,6 +120,33 @@ def discovery_payload(version: str) -> dict[str, Any]:
                 "json_attributes_topic": RESYNC_RESULT_TOPIC,
                 "icon": "mdi:scale-unbalanced",
                 "entity_category": "diagnostic",
+            },
+            "reader_activity": sensor(
+                "reader_activity",
+                "Reader activity",
+                "{{ value_json.activity }}",
+                "mdi:radar",
+                device_class="enum",
+                options=["idle", "continuous", "sweep"],
+                json_attributes_topic=STATE_TOPIC,
+                json_attributes_template="{{ value_json.reading | tojson }}",
+            ),
+            "last_sweep": sensor(
+                "last_sweep",
+                "Last sweep",
+                "{{ value_json.last_sweep or None }}",
+                "mdi:timer-check-outline",
+                device_class="timestamp",
+                entity_category="diagnostic",
+            ),
+            "sweep_now": {
+                "p": "button",
+                "name": "Sweep now",
+                "unique_id": "pantry_hub_sweep_now",
+                "default_entity_id": "button.pantry_hub_sweep_now",
+                "command_topic": SWEEP_COMMAND_TOPIC,
+                "payload_press": "PRESS",
+                "icon": "mdi:radar",
             },
             "item": {
                 "p": "event",

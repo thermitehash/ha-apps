@@ -4,19 +4,32 @@ States::
 
     unknown ──read──▶ arriving ──N reads within window──▶ present
                          │                                  │  ▲
-                 window expires                     unseen  │  │ read
-                         ▼                     missing_after│  │
+                 window expires                   unseen /  │  │ read
+                         ▼                   missed sweep   │  │
                       unknown                               ▼  │
                                                           missing
                                                             │
-                               unseen depart_after (and door gate open)
+             unseen reading time ≥ depart_after_s  or  missed N completed sweeps
                                                             ▼
                                                          departed ──read──▶ arriving
 
-``arrived`` is emitted on arriving → present; ``departed`` on missing →
+``arrived`` is emitted on arriving → present; ``departed`` on missing/present →
 departed. Events alternate per EPC, starting with ``arrived`` (an EPC restored
 after a restart starts in ``present`` because its ``arrived`` already happened
 before the restart).
+
+Two ways to depart:
+
+* **Unseen timer** (``depart_after_s``): counts only *reading time*. The hub
+  calls :meth:`tick` with ``accrue=True`` while the reader is reading
+  continuously (door open, or the UDP/auto fallback mode) and ``accrue=False``
+  otherwise, so time with the reader idle never counts as "not seen".
+* **Missed sweeps** (``depart_after_missed_sweeps``): a tag that is present
+  but absent from N consecutive *completed* sweeps departs. An aborted sweep
+  (reader dropped, door event) never counts as a miss.
+
+After a restart, ``min_sweeps_before_departure`` completed sweeps must happen
+before anything may depart.
 """
 
 from __future__ import annotations
@@ -39,7 +52,7 @@ class State(StrEnum):
 
 
 class Door(StrEnum):
-    """Pantry door state as reported over MQTT."""
+    """Pantry door state (from the Home Assistant door entity)."""
 
     UNKNOWN = "unknown"
     OPEN = "open"
@@ -60,25 +73,25 @@ class PresenceEvent:
 
 @dataclass(frozen=True, slots=True)
 class PresenceConfig:
-    """Thresholds (seconds)."""
+    """Thresholds (seconds unless noted)."""
 
     arrive_reads: int = 3
     arrive_window_s: float = 10.0
     depart_after_s: float = 900.0
     depart_requires_door_closed: bool = False
+    #: Consecutive completed sweeps a present tag may be missing from (0 = off).
+    depart_after_missed_sweeps: int = 0
+    #: Completed sweeps needed after start before anything may depart.
+    min_sweeps_before_departure: int = 0
 
     @property
     def missing_after_s(self) -> float:
-        """Unseen this long → ``missing`` (informational; no event)."""
+        """Unseen reading time → ``missing`` (informational; no event)."""
         return min(60.0, self.depart_after_s / 2)
 
     @property
     def door_settle_s(self) -> float:
-        """How long the door must have been closed before a departure counts.
-
-        Gives the reader one arrival window to re-read tags that a person in
-        the doorway was shadowing.
-        """
+        """How long the door must have been closed before a timer departure counts."""
         return self.arrive_window_s
 
 
@@ -90,6 +103,12 @@ class Track:
     state: State
     last_seen: float
     reads: deque[float] = field(default_factory=deque)
+    #: Reading time accrued since the last read (the unseen timer).
+    unseen: float = 0.0
+    #: Time up to which ``unseen`` has been accounted for.
+    mark: float = 0.0
+    #: Consecutive completed sweeps this present tag was missing from.
+    missed: int = 0
 
 
 class PresenceMachine:
@@ -101,10 +120,16 @@ class PresenceMachine:
             raise ValueError("arrive_reads must be at least 1")
         if config.depart_after_s <= config.arrive_window_s:
             raise ValueError("depart_after_s must be longer than arrive_window_s")
+        if config.depart_after_missed_sweeps < 0:
+            raise ValueError("depart_after_missed_sweeps must not be negative")
         self.config = config
         self._tracks: dict[str, Track] = {}
         self.door = Door.UNKNOWN
         self._door_closed_since: float | None = None
+        self._sweep_seen: set[str] | None = None
+        #: Completed sweeps since this machine was created (i.e. since start).
+        self.sweeps_completed = 0
+        self.sweeps_aborted = 0
 
     # Queries -----------------------------------------------------------------
 
@@ -125,25 +150,38 @@ class PresenceMachine:
             if t.state in (State.PRESENT, State.MISSING)
         ]
 
+    @property
+    def sweeping(self) -> bool:
+        """Whether a sweep is in progress."""
+        return self._sweep_seen is not None
+
+    @property
+    def departures_allowed(self) -> bool:
+        """False until enough sweeps completed after start (restart rule)."""
+        return self.sweeps_completed >= self.config.min_sweeps_before_departure
+
     # Inputs ------------------------------------------------------------------
 
     def restore(self, epcs: Iterable[str], now: float) -> None:
-        """Mark EPCs that were in the pantry before a restart as present.
-
-        Their departure clock starts at ``now``, so nothing departs until one
-        full ``depart_after_s`` has passed without a read.
-        """
+        """Mark EPCs that were in the pantry before a restart as present."""
         for epc in epcs:
-            self._tracks[epc] = Track(epc=epc, state=State.PRESENT, last_seen=now)
+            self._tracks[epc] = Track(
+                epc=epc, state=State.PRESENT, last_seen=now, mark=now
+            )
 
     def read(self, epc: str, now: float) -> list[PresenceEvent]:
         """Record one read of ``epc`` at ``now``."""
+        if self._sweep_seen is not None:
+            self._sweep_seen.add(epc)
         track = self._tracks.get(epc)
         if track is None or track.state in (State.UNKNOWN, State.DEPARTED):
-            track = Track(epc=epc, state=State.ARRIVING, last_seen=now)
+            track = Track(epc=epc, state=State.ARRIVING, last_seen=now, mark=now)
             self._tracks[epc] = track
         else:
             track.last_seen = max(track.last_seen, now)
+        track.unseen = 0.0
+        track.missed = 0
+        track.mark = max(track.mark, now)
         if track.state is State.ARRIVING:
             track.reads.append(now)
             self._prune_reads(track, now)
@@ -156,31 +194,73 @@ class PresenceMachine:
         return []
 
     def set_door(self, door: Door, now: float) -> None:
-        """Update the pantry door state."""
+        """Update the pantry door state (timer-departure gating)."""
         if door is Door.CLOSED and self.door is not Door.CLOSED:
             self._door_closed_since = now
         elif door is not Door.CLOSED:
             self._door_closed_since = None
         self.door = door
 
-    def tick(self, now: float) -> list[PresenceEvent]:
-        """Advance timers; return departures."""
+    def tick(self, now: float, *, accrue: bool = True) -> list[PresenceEvent]:
+        """Advance timers; return timer departures.
+
+        ``accrue``: whether the reader was reading continuously since the
+        last tick. If not, that time does not count towards ``unseen``.
+        """
         events: list[PresenceEvent] = []
         cfg = self.config
         for epc in list(self._tracks):
             track = self._tracks[epc]
-            unseen = now - track.last_seen
             if track.state is State.ARRIVING:
                 self._prune_reads(track, now)
                 if not track.reads:
                     del self._tracks[epc]
-            elif track.state is State.PRESENT and unseen > cfg.missing_after_s:
+                continue
+            if now > track.mark:
+                if accrue:
+                    track.unseen += now - track.mark
+                track.mark = now
+            if track.state is State.PRESENT and track.unseen > cfg.missing_after_s:
                 track.state = State.MISSING
             if (
                 track.state is State.MISSING
-                and unseen >= cfg.depart_after_s
+                and track.unseen >= cfg.depart_after_s
+                and self.departures_allowed
                 and self._door_allows_departure(now)
             ):
+                del self._tracks[epc]
+                events.append(PresenceEvent("departed", epc, now))
+        return events
+
+    def start_sweep(self) -> None:
+        """Begin a sweep: remember which EPCs are read until it finishes."""
+        self._sweep_seen = set()
+
+    def finish_sweep(self, completed: bool, now: float) -> list[PresenceEvent]:
+        """End the sweep; return departures (only for a completed sweep).
+
+        A sweep is *completed* when the reader stayed online for the whole
+        window and the inventory ended normally (tags, or an explicit empty
+        result). Aborted sweeps change nothing.
+        """
+        seen = self._sweep_seen or set()
+        self._sweep_seen = None
+        if not completed:
+            self.sweeps_aborted += 1
+            return []
+        self.sweeps_completed += 1
+        events: list[PresenceEvent] = []
+        limit = self.config.depart_after_missed_sweeps
+        for epc in list(self._tracks):
+            track = self._tracks[epc]
+            if track.state not in (State.PRESENT, State.MISSING):
+                continue
+            if epc in seen:
+                track.missed = 0
+                continue
+            track.missed += 1
+            track.state = State.MISSING
+            if limit and track.missed >= limit and self.departures_allowed:
                 del self._tracks[epc]
                 events.append(PresenceEvent("departed", epc, now))
         return events

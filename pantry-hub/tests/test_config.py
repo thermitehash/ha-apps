@@ -14,7 +14,7 @@ from pantry_hub.config import (
     mqtt_from_supervisor,
     parse_options,
 )
-from pantry_hub.hub import parse_door
+from pantry_hub.homeassistant import door_from_state
 from pantry_hub.presence import Door
 
 GOOD: dict[str, Any] = {
@@ -22,6 +22,7 @@ GOOD: dict[str, Any] = {
     "grocy_url": "http://a0d7b954-grocy/",
     "grocy_api_key": "abc",
     "grocy_location_id": 2,
+    "door_entity": "binary_sensor.pantry_door",
 }
 
 
@@ -68,9 +69,21 @@ def test_env_ports_and_overrides() -> None:
         ({"arrive_reads": 2.5}, "arrive_reads"),
         ({"arrive_window_s": "10"}, "arrive_window_s"),
         ({"depart_after_s": 30, "arrive_window_s": 60}, "must be longer"),
-        ({"depart_requires_door_closed": True}, "door_entity_topic is empty"),
+        (
+            {
+                "depart_requires_door_closed": True,
+                "reading_mode": "continuous",
+                "door_entity": "",
+            },
+            "door_entity is empty",
+        ),
         ({"depart_requires_door_closed": "yes"}, "true or false"),
-        ({"door_entity_topic": "a/#"}, "wildcards"),
+        ({"door_entity_topic": "a/b"}, "replaced by door_entity"),
+        ({"reading_mode": "door", "door_entity": ""}, "door_entity is required"),
+        ({"door_entity": "sensor.door"}, "binary_sensor"),
+        ({"reading_mode": "trigger"}, "reading_mode"),
+        ({"sweep_s": 400}, "sweep_s"),
+        ({"depart_after_missed_sweeps": 0}, "depart_after_missed_sweeps"),
         ({"max_reader_power_dbm": 30}, "FCC"),
         ({"log_level": "loud"}, "log_level"),
         ({"reader_host": 5}, "must be text"),
@@ -82,10 +95,17 @@ def test_validation_errors(change: dict[str, Any], message: str) -> None:
 
 
 def test_none_string_is_default() -> None:
-    assert (
-        parse_options({**GOOD, "door_entity_topic": None}, env={}).door_entity_topic
-        == ""
-    )
+    assert parse_options({**GOOD, "grocy_ui_url": None}, env={}).grocy_ui_url == ""
+
+
+def test_door_mode_defaults() -> None:
+    o = parse_options(GOOD, env={})
+    assert o.reading_mode == "door" and o.door_entity == "binary_sensor.pantry_door"
+    assert (o.open_continuous_s, o.open_sweep_interval_s, o.sweep_s) == (600, 300, 45)
+    assert (o.closed_sweep_interval_s, o.depart_after_missed_sweeps) == (3600, 2)
+    assert o.reader_tcp_port == 8888
+    c = parse_options({**GOOD, "reading_mode": "continuous", "door_entity": ""}, env={})
+    assert c.reading_mode == "continuous"
 
 
 def test_load_options(tmp_path: Path) -> None:
@@ -173,22 +193,15 @@ async def test_mqtt_from_supervisor() -> None:
 
 
 @pytest.mark.parametrize(
-    ("payload", "door"),
+    ("state", "door"),
     [
-        (b"ON", Door.OPEN),
-        (b"off", Door.CLOSED),
-        (b"open", Door.OPEN),
-        (b"closed", Door.CLOSED),
-        (b"1", Door.OPEN),
-        (b"false", Door.CLOSED),
-        (b'{"contact": true}', Door.CLOSED),
-        (b'{"contact": false}', Door.OPEN),
-        (b'{"state": "OFF"}', Door.CLOSED),
-        (b'{"other": 1}', Door.UNKNOWN),
-        (b"{bad", Door.UNKNOWN),
-        (b"[1]", Door.UNKNOWN),
-        (b"maybe", Door.UNKNOWN),
+        ("on", Door.OPEN),
+        ("off", Door.CLOSED),
+        ("unavailable", Door.UNKNOWN),
+        ("unknown", Door.UNKNOWN),
+        (None, Door.UNKNOWN),
+        ("open", Door.UNKNOWN),
     ],
 )
-def test_parse_door(payload: bytes, door: Door) -> None:
-    assert parse_door(payload) is door
+def test_door_from_state(state: object, door: Door) -> None:
+    assert door_from_state(state) is door

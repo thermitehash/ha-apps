@@ -605,6 +605,23 @@ class Store:
             now=link.linked_at,
         )
 
+    # Meta ----------------------------------------------------------------------
+
+    async def get_meta(self, key: str) -> str | None:
+        """Return a stored setting (e.g. the reader's unique id)."""
+        async with self._lock:
+            row = await self._one("SELECT value FROM meta WHERE key = ?", (key,))
+        return None if row is None else str(row["value"])
+
+    async def set_meta(self, key: str, value: str) -> None:
+        """Store a setting."""
+        async with self._lock:
+            await self._exec(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
     # Links ---------------------------------------------------------------------
 
     async def get_link(self, epc: str) -> Link | None:

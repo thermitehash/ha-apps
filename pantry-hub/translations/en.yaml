@@ -3,6 +3,39 @@ configuration:
   reader_host:
     name: Reader IP address
     description: The Chainway UR4's IP address (static, on the IoT VLAN).
+  reader_tcp_port:
+    name: Reader TCP port
+    description: The UR4's command port (8888 unless you changed it).
+  reading_mode:
+    name: Reading mode
+    description: >-
+      door (default): the hub drives the reader in command mode from the door
+      sensor (continuous while open, sweeps otherwise). continuous: the
+      reader's auto mode pushes every read over UDP.
+  door_entity:
+    name: Door sensor
+    description: >-
+      The pantry door contact, a binary_sensor (on = open). Required for
+      reading_mode door.
+  open_continuous_s:
+    name: Read continuously after opening (s)
+    description: How long to read continuously after the door opens.
+  open_sweep_interval_s:
+    name: Sweep interval while open (s)
+    description: After the continuous window, sweep this often while the door stays open.
+  sweep_s:
+    name: Sweep length (s)
+    description: How long one sweep reads.
+  closed_sweep_interval_s:
+    name: Sweep interval while closed (s)
+    description: >-
+      Sweep this often while the door is closed (also used while the door
+      sensor is unavailable).
+  depart_after_missed_sweeps:
+    name: Depart after missed sweeps
+    description: >-
+      A present item departs after being missing from this many completed
+      sweeps in a row.
   allowed_reader_ip:
     name: Allowed reader IP
     description: >-
@@ -43,13 +76,8 @@ configuration:
   depart_requires_door_closed:
     name: Departures need a closed door
     description: >-
-      Only count departures while the pantry door is closed (needs the door
-      topic below).
-  door_entity_topic:
-    name: Door contact MQTT topic
-    description: >-
-      MQTT topic of the pantry door contact (ON/OFF, open/closed, or
-      zigbee2mqtt JSON with "contact").
+      reading_mode continuous only: count timer departures only while the
+      door sensor reports closed.
   max_reader_power_dbm:
     name: Max reader power (dBm)
     description: >-

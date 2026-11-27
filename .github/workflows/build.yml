@@ -117,7 +117,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/data"
           cat > "$RUNNER_TEMP/data/options.json" <<'JSON'
           {"reader_host": "127.0.0.1", "grocy_url": "http://127.0.0.1:18080",
-           "grocy_api_key": "smoke", "grocy_location_id": 1, "log_level": "info"}
+           "grocy_api_key": "smoke", "grocy_location_id": 1, "log_level": "info",
+           "reading_mode": "continuous"}
           JSON
           printf 'listener 1883\nallow_anonymous true\n' > "$RUNNER_TEMP/mosquitto.conf"
           docker run -d --name mqtt --network host \
