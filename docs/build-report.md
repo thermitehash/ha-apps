@@ -2,7 +2,10 @@
 - App version: 0.3.3 (reader antenna/power enforcement; 0.1.0–0.3.1 released in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3) · linking station firmware 0.2.0
 - Branches: PR #3 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `0acda6e`, the merge of PR #2 (which published 0.3.2). Merging PR #3 publishes 0.3.3.
 - aiochainway version used: v0.3.0 (unchanged). v0.4.0 (`ensure_config()`, `get_antenna_status()`) isn't tagged yet; see "Spec changes" for the adapter.
-- Date / PR / Commit / CI (per job): 2026-11-27 / PR #3 / CI_PENDING
+- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#3](https://github.com/thermitehash/ha-apps/pull/3) / code verified at `97c760b` (this report is committed on top) / CI on `97c760b`, all green:
+  - Lint: Ruff + mypy ✅ · HA app linter ✅ (accepts the `reader_antennas` list schema) · yamllint ✅ · ESPHome linking station ✅ · Version bump (0.3.3) ✅
+  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (274 tests, coverage gate 90%) · Sweep-now repeat ×200 (macOS) ✅
+  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
 
 ## Summary
 **v0.3.3, reader antenna/power enforcement** (door mode):
