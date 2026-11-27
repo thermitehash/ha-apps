@@ -1,7 +1,11 @@
 # Pantry Hub build report
 - App version: 0.3.0 (door-driven reading + Q8 mode card; 0.1.0–0.3.0 are unreleased and all in PR #1) · linking station firmware 0.2.0
 - aiochainway version used: v0.2.0 (`f188a02`, ships `aiochainway.testing.FakeUR4`)
-- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / CI_V030
+- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#1](https://github.com/thermitehash/ha-apps/pull/1) / code verified at `813acf0` (this report is committed on top) / CI on `813acf0`, all green:
+  - Lint: Ruff + mypy ✅ · HA app linter ✅ · yamllint ✅ · ESPHome linking station (C++ host tests incl. link_mode, `esphome config`, `esphome compile`) ✅ · Version bump (0.3.0) ✅
+  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (222 tests, coverage gate 90%)
+  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
+  - Note: on `2914a8c`, macOS failed once in `test_sweep_now_during_continuous_then_resumes` (see Test results); passed on `813acf0`.
 
 ## Summary
 **v0.3.0, door-driven reading** (default `reading_mode: door`):
