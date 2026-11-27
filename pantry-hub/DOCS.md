@@ -84,11 +84,12 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
 ## Choosing the door sensor
 
 App options can't show an entity picker, so the web UI has one: open
-**Pantry Hub** in the sidebar → **Settings**. The dropdown lists every
-`binary_sensor` in Home Assistant with its friendly name, entity id and
-current state: door, garage door, opening and window sensors first, then the
-rest. **Save** stores the choice in Pantry Hub's database (it survives
-restarts and updates).
+**Pantry Hub** in the sidebar → **Settings**. Type to search; the list shows
+every `binary_sensor` in Home Assistant with its friendly name and, small
+underneath, its entity id: door, garage door, opening and window sensors
+first, then the rest. Tapping one saves it in Pantry Hub's database (it
+survives restarts and updates). Below the list, a large **Door: OPEN** /
+**Door: CLOSED** shows what Pantry Hub sees, updated every second.
 
 Which one is used:
 
@@ -105,14 +106,15 @@ in the **needs door sensor** state. It sweeps every
 and raises a persistent notification in Home Assistant that links to the
 web UI. Both go away as soon as a sensor is chosen.
 
-**Inverted sensor** (reports `on` when the door is closed): fix it at the
-device first if you can. Wire the reed switch the other way (NC instead of
-NO, or the reverse), or set the sensor's own invert parameter (many Zigbee
-and Z-Wave contacts have one). The **Inverted** checkbox next to the picker
-is for sensors that can't be changed. The Settings page shows a live line
-such as `Door: open (raw: on)`: open the door and check that it says
-**open**. If it was already right before you ticked the box, untick it
-(inverting twice makes it wrong again).
+**Is it the right way round?** Close the pantry door, tap **Check it**, then
+open the door. After a few seconds Pantry Hub compares what the sensor says:
+"Looks right ✓", or "This sensor reports the opposite. Flip it?" with a
+**Flip** button. Flipping is stored in Pantry Hub (the same setting as the
+0.3.x "Inverted" checkbox). If you can, fix a reversed sensor at the device
+instead: wire the reed switch the other way (NC instead of NO, or the
+reverse), or set the sensor's own invert parameter (many Zigbee and Z-Wave
+contacts have one). **Advanced → Reverse open/closed** is the same setting
+as a plain switch.
 
 **Saved sensor not found** (renamed or deleted in Home Assistant): it stays
 selected and is marked "not found" on the Settings page. After 2 minutes a
@@ -315,11 +317,30 @@ duplicate them.
 
 ## Web UI
 
-Open **Pantry Hub** in the sidebar. It shows status, links (unlink, or
-relink by barcode or by Grocy product id written as `#12`, optionally "already
-in stock"), unlinked tags,
-barcodes that need a Grocy product, failed operations, and the last resync.
-**Settings** has the door sensor picker. It's only reachable through Home
+Open **Pantry Hub** in the sidebar. It updates itself (every 3 seconds while
+you're looking at it, and straight away when you come back to it), so there's
+no need to pull down to refresh. "Updated 3 s ago" under the title shows how
+fresh it is; if Pantry Hub stops answering, a "Can't reach Pantry Hub —
+retrying" banner appears. Three tabs (at the bottom on a phone, at the top on
+a wide screen):
+
+- **Pantry**: one line that says whether everything is fine or names the most
+  important problem and how to fix it (tap it for **Details**: reader, Grocy,
+  MQTT, sweep counters, reads per antenna port). Then the door and when the
+  pantry was last checked (**Check now** checks immediately), and what's in
+  the pantry, grouped by Grocy product with a count and "since Tue". Product
+  pictures come from Grocy when it has one.
+- **Tags**: tags that aren't linked yet (**How to link** shows the linking
+  station steps, and a field to link by barcode or Grocy product id written as
+  `#12`, optionally "already in stock"; **Forget**), linked tags (search; the
+  **⋯** menu has **Unlink** and **Relink**), failed Grocy updates (**Retry**,
+  or **Consume now** / **Dismiss** for one waiting for review), and barcodes
+  that need a Grocy product.
+- **Settings**: the door sensor picker and check (above), the reader options
+  that matter (change them in the app's Configuration tab), and **Compare
+  with Grocy** (the resync report).
+
+It follows the phone's light or dark mode, and is only reachable through Home
 Assistant ingress.
 
 ## Troubleshooting

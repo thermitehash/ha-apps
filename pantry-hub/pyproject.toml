@@ -28,6 +28,11 @@ dev = [
     "ruff==0.17.6",
     "yamllint==1.38.0",
 ]
+# Browser smoke tests of the web UI (tests/test_ui_browser.py; skipped without it).
+# 1.63.0 matches the Chromium build the CI job installs with `playwright install`.
+ui = [
+    "playwright==1.63.0",
+]
 
 [project.scripts]
 pantry-hub = "pantry_hub.__main__:main"
@@ -70,6 +75,10 @@ warn_unreachable = true
 module = ["amqtt.*"]
 ignore_missing_imports = true
 follow_untyped_imports = true
+
+[[tool.mypy.overrides]]
+module = ["playwright.*"]
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["hypothesis.*"]

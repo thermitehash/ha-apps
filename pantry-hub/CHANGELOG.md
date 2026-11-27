@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0
+
+- **No more stale page**: opening Pantry Hub from the sidebar shows current
+  data straight away, without pulling down to refresh. Pages and data are sent
+  with `Cache-Control: no-store`, and the page refreshes itself every 3 s
+  while visible (30 s in the background), and immediately when you come back
+  to it. "Updated 3 s ago" shows how fresh it is; a banner appears if Pantry
+  Hub stops answering.
+- **New web UI** (same look as Laundry Hub, "Harvest & Clay" colours, light
+  and dark): **Pantry** leads with one plain-language health line and what's
+  in the pantry (grouped by product, with Grocy pictures); the diagnostics
+  moved behind **Details**. **Tags** lists unlinked tags first, then linked
+  tags (search, ⋯ menu), failed Grocy updates and barcodes without a product.
+  **Settings** has a searchable door sensor picker, a big live **Door:
+  OPEN/CLOSED**, and a **Check it** step that replaces the "Inverted"
+  checkbox (same stored setting, so 0.3.x choices carry over).
+- Every action works as before (unlink, relink, forget, dismiss, retry,
+  consume now, dismiss review, resync, check now), without reloading the page.
+- No change to reading, sweeps, Grocy sync or MQTT.
+
 ## 0.3.4
 
 - Uses **aiochainway v0.4.0**: antenna/power enforcement now calls

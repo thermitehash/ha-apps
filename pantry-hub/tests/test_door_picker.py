@@ -19,7 +19,6 @@ from pantry_hub.homeassistant import (
     fetch_states,
 )
 from pantry_hub.reading import Activity
-from pantry_hub.web import WebUI
 
 from .conftest import BrokerHandle, eventually, free_port, make_options
 from .fake_grocy import FakeGrocy
@@ -27,6 +26,7 @@ from .fake_ha import TOKEN, FakeHomeAssistant
 from .test_config import GOOD
 from .test_door_reading import DOOR, DoorRig
 from .test_main import env_for
+from .web_client import WebClient
 
 APP = Path(__file__).resolve().parents[1]
 OTHER_DOOR = "binary_sensor.back_door"
@@ -317,7 +317,15 @@ async def test_run_starts_without_door_or_reachable_reader(
             return False
 
     await eventually(page_up, timeout=10)
-    assert "Needs a door sensor" in pages[-1]
+    assert 'id="app"' in pages[-1]  # the shell; data comes from /api/state
+    async with (
+        aiohttp.ClientSession() as s,
+        s.get(f"http://127.0.0.1:{web_port}/api/state") as r,
+    ):
+        state = await r.json()
+    assert state["door"]["needed"] is True
+    assert state["health"]["title"] in ("Reader offline", "Connecting to the reader…")
+    assert "No door sensor chosen" in [i["title"] for i in state["health"]["issues"]]
     stop.set()
     assert await asyncio.wait_for(task, 20) == 0
 
@@ -325,7 +333,7 @@ async def test_run_starts_without_door_or_reachable_reader(
 # Web UI --------------------------------------------------------------------------
 
 
-async def test_settings_page_lists_saves_and_shows_source(
+async def test_settings_picker_lists_saves_and_shows_source(
     rig: DoorRig, ha: FakeHomeAssistant
 ) -> None:
     ha.add_entity(
@@ -339,94 +347,59 @@ async def test_settings_page_lists_saves_and_shows_source(
         device_class="window",
     )
     await rig.start(door_entity="")
-    ui = WebUI(rig.h, allowed_peers=["*"])
-    port = free_port()
-    await ui.start("127.0.0.1", port)
-    base = f"http://127.0.0.1:{port}"
-    hdr = {"X-Ingress-Path": "/api/hassio_ingress/abc"}
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(base + "/", headers=hdr) as r:
-                index = await r.text()
-            assert "Needs a door sensor" in index
-            assert 'href="/api/hassio_ingress/abc/settings"' in index
-            async with s.get(base + "/settings", headers=hdr) as r:
-                page = await r.text()
-            assert "needs-door-sensor state" in page
-            labels = re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', page)
-            assert [v for v, _ in labels] == [
-                "",
-                OTHER_DOOR,
-                "binary_sensor.window",
-                "binary_sensor.motion",
-            ]
-            assert (
-                "binary_sensor.motion",
-                "Hall motion — binary_sensor.motion (on)",
-            ) in labels
-            assert "Window &amp; &lt;b&gt;" in page  # escaped
-            assert page.index("Doors, garage doors") < page.index(
-                "Other binary sensors"
-            )
-            csrf = re.search(r'name="csrf" value="([^"]+)"', page)
-            assert csrf
-            async with s.post(
-                base + "/settings/door",
-                data={"csrf": csrf.group(1), "door_entity": OTHER_DOOR},
-                headers=hdr,
-                allow_redirects=False,
-            ) as r:
-                assert r.status == 303
-                assert r.headers["Location"] == "/api/hassio_ingress/abc/settings"
-            assert rig.store is not None
-            assert await rig.store.get_meta("door_entity") == OTHER_DOOR
-            async with s.get(base + "/settings", headers=hdr) as r:
-                page = await r.text()
-            assert f"Door sensor: {OTHER_DOOR}" in page  # flash
-            assert "chosen on this page" in page
-            assert f'<option value="{OTHER_DOOR}" selected>' in page
-            async with s.post(
-                base + "/settings/door",
-                data={"csrf": "stale", "door_entity": ""},
-            ) as r:
-                assert r.status == 403
-            # A bad value is refused with a message, nothing saved.
-            async with s.post(
-                base + "/settings/door",
-                data={"csrf": csrf.group(1), "door_entity": "sensor.x"},
-            ) as r:
-                page = await r.text()
-            assert "not a binary_sensor" in page
-            assert await rig.store.get_meta("door_entity") == OTHER_DOOR
-            # HA listing fails: the page still renders with the saved choice.
-            ha.fail_get_states = True
-            async with s.get(base + "/settings") as r:
-                page = await r.text()
-            assert "Couldn&#x27;t list Home Assistant entities" in page
-            assert f'<option value="{OTHER_DOOR}" selected>' in page
-            assert "not found in Home Assistant" in page
-    finally:
-        await ui.stop()
+    async with WebClient(rig.h, prefix="/api/hassio_ingress/abc") as c:
+        state = await c.state()
+        assert state["door"]["needed"] is True
+        assert state["health"]["action"] == "settings" or "No door sensor chosen" in [
+            i["title"] for i in state["health"]["issues"]
+        ]
+        listing = await c.json("/api/door-candidates")
+        assert listing["error"] is None
+        assert [x["entity_id"] for x in listing["candidates"]] == [
+            OTHER_DOOR,
+            "binary_sensor.window",
+            "binary_sensor.motion",
+        ]
+        assert listing["candidates"][2] == {
+            "entity_id": "binary_sensor.motion",
+            "name": "Hall motion",
+            "state": "on",
+            "device_class": "motion",
+            "door_like": False,
+        }
+        assert (
+            listing["candidates"][1]["name"] == "Window & <b>"
+        )  # JSON, escaped by the page
+        reply = await c.post("/settings/door", door_entity=OTHER_DOOR)
+        assert reply == {"ok": True, "message": f"Door sensor: {OTHER_DOOR}"}
+        assert rig.store is not None
+        assert await rig.store.get_meta("door_entity") == OTHER_DOOR
+        door = (await c.state())["door"]
+        assert (door["entity_id"], door["source"], door["web_entity_id"]) == (
+            OTHER_DOOR,
+            "web_ui",
+            OTHER_DOOR,
+        )
+        # A bad value is refused with a message, nothing saved.
+        bad = await c.post("/settings/door", door_entity="sensor.x")
+        assert bad["ok"] is False and "not a binary_sensor" in bad["message"]
+        assert await rig.store.get_meta("door_entity") == OTHER_DOOR
+        # HA listing fails: an error, and the saved choice is still reported.
+        ha.fail_get_states = True
+        listing = await c.json("/api/door-candidates")
+        assert listing["candidates"] == [] and "get_states failed" in listing["error"]
+        assert (await c.state())["door"]["web_entity_id"] == OTHER_DOOR
 
 
-async def test_settings_page_shows_options_source(
+async def test_settings_shows_options_source(
     rig: DoorRig, ha: FakeHomeAssistant
 ) -> None:
     await ha.set_state(DOOR, "off")
     await rig.start()
-    ui = WebUI(rig.h, allowed_peers=["*"])
-    port = free_port()
-    await ui.start("127.0.0.1", port)
-    try:
-        async with (
-            aiohttp.ClientSession() as s,
-            s.get(f"http://127.0.0.1:{port}/settings") as r,
-        ):
-            page = await r.text()
-        assert "from the app options" in page and DOOR in page
-        assert "Needs a door sensor" not in page
-    finally:
-        await ui.stop()
+    async with WebClient(rig.h) as c:
+        door = (await c.state())["door"]
+    assert (door["entity_id"], door["source"]) == (DOOR, "options")
+    assert door["needed"] is False
 
 
 async def test_settings_without_home_assistant_token(
@@ -457,13 +430,16 @@ async def test_inverted_sensor_and_live_state(
         status = rig.h.door_status()
         assert status["door"] == "closed" and status["raw"] == "on"
         assert status["inverted"] is True
-        assert WebUI.door_line(status) == "Door: closed (raw: on, inverted)"
+        assert (status["door"], status["raw"], status["inverted"]) == (
+            "closed",
+            "on",
+            True,
+        )
         await eventually(lambda: rig.h.activity is not Activity.CONTINUOUS)
         await ha.set_state(DOOR, "off")  # raw off → open when inverted
         await eventually(lambda: rig.h.activity is Activity.CONTINUOUS)
-        assert WebUI.door_line(rig.h.door_status()) == (
-            "Door: open (raw: off, inverted)"
-        )
+        st = rig.h.door_status()
+        assert (st["door"], st["raw"], st["inverted"]) == ("open", "off", True)
         reading = rig.h.state()["reading"]
         assert reading["door_inverted"] is True and reading["door_raw"] == "off"
         await ha.set_state(DOOR, "unavailable")  # unknown stays unknown
@@ -479,65 +455,49 @@ async def test_inverted_sensor_and_live_state(
         await eventually(lambda: again.h.door_status()["door"] == "open")
         await again.h.set_door_inverted(False)
         assert again.h.door_status()["door"] == "closed"
-        assert WebUI.door_line(again.h.door_status()) == "Door: closed (raw: off)"
+        st = again.h.door_status()
+        assert (st["door"], st["raw"], st["inverted"]) == ("closed", "off", False)
     finally:
         await again.stop()
 
 
-async def test_settings_inverted_checkbox_and_live_endpoint(
+async def test_settings_inverted_switch_and_live_endpoint(
     rig: DoorRig, ha: FakeHomeAssistant
 ) -> None:
     ha.add_entity(DOOR, "on", friendly_name="Pantry door", device_class="door")
     await rig.start()
     await eventually(lambda: rig.h.door_status()["raw"] == "on")
-    ui = WebUI(rig.h, allowed_peers=["*"])
-    port = free_port()
-    await ui.start("127.0.0.1", port)
-    base = f"http://127.0.0.1:{port}"
-    hdr = {"X-Ingress-Path": "/api/hassio_ingress/a</script>"}
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(base + "/settings", headers=hdr) as r:
-                page = await r.text()
-            assert '<b id="door-live">Door: open (raw: on)</b>' in page
-            assert 'name="inverted">' in page  # unchecked
-            assert "</script>/settings" not in page  # header can't break the script
-            assert (
-                "/api/hassio_ingress/a\\u003c/script\\u003e/settings/door-state" in page
-            )
-            assert "NC/NO" in page
-            async with s.get(base + "/settings/door-state") as r:
-                assert await r.json() == {
-                    "entity_id": DOOR,
-                    "source": "options",
-                    "inverted": False,
-                    "door": "open",
-                    "raw": "on",
-                    "missing": False,
-                    "needed": False,
-                }
-            csrf = re.search(r'name="csrf" value="([^"]+)"', page)
-            assert csrf
-            async with s.post(
-                base + "/settings/door",
-                data={"csrf": csrf.group(1), "door_entity": "", "inverted": "on"},
-            ) as r:
-                page = await r.text()
-            assert "; inverted" in page
-            assert 'name="inverted" checked>' in page
-            assert '<b id="door-live">Door: closed (raw: on, inverted)</b>' in page
-            assert rig.store is not None
-            assert await rig.store.get_meta("door_inverted") == "1"
-            async with s.get(base + "/settings/door-state") as r:
-                live = await r.json()
-            assert live["door"] == "closed" and live["inverted"] is True
-            await ha.set_state(DOOR, "off")  # the live endpoint follows the door
-            await eventually(lambda: rig.h.door_status()["raw"] == "off")
-            async with s.get(base + "/settings/door-state") as r:
-                live = await r.json()
-            assert (live["door"], live["raw"]) == ("open", "off")
-    finally:
-        await ui.stop()
+    async with WebClient(rig.h) as c:
+        assert await c.json("/api/door") == {
+            "entity_id": DOOR,
+            "source": "options",
+            "inverted": False,
+            "door": "open",
+            "raw": "on",
+            "missing": False,
+            "needed": False,
+        }
+        # The check step's "Flip" and the Advanced switch both post this.
+        reply = await c.post("/settings/inverted", inverted="true")
+        assert reply == {"ok": True, "message": "Open/closed reversed"}
+        assert rig.store is not None
+        assert await rig.store.get_meta("door_inverted") == "1"  # v0.3.4 format
+        live = await c.json("/api/door")
+        assert live["door"] == "closed" and live["inverted"] is True
+        state = await c.state()
+        assert state["door"]["inverted"] is True and state["door"]["raw"] == "on"
+        await ha.set_state(DOOR, "off")  # the live endpoint follows the door
+        await eventually(lambda: rig.h.door_status()["raw"] == "off")
+        live = await c.json("/api/door")
+        assert (live["door"], live["raw"]) == ("open", "off")
+        bad = await c.post("/settings/inverted", inverted="maybe")
+        assert bad["ok"] is False
+        reply = await c.post("/settings/inverted", inverted="false")
+        assert reply["message"] == "Open/closed as reported"
+        assert await rig.store.get_meta("door_inverted") == "0"
+        # Choosing a sensor and the switch in one request (older form).
+        both = await c.post("/settings/door", door_entity="", inverted="on")
+        assert both["ok"] is True and rig.h.door_inverted is True
 
 
 async def test_saved_sensor_not_found_notification(
@@ -546,9 +506,7 @@ async def test_saved_sensor_not_found_notification(
     await rig.start(door_entity="", settings_url="/hassio/ingress/local_pantry_hub")
     await rig.h.set_door_entity("binary_sensor.gone")  # not in Home Assistant
     await eventually(lambda: rig.h.door_status()["missing"] is True)
-    assert WebUI.door_line(rig.h.door_status()) == (
-        "Door: unknown (sensor not found in Home Assistant)"
-    )
+    assert rig.h.door_status()["missing"] is True
     await eventually(
         lambda: any(
             c.get("notification_id") == "pantry_hub_door_unavailable"

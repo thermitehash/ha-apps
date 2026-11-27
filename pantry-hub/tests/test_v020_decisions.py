@@ -6,21 +6,19 @@ import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 import random
-import re
 
-import aiohttp
 import pytest
 
 from pantry_hub.discovery import RESYNC_COMMAND_TOPIC, RESYNC_RESULT_TOPIC, STATE_TOPIC
 from pantry_hub.grocy import StockEntry
 from pantry_hub.store import Link, Store
-from pantry_hub.web import WebUI
 from pantry_hub.worker import GrocyWorker
 
-from .conftest import BrokerHandle, FakeClock, eventually, free_port
+from .conftest import BrokerHandle, FakeClock, eventually
 from .fake_grocy import FakeGrocy
 from .memory_backend import MemoryBackend
 from .rig import Observer, Rig
+from .web_client import WebClient
 
 T0 = 1_800_000_000.0
 EPC = "E28011700000020F1A2B3C0A"
@@ -281,63 +279,38 @@ async def test_q1_q2_web_ui_and_resync(
     await rig.client.add(beans.id, location_id=1, best_before=None, note="old")
     await rig.arrive(EPC)  # unlinked, already on the shelf
     await rig.idle()
-    ui = WebUI(rig.h, allowed_peers=["*"])
-    port = free_port()
-    await ui.start("127.0.0.1", port)
-    base = f"http://127.0.0.1:{port}"
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(base + "/") as r:
-                page = await r.text()
-            assert 'name="in_stock"' in page  # Q1 checkbox
-            m = re.search(r'name="csrf" value="([^"]+)"', page)
-            assert m
-            csrf = m.group(1)
-            async with s.post(
-                base + "/relink",
-                data={"csrf": csrf, "epc": EPC, "target": "0001", "in_stock": "on"},
-            ) as r:
-                page = await r.text()
-            assert "already in stock" in page
-            await rig.idle()
-            assert grocy.count_calls("POST", "/add") == 1  # no new add
-            # Q2: make the departure's consume ambiguous (answer lost) → review.
-            grocy.fault("/api/stock/products/{id}/consume", "apply_then_500")
-            rig.clock.advance(61)
-            await rig.read_until_state(EPC, "unknown")
-            assert rig.store is not None
-            await eventually(lambda: _review_count(rig), timeout=5)
-            assert grocy.amount(beans.id) == 0  # consumed once, not twice
-            await eventually(
-                lambda: (
-                    (observer.last(STATE_TOPIC) or {}).get("grocy", {}).get("review")
-                    == 1
-                )
+    async with WebClient(rig.h) as c:
+        state = await c.state()
+        assert [u["epc"] for u in state["unlinked"]] == [EPC]
+        # Q1: link it as "already in stock" (the page's checkbox).
+        reply = await c.post("/relink", epc=EPC, target="0001", in_stock="on")
+        assert "already in stock" in reply["message"]
+        await rig.idle()
+        assert grocy.count_calls("POST", "/add") == 1  # no new add
+        # Q2: make the departure's consume ambiguous (answer lost) → review.
+        grocy.fault("/api/stock/products/{id}/consume", "apply_then_500")
+        rig.clock.advance(61)
+        await rig.read_until_state(EPC, "unknown")
+        assert rig.store is not None
+        await eventually(lambda: _review_count(rig), timeout=5)
+        assert grocy.amount(beans.id) == 0  # consumed once, not twice
+        await eventually(
+            lambda: (
+                (observer.last(STATE_TOPIC) or {}).get("grocy", {}).get("review") == 1
             )
-            await observer.publish(RESYNC_COMMAND_TOPIC, "PRESS")
-            await eventually(lambda: observer.last(RESYNC_RESULT_TOPIC) is not None)
-            assert observer.last(RESYNC_RESULT_TOPIC)["review_ops"][0]["epc"] == EPC
-            async with s.get(base + "/") as r:
-                page = await r.text()
-            assert "Consume now" in page and "waiting for review" in page
-            op = (await rig.store.ops("failed"))[0]
-            async with s.post(
-                base + "/dismiss-op", data={"csrf": csrf, "op": str(op.id)}
-            ) as r:
-                page = await r.text()
-            assert "dismissed" in page
-            async with s.post(
-                base + "/dismiss-op", data={"csrf": csrf, "op": str(op.id)}
-            ) as r:
-                page = await r.text()
-            assert "not waiting for review" in page
-            async with s.post(
-                base + "/consume-now", data={"csrf": csrf, "op": str(op.id)}
-            ) as r:
-                page = await r.text()
-            assert "Failed:" in page
-    finally:
-        await ui.stop()
+        )
+        await observer.publish(RESYNC_COMMAND_TOPIC, "PRESS")
+        await eventually(lambda: observer.last(RESYNC_RESULT_TOPIC) is not None)
+        assert observer.last(RESYNC_RESULT_TOPIC)["review_ops"][0]["epc"] == EPC
+        state = await c.state()
+        assert state["failed_ops"][0]["needs_review"] is True  # Consume now / Dismiss
+        assert state["resync"]["review_ops"][0]["epc"] == EPC
+        op = (await rig.store.ops("failed"))[0]
+        assert "dismissed" in (await c.post("/dismiss-op", op=op.id))["message"]
+        again = await c.post("/dismiss-op", op=op.id)
+        assert "not waiting for review" in again["message"]
+        late = await c.post("/consume-now", op=op.id)
+        assert late["ok"] is False and "Failed:" in late["message"]
 
 
 async def _review_count(rig: Rig) -> bool:
@@ -361,22 +334,9 @@ async def test_q2_web_consume_now(rig: Rig, grocy: FakeGrocy) -> None:
     await rig.read_until_state(EPC, "unknown")
     await eventually(lambda: _review_count(rig), timeout=5)
     assert grocy.amount(beans.id) == 1  # under-consume, not double
-    ui = WebUI(rig.h, allowed_peers=["*"])
-    port = free_port()
-    await ui.start("127.0.0.1", port)
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"http://127.0.0.1:{port}/") as r:
-                page = await r.text()
-            m = re.search(r'name="csrf" value="([^"]+)"', page)
-            assert m
-            op = (await rig.store.ops("failed"))[0]
-            async with s.post(
-                f"http://127.0.0.1:{port}/consume-now",
-                data={"csrf": m.group(1), "op": str(op.id)},
-            ) as r:
-                page = await r.text()
-            assert "Consumed one Beans" in page
-        assert grocy.amount(beans.id) == 0
-    finally:
-        await ui.stop()
+    async with WebClient(rig.h) as c:
+        assert (await c.state())["failed_ops"][0]["needs_review"] is True
+        op = (await rig.store.ops("failed"))[0]
+        reply = await c.post("/consume-now", op=op.id)
+        assert "Consumed one Beans" in reply["message"]
+    assert grocy.amount(beans.id) == 0

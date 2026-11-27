@@ -1,8 +1,15 @@
-"""Minimal server-rendered ingress UI (no build step, no external assets).
+"""Ingress web UI: one HTML shell + vanilla JS modules, data from ``/api/state``.
 
 Home Assistant ingress authenticates the user; this server only accepts
 connections from the Supervisor's ingress proxy (172.30.32.2) unless told
-otherwise for local development. Every form carries a per-process CSRF token.
+otherwise for local development. Every action is a POST carrying a
+per-process CSRF token (form field ``csrf`` or header ``X-CSRF-Token``) and
+answers JSON ``{"ok": bool, "message": str}``; the page then re-renders from
+``/api/state``.
+
+No build step: ``static/`` holds plain ES modules and CSS. JS modules import
+each other as ``./x.js?v=__VERSION__``; the placeholder is replaced when
+served, so a new app version never mixes with cached old modules.
 """
 
 from __future__ import annotations
@@ -11,18 +18,17 @@ from collections.abc import Awaitable, Callable, Iterable
 import html
 import json
 import logging
+from pathlib import Path
 import secrets
 import time
 from typing import TYPE_CHECKING
-from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
 
 from ..grocy import GrocyError
-from ..homeassistant import DoorCandidate
 from ..linking import normalize_epc
-from ..store import iso
+from .state import build_state
 
 if TYPE_CHECKING:
     from ..hub import Hub
@@ -30,55 +36,45 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 INGRESS_PROXY = "172.30.32.2"
-HUB_KEY = web.AppKey("hub", object)
-TOKEN_KEY = web.AppKey("csrf", str)
 ALLOW_KEY = web.AppKey("allow", frozenset)
-
-_CSS = """
-:root{--bg:#fff;--fg:#1c1c1c;--muted:#666;--line:#ddd;--ok:#1b7f3b;--bad:#b3261e;--warn:#9a6700;--accent:#03a9f4}
-@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#e8e8e8;--muted:#9a9a9a;--line:#333;--ok:#5bd68a;--bad:#ff8a80;--warn:#f2c14e}}
-body{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);margin:0 auto;padding:16px;max-width:1100px}
-h1{font-size:20px;margin:0 0 12px}h2{font-size:16px;margin:24px 0 8px}
-.cards{display:flex;flex-wrap:wrap;gap:8px}.card{border:1px solid var(--line);border-radius:8px;padding:8px 12px;min-width:120px}
-.card b{display:block;font-size:20px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.muted{color:var(--muted)}
-.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-td code{font-size:12px;word-break:break-all}form.inline{display:inline}button{font:inherit;padding:2px 8px;cursor:pointer}
-input{font:inherit;padding:2px 4px;max-width:150px}select{font:inherit;padding:2px 4px;max-width:100%}
-nav{margin:0 0 12px}nav a{margin-right:12px}.banner{padding:8px 12px;border-radius:6px;border:1px solid var(--warn);margin:8px 0}a{color:var(--accent)}.msg{padding:8px 12px;border-radius:6px;border:1px solid var(--line);margin:8px 0}
-"""
+STATIC_DIR = Path(__file__).with_name("static")
+#: Long cache for versioned static assets (``?v=<version>`` busts it).
+STATIC_CACHE = "public, max-age=31536000, immutable"
+STATIC_TYPES = {
+    ".js": "text/javascript",
+    ".css": "text/css",
+    ".svg": "image/svg+xml",
+}
+#: Product pictures are fetched from Grocy at most this often per product.
+PICTURE_TTL_S = 3600.0
+ActionFn = Callable[[dict[str, str]], Awaitable[str]]
 
 
-def _e(value: object) -> str:
-    return html.escape("" if value is None else str(value), quote=True)
+@web.middleware
+async def no_store(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    """Never let a web view show a cached page or state.
 
-
-def _js(value: str) -> str:
-    """Quote ``value`` as a JSON string that is safe inside a ``<script>``."""
-    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e")
-
-
-def _ago(ts: float | None) -> str:
-    if not ts:
-        return "never"
-    secs = max(0, int(time.time() - ts))
-    if secs < 90:
-        return f"{secs} s ago"
-    if secs < 5400:
-        return f"{secs // 60} min ago"
-    if secs < 172800:
-        return f"{secs // 3600} h ago"
-    return f"{secs // 86400} d ago"
-
-
-def _status(ok: bool | None, yes: str, no: str, unknown: str = "unknown") -> str:
-    if ok is None:
-        return f'<span class="warn">{unknown}</span>'
-    return f'<span class="ok">{yes}</span>' if ok else f'<span class="bad">{no}</span>'
-
-
-def _rows(rows: Iterable[str], cols: int, empty: str) -> str:
-    body = "".join(rows)
-    return body or f'<tr><td colspan="{cols}" class="muted">{empty}</td></tr>'
+    The HA companion app's web view could show an old copy of the page after
+    opening Pantry Hub from the side menu. HTML and JSON are ``no-store``;
+    static assets are versioned and cached for a year.
+    """
+    try:
+        response = await handler(request)
+    except web.HTTPException as exc:
+        if not request.path.startswith("/static/"):
+            exc.headers["Cache-Control"] = "no-store"
+        raise
+    if request.path.startswith("/static/") and response.status == 200:
+        response.headers["Cache-Control"] = STATIC_CACHE
+    elif request.path.startswith("/api/product-picture/") and response.status == 200:
+        response.headers["Cache-Control"] = "private, max-age=3600"
+    else:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers.setdefault("Pragma", "no-cache")
+    return response
 
 
 class WebUI:
@@ -93,25 +89,32 @@ class WebUI:
             if allowed_peers is not None
             else frozenset({INGRESS_PROXY})
         )
-        self.app = web.Application(middlewares=[self._guard])
+        self.app = web.Application(middlewares=[self._guard, no_store])
         self.app[ALLOW_KEY] = allow
-        self.app.router.add_get("/", self.index)
-        self.app.router.add_get("/settings", self.settings)
-        self.app.router.add_get("/settings/door-state", self.door_state)
-        self.app.router.add_post(
-            "/settings/door", self._form(self._set_door, page="settings")
-        )
-        self.app.router.add_post("/unlink", self._form(self._unlink))
-        self.app.router.add_post("/relink", self._form(self._relink))
-        self.app.router.add_post("/forget", self._form(self._forget))
-        self.app.router.add_post("/dismiss", self._form(self._dismiss))
-        self.app.router.add_post("/retry", self._form(self._retry))
-        self.app.router.add_post("/consume-now", self._form(self._consume_now))
-        self.app.router.add_post("/dismiss-op", self._form(self._dismiss_op))
-        self.app.router.add_post("/resync", self._form(self._resync))
-        self.app.router.add_post("/sweep", self._form(self._sweep))
+        r = self.app.router
+        r.add_get("/", self.index)
+        r.add_get("/static/{name}", self.static)
+        r.add_get("/api/state", self.api_state)
+        r.add_get("/api/door", self.api_door)
+        r.add_get("/api/door-candidates", self.api_door_candidates)
+        r.add_get("/api/product-picture/{product_id}", self.api_product_picture)
+        actions: dict[str, ActionFn] = {
+            "/unlink": self._unlink,
+            "/relink": self._relink,
+            "/forget": self._forget,
+            "/dismiss": self._dismiss,
+            "/retry": self._retry,
+            "/consume-now": self._consume_now,
+            "/dismiss-op": self._dismiss_op,
+            "/resync": self._resync,
+            "/sweep": self._sweep,
+            "/settings/door": self._set_door,
+            "/settings/inverted": self._set_inverted,
+        }
+        for path, action in actions.items():
+            r.add_post(path, self._action(action))
         self._runner: web.AppRunner | None = None
-        self._flash: str | None = None
+        self._pictures: dict[int, tuple[float, tuple[bytes, str] | None]] = {}
 
     async def start(self, host: str, port: int) -> None:
         """Serve on ``host:port``."""
@@ -141,24 +144,132 @@ class WebUI:
             )
         return await handler(request)
 
-    def _form(
-        self, action: Callable[[dict[str, str]], Awaitable[str]], page: str = ""
-    ) -> Callable[[web.Request], Awaitable[web.StreamResponse]]:
-        async def handler(request: web.Request) -> web.StreamResponse:
-            data = await request.post()
-            form = {k: str(v) for k, v in data.items()}
-            if not secrets.compare_digest(form.get("csrf", ""), self.token):
-                raise web.HTTPForbidden(text="Stale form; reload the page")
-            try:
-                self._flash = await action(form)
-            except (GrocyError, ValueError) as err:
-                self._flash = f"Failed: {err}"
-            base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-            raise web.HTTPSeeOther(f"{base}/{page}")
+    # Page and assets -------------------------------------------------------------
 
-        return handler
+    @staticmethod
+    def base(request: web.Request) -> str:
+        """Return the ingress prefix (``X-Ingress-Path``) every URL is built from."""
+        return request.headers.get("X-Ingress-Path", "").rstrip("/")
+
+    async def index(self, request: web.Request) -> web.Response:
+        """Serve the HTML shell; the page fills itself from ``/api/state``."""
+        base = self.base(request)
+        v = self.hub.version
+        boot = {"base": base, "csrf": self.token, "version": v}
+        page = SHELL.format(
+            base=html.escape(base, quote=True),
+            v=html.escape(v, quote=True),
+            boot=html.escape(json.dumps(boot), quote=True),
+        )
+        return web.Response(text=page, content_type="text/html")
+
+    async def static(self, request: web.Request) -> web.Response:
+        """Serve a file from ``static/`` (no directory listing, no traversal)."""
+        name = request.match_info["name"]
+        path = STATIC_DIR / name
+        suffix = path.suffix
+        if (
+            "/" in name
+            or name.startswith(".")
+            or suffix not in STATIC_TYPES
+            or not path.is_file()
+        ):
+            raise web.HTTPNotFound()
+        text = path.read_text(encoding="utf-8")
+        if suffix == ".js":
+            text = text.replace("__VERSION__", self.hub.version)
+        return web.Response(text=text, content_type=STATIC_TYPES[suffix])
+
+    # JSON ------------------------------------------------------------------------
+
+    async def api_state(self, request: web.Request) -> web.Response:
+        """Everything the page shows (polled every 3 s while visible)."""
+        return web.json_response(await build_state(self.hub))
+
+    async def api_door(self, request: web.Request) -> web.Response:
+        """Live door status: interpreted and raw (polled every second)."""
+        return web.json_response(self.hub.door_status())
+
+    async def api_door_candidates(self, request: web.Request) -> web.Response:
+        """binary_sensors for the picker, door-like first."""
+        try:
+            candidates = await self.hub.door_candidates()
+        except (ValueError, OSError, TimeoutError, aiohttp.ClientError) as err:
+            return web.json_response({"candidates": [], "error": str(err)})
+        return web.json_response(
+            {
+                "candidates": [
+                    {
+                        "entity_id": c.entity_id,
+                        "name": c.name,
+                        "state": c.state,
+                        "device_class": c.device_class,
+                        "door_like": c.door_like,
+                    }
+                    for c in candidates
+                ],
+                "error": None,
+            }
+        )
+
+    async def api_product_picture(self, request: web.Request) -> web.Response:
+        """Proxy the Grocy product picture (thumbnail); 404 if there is none."""
+        try:
+            product_id = int(request.match_info["product_id"])
+        except ValueError as err:
+            raise web.HTTPNotFound() from err
+        picture = await self._picture(product_id)
+        if picture is None:
+            # 204, not 404: the <img> falls back to an icon without a console error.
+            return web.Response(status=204)
+        body, ctype = picture
+        return web.Response(body=body, content_type=ctype)
+
+    async def _picture(self, product_id: int) -> tuple[bytes, str] | None:
+        cached = self._pictures.get(product_id)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < PICTURE_TTL_S:
+            return cached[1]
+        fetch = getattr(self.hub.backend, "product_picture", None)
+        picture: tuple[bytes, str] | None = None
+        if fetch is not None:
+            try:
+                picture = await fetch(product_id)
+            except GrocyError as err:
+                _LOGGER.debug("No picture for product %d: %s", product_id, err)
+        self._pictures[product_id] = (now, picture)
+        return picture
 
     # Actions ---------------------------------------------------------------------
+
+    def _action(
+        self, action: ActionFn
+    ) -> Callable[[web.Request], Awaitable[web.Response]]:
+        async def handler(request: web.Request) -> web.Response:
+            form: dict[str, str]
+            if request.content_type == "application/json":
+                try:
+                    body = await request.json()
+                except ValueError as err:
+                    raise web.HTTPBadRequest(text="Body is not JSON") from err
+                if not isinstance(body, dict):
+                    raise web.HTTPBadRequest(text="Body must be a JSON object")
+                form = {k: "" if v is None else str(v) for k, v in body.items()}
+            else:
+                data = await request.post()
+                form = {k: str(v) for k, v in data.items()}
+            token = request.headers.get("X-CSRF-Token") or form.get("csrf", "")
+            if not secrets.compare_digest(token, self.token):
+                return web.json_response(
+                    {"ok": False, "message": "Stale page; reload it"}, status=403
+                )
+            try:
+                message = await action(form)
+            except (GrocyError, ValueError) as err:
+                return web.json_response({"ok": False, "message": f"Failed: {err}"})
+            return web.json_response({"ok": True, "message": message})
+
+        return handler
 
     async def _unlink(self, form: dict[str, str]) -> str:
         epc = form.get("epc", "")
@@ -172,7 +283,7 @@ class WebUI:
         target = form.get("target", "").strip()
         if not target:
             raise ValueError("enter a barcode or a Grocy product id (#12)")
-        in_stock = form.get("in_stock") == "on"
+        in_stock = form.get("in_stock") in ("on", "true", "1")
         if target.startswith("#") and target[1:].isdigit():
             link = await self.hub.relink(
                 epc, product_id=int(target[1:]), in_stock=in_stock
@@ -215,16 +326,8 @@ class WebUI:
 
     async def _sweep(self, form: dict[str, str]) -> str:
         if self.hub.request_sweep():
-            return "Sweep requested"
-        return "Sweep not started (one is running, or reading_mode is continuous)"
-
-    async def _set_door(self, form: dict[str, str]) -> str:
-        message = await self.hub.set_door_entity(form.get("door_entity", ""))
-        inverted = form.get("inverted") == "on"
-        if inverted != self.hub.door_inverted:
-            await self.hub.set_door_inverted(inverted)
-            message += "; inverted" if inverted else "; not inverted"
-        return message
+            return "Checking the pantry now"
+        return "Not started: a check is already running, or reading is continuous"
 
     async def _resync(self, form: dict[str, str]) -> str:
         report = await self.hub.resync()
@@ -232,309 +335,43 @@ class WebUI:
             return f"Resync incomplete: {report.error}"
         return f"Resync: {len(report.differences)} difference(s) in {report.checked} product(s)"
 
-    # Page ------------------------------------------------------------------------
+    async def _set_door(self, form: dict[str, str]) -> str:
+        message = await self.hub.set_door_entity(form.get("door_entity", ""))
+        if "inverted" in form:
+            await self._set_inverted(form)
+        return message
 
-    def _button(self, action: str, label: str, **fields: object) -> str:
-        hidden = "".join(
-            f'<input type="hidden" name="{_e(k)}" value="{_e(v)}">'
-            for k, v in fields.items()
-        )
-        return (
-            f'<form class="inline" method="post" action="{action}">'
-            f'<input type="hidden" name="csrf" value="{self.token}">{hidden}'
-            f"<button>{_e(label)}</button></form>"
-        )
-
-    def _relink_form(self, epc: str) -> str:
-        return (
-            '<form class="inline" method="post" action="relink">'
-            f'<input type="hidden" name="csrf" value="{self.token}">'
-            f'<input type="hidden" name="epc" value="{_e(epc)}">'
-            '<input name="target" placeholder="barcode or #id" aria-label="barcode or product id">'
-            '<label title="Grocy already counts this unit: skip the add for its current '
-            'or next arrival"><input type="checkbox" name="in_stock"> already in stock</label> '
-            "<button>Link</button></form>"
-        )
-
-    def _nav(self, request: web.Request) -> str:
-        base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-        return f'<nav><a href="{_e(base)}/">Status</a><a href="{_e(base)}/settings">Settings</a></nav>'
-
-    def _door_banner(self, request: web.Request) -> str:
-        if not self.hub.door_sensor_needed:
-            return ""
-        base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-        return (
-            '<div class="banner"><b>Needs a door sensor.</b> Sweeping every '
-            f"{self.hub.options.closed_sweep_interval_s} s until one is chosen. "
-            f'<a href="{_e(base)}/settings">Choose the pantry door sensor</a>.</div>'
-        )
-
-    async def door_state(self, request: web.Request) -> web.Response:
-        """Live door status (polled by the Settings page)."""
-        return web.json_response(self.hub.door_status())
-
-    @staticmethod
-    def door_line(status: dict[str, object]) -> str:
-        """``Door: open (raw: on)`` (plain text, also built by the page's script)."""
-        if not status["entity_id"]:
-            return "Door: no sensor"
-        if status["missing"]:
-            return "Door: unknown (sensor not found in Home Assistant)"
-        raw = status["raw"] if status["raw"] is not None else "none"
-        inverted = ", inverted" if status["inverted"] else ""
-        return f"Door: {status['door']} (raw: {raw}{inverted})"
-
-    async def settings(self, request: web.Request) -> web.Response:
-        """Render the Settings page (door sensor picker)."""
-        hub = self.hub
-        flash, self._flash = self._flash, None
-        entity, source = hub.door_entity, hub.door_entity_source
-        if source == "options":
-            active = (
-                f"<b>{_e(entity)}</b> from the app options (<code>door_entity</code>). "
-                "It overrides the choice below; clear it in the app's "
-                "configuration to use this page."
-            )
-        elif source == "web_ui":
-            active = f"<b>{_e(entity)}</b>, chosen on this page."
-        elif hub.door_needed:
-            active = (
-                '<span class="warn"><b>None.</b> Pantry Hub is in the '
-                "needs-door-sensor state and sweeps every "
-                f"{hub.options.closed_sweep_interval_s} s.</span>"
-            )
-        else:
-            active = "None (not needed with <code>reading_mode: continuous</code>)."
-        base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-        live = self.door_line(hub.door_status())
-        inverted_checked = " checked" if hub.door_inverted else ""
-        error = ""
-        candidates: list[DoorCandidate] = []
-        try:
-            candidates = await hub.door_candidates()
-        except (ValueError, OSError, TimeoutError, aiohttp.ClientError) as err:
-            error = f"Couldn't list Home Assistant entities: {err}"
-        current = hub.door_entity_web
-        known = {c.entity_id for c in candidates}
-
-        def option(c: DoorCandidate) -> str:
-            selected = " selected" if c.entity_id == current else ""
-            label = f"{c.name} — {c.entity_id} ({c.state})"
-            return f'<option value="{_e(c.entity_id)}"{selected}>{_e(label)}</option>'
-
-        door_like = [c for c in candidates if c.door_like]
-        others = [c for c in candidates if not c.door_like]
-        groups = ""
-        if door_like:
-            groups += (
-                '<optgroup label="Doors, garage doors, openings, windows">'
-                + "".join(option(c) for c in door_like)
-                + "</optgroup>"
-            )
-        if others:
-            groups += (
-                '<optgroup label="Other binary sensors">'
-                + "".join(option(c) for c in others)
-                + "</optgroup>"
-            )
-        if current and current not in known:
-            groups += (
-                f'<option value="{_e(current)}" selected>'
-                f"{_e(current)} (not found in Home Assistant)</option>"
-            )
-        none_selected = "" if current else " selected"
-        page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pantry Hub settings</title><style>{_CSS}</style></head><body>
-<h1>Pantry Hub <span class="muted">{_e(hub.version)}</span></h1>
-{self._nav(request)}
-{f'<div class="msg">{_e(flash)}</div>' if flash else ""}
-<h2>Pantry door sensor</h2>
-<p>In use: {active}</p>
-<p><b id="door-live">{_e(live)}</b> <span class="muted">(live)</span></p>
-{f'<p class="bad">{_e(error)}</p>' if error else ""}
-<form method="post" action="settings/door">
-<input type="hidden" name="csrf" value="{self.token}">
-<label for="door_entity">Door sensor</label><br>
-<select id="door_entity" name="door_entity">
-<option value=""{none_selected}>— none —</option>{groups}</select><br>
-<label title="Swap open and closed for a sensor that reports on = closed">
-<input type="checkbox" name="inverted"{inverted_checked}> Inverted (sensor reports <code>on</code> when closed)</label><br>
-<button>Save</button></form>
-<p class="muted">Fix an inverted sensor at the device first if you can: wire the reed switch the
-other way (NC/NO), or set the sensor's own invert parameter. Use the checkbox only for sensors
-that can't be changed. Watch the live line above: open the door and it should say
-<b>open</b>. If the raw state is already right, leave the box unticked (inverting twice
-makes it wrong again).</p>
-<script>
-(function () {{
-  var el = document.getElementById("door-live");
-  function line(s) {{
-    if (!s.entity_id) return "Door: no sensor";
-    if (s.missing) return "Door: unknown (sensor not found in Home Assistant)";
-    return "Door: " + s.door + " (raw: " + (s.raw === null ? "none" : s.raw) +
-      (s.inverted ? ", inverted" : "") + ")";
-  }}
-  function poll() {{
-    fetch({_js(base + "/settings/door-state")}, {{credentials: "same-origin"}})
-      .then(function (r) {{ return r.json(); }})
-      .then(function (s) {{ el.textContent = line(s); }})
-      .catch(function () {{}});
-  }}
-  setInterval(poll, 2000);
-}})();
-</script>
-<p class="muted">Lists every <code>binary_sensor</code> in Home Assistant: door, garage door,
-opening and window sensors first. <code>on</code> must mean open. The choice is stored in
-Pantry Hub's database; <code>door_entity</code> in the app options, if set, takes precedence.</p>
-</body></html>"""
-        return web.Response(text=page, content_type="text/html")
-
-    async def index(self, request: web.Request) -> web.Response:
-        """Render the status page."""
-        hub = self.hub
-        opts = hub.options
-        grocy = opts.grocy_browser_url
-        await hub.refresh_counts()
-        state = hub.state()
-        links = await hub.store.links()
-        unlinked = await hub.store.unlinked()
-        needs = await hub.store.needs_product()
-        failed = await hub.store.ops("failed", limit=50)
-        rows = await hub.store.presence_rows()
-        last_seen = {r.epc: r.last_seen for r in rows}
-        in_pantry = set(hub.machine.in_pantry())
-        mqtt_ok = hub.mqtt.connected if hub.mqtt is not None else None
-
-        flash, self._flash = self._flash, None
-        cards = [
-            ("Reader", _status(state["reader_online"], "online", "offline")),
-            ("Grocy", _status(hub.worker.grocy_ok, "online", "error", "not used yet")),
-            ("MQTT", _status(mqtt_ok, "connected", "disconnected", "off")),
-            ("Present tags", f"<b>{state['present_tags']}</b>"),
-            ("Unlinked present", f"<b>{state['unlinked_tags']}</b>"),
-            ("Reader activity", f"<b>{_e(state['activity'])}</b>"),
-            ("Grocy queue", f"<b>{state['grocy_queue']}</b>"),
-            ("Failed ops", f"<b>{state['grocy']['failed']}</b>"),
-        ]
-        cards_html = "".join(
-            f'<div class="card"><span class="muted">{label}</span><br>{value}</div>'
-            for label, value in cards
-        )
-        link_rows = (
-            "<tr>"
-            f"<td><code>{_e(lk.epc)}</code>{' <span class=ok>●</span>' if lk.epc in in_pantry else ''}</td>"
-            f'<td><a href="{_e(grocy)}/product/{lk.product_id}" target="_blank" rel="noopener">{_e(lk.product_name)}</a></td>'
-            f"<td>{_e(iso(lk.linked_at))}"
-            + (
-                f' <span class="muted">(in stock: no add for arrival {lk.skip_add_cycle})</span>'
-                if lk.skip_add_cycle
-                else ""
-            )
-            + f"</td><td>{_ago(last_seen.get(lk.epc))}</td>"
-            f"<td>{self._button('unlink', 'Unlink', epc=lk.epc)} {self._relink_form(lk.epc)}</td>"
-            "</tr>"
-            for lk in links
-        )
-        unlinked_rows = (
-            "<tr>"
-            f"<td><code>{_e(u.epc)}</code>{' <span class=ok>●</span>' if u.epc in in_pantry else ''}</td>"
-            f"<td>{_ago(u.last_seen)}</td><td>{u.arrivals}</td>"
-            f"<td>{self._relink_form(u.epc)} {self._button('forget', 'Forget', epc=u.epc)} "
-            f'<a href="{_e(grocy)}/products" target="_blank" rel="noopener">Grocy products</a></td>'
-            "</tr>"
-            for u in unlinked
-        )
-        needs_rows = (
-            "<tr>"
-            f"<td><code>{_e(n.barcode)}</code></td><td>{_e(n.station)}</td>"
-            f"<td>{_ago(n.last_seen)}</td><td>{n.scans}</td>"
-            f'<td><a href="{_e(grocy)}/product/new" target="_blank" rel="noopener">Create in Grocy</a> '
-            f"{self._button('dismiss', 'Dismiss', barcode=n.barcode)}</td>"
-            "</tr>"
-            for n in needs
-        )
-        failed_rows = (
-            "<tr>"
-            f"<td>{op.id}</td><td>{_e(op.kind)}</td><td>{_e(op.product_name)}</td>"
-            f"<td><code>{_e(op.epc)}</code></td><td>{_e(op.last_error)}</td>"
-            + (
-                f"<td><b>Review:</b> {self._button('consume-now', 'Consume now', op=op.id)} "
-                f"{self._button('dismiss-op', 'Dismiss', op=op.id)}</td>"
-                if op.needs_review
-                else f"<td>{self._button('retry', 'Retry', op=op.id)}</td>"
-            )
-            + "</tr>"
-            for op in failed
-        )
-        resync = hub.last_resync
-        resync_html = '<p class="muted">Not run yet.</p>'
-        if resync is not None:
-            diff_rows = "".join(
-                f"<tr><td>{_e(d['product'])}</td><td>{d['present_tags']}</td><td>{d['grocy_amount']:g}</td></tr>"
-                for d in resync.differences
-            )
-            resync_html = (
-                f"<p>{_e(iso(resync.checked_at))}: {resync.checked} product(s), "
-                f"{len(resync.differences)} difference(s)"
-                + (
-                    f' <span class="bad">({_e(resync.error)})</span>'
-                    if resync.error
-                    else ""
-                )
-                + "</p>"
-                + (
-                    '<div class="scroll"><table><tr><th>Product</th><th>Tags present</th><th>Grocy (pantry)</th></tr>'
-                    + diff_rows
-                    + "</table></div>"
-                    if diff_rows
-                    else ""
-                )
-                + (
-                    f'<p class="warn">{len(resync.review_ops)} consume(s) waiting for review '
-                    "(Grocy may be one unit high for: "
-                    + ", ".join(_e(r["product"]) for r in resync.review_ops)
-                    + "). See Failed Grocy operations.</p>"
-                    if resync.review_ops
-                    else ""
-                )
-            )
-        page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pantry Hub</title><style>{_CSS}</style></head><body>
-<h1>Pantry Hub <span class="muted">{_e(hub.version)}</span></h1>
-{self._nav(request)}
-{f'<div class="msg">{_e(flash)}</div>' if flash else ""}
-{self._door_banner(request)}
-<div class="cards">{cards_html}</div>
-<p class="muted">Reader {_e(opts.reader_host)} · last datagram {_e(state["reader"]["last_datagram"] or "never")} ·
-bad frames {state["reader"]["bad_frames"]} · dropped sources {state["reader"]["dropped_sources"]} ·
-door {_e(state["door"])}{f" · Grocy error: {_e(state['grocy']['last_error'])}" if state["grocy"]["last_error"] else ""}</p>
-<p class="muted">Reading mode {_e(state["reading"]["mode"])} · last sweep {_e(state["last_sweep"] or "never")} ·
-sweeps completed {state["reading"]["sweeps_completed"]} (aborted {state["reading"]["sweeps_aborted"]}) ·
-reader id {_e(state["reading"]["reader_id"])}{" · <b>departures paused until 2 sweeps complete</b>" if not state["reading"]["departures_allowed"] else ""}
-{self._button("sweep", "Sweep now") if hub.door_mode else ""}</p>
-<h2>Links ({len(links)})</h2>
-<div class="scroll"><table><tr><th>EPC</th><th>Product</th><th>Linked</th><th>Last seen</th><th></th></tr>
-{_rows(link_rows, 5, "No links yet. Use the linking station: double-click its button, scan a barcode, hold the tag near the reader.")}</table></div>
-<h2>Unlinked tags ({len(unlinked)})</h2>
-<div class="scroll"><table><tr><th>EPC</th><th>Last seen</th><th>Arrivals</th><th></th></tr>
-{_rows(unlinked_rows, 4, "None.")}</table></div>
-<h2>Barcodes that need a Grocy product ({len(needs)})</h2>
-<div class="scroll"><table><tr><th>Barcode</th><th>Station</th><th>Last scan</th><th>Scans</th><th></th></tr>
-{_rows(needs_rows, 5, "None.")}</table></div>
-<h2>Failed Grocy operations ({len(failed)})</h2>
-<div class="scroll"><table><tr><th>#</th><th>Kind</th><th>Product</th><th>EPC</th><th>Error</th><th></th></tr>
-{_rows(failed_rows, 6, "None.")}</table></div>
-<h2>Resync</h2>{resync_html}
-{self._button("resync", "Run resync now")}
-<p class="muted">● = in the pantry now. Resync only reports differences; fix them in Grocy.
-Relink takes a barcode or a Grocy product id written as <code>#12</code>.</p>
-</body></html>"""
-        return web.Response(text=page, content_type="text/html")
+    async def _set_inverted(self, form: dict[str, str]) -> str:
+        value = form.get("inverted", "").strip().lower()
+        if value not in ("true", "false", "on", "off", "1", "0", ""):
+            raise ValueError(f"inverted must be true or false, got {value!r}")
+        inverted = value in ("true", "on", "1")
+        await self.hub.set_door_inverted(inverted)
+        return "Open/closed reversed" if inverted else "Open/closed as reported"
 
 
-def grocy_product_url(base: str, product_id: int) -> str:
-    """Grocy product page URL."""
-    return f"{base}/product/{quote(str(product_id))}"
+SHELL = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Pantry Hub</title>
+<link rel="stylesheet" href="{base}/static/tokens.css?v={v}">
+<link rel="stylesheet" href="{base}/static/app.css?v={v}">
+<script type="module" src="{base}/static/app.js?v={v}"></script>
+</head>
+<body>
+<div id="app" data-boot="{boot}" aria-busy="true">
+<header class="top">
+<h1 id="title">Pantry</h1>
+<p class="fresh" id="fresh" aria-live="polite">Loading…</p>
+</header>
+<main id="view" tabindex="-1">
+<div class="skeleton" aria-hidden="true"><div></div><div></div><div></div></div>
+</main>
+</div>
+<noscript><p class="noscript">Pantry Hub needs JavaScript.</p></noscript>
+</body>
+</html>
+"""
