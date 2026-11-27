@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.4
+
+- Uses **aiochainway v0.4.0**: antenna/power enforcement now calls
+  `UR4Client.ensure_config()` (read, write only what differs, read back,
+  verify); Pantry Hub's own copy of that logic is gone. Behaviour is
+  unchanged.
+- **Dead port warning** (door mode): from per-antenna read counts of completed
+  sweeps. With 2+ ports, a port with no reads in 5 sweeps while the others
+  read 10+ times; with 1 port, no reads in 5 sweeps while tags were in the
+  pantry. Raises "Antenna on port N gave no reads in 5 sweeps — check its
+  cable and connection." and clears on that port's first read. Warning only.
+- New `reader_activity` attributes: `per_port_reads_last_sweep`,
+  `dead_ports`.
+
 ## 0.3.3
 
 - **Reader antennas and power are enforced** (door mode). New options

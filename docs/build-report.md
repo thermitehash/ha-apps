@@ -1,13 +1,19 @@
 # Pantry Hub build report
-- App version: 0.3.3 (reader antenna/power enforcement; 0.1.0–0.3.1 released in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3) · linking station firmware 0.2.0
-- Branches: PR #3 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `0acda6e`, the merge of PR #2 (which published 0.3.2). Merging PR #3 publishes 0.3.3.
-- aiochainway version used: v0.3.0 (unchanged). v0.4.0 (`ensure_config()`, `get_antenna_status()`) isn't tagged yet; see "Spec changes" for the adapter.
-- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#3](https://github.com/thermitehash/ha-apps/pull/3) / code verified at `97c760b` (this report is committed on top) / CI on `97c760b`, all green:
-  - Lint: Ruff + mypy ✅ · HA app linter ✅ (accepts the `reader_antennas` list schema) · yamllint ✅ · ESPHome linking station ✅ · Version bump (0.3.3) ✅
-  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (274 tests, coverage gate 90%) · Sweep-now repeat ×200 (macOS) ✅
-  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
+- App version: 0.3.4 (aiochainway v0.4.0 + dead port warning; 0.1.0–0.3.1 released in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4) · linking station firmware 0.2.0
+- Branches: PR #4 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `42fc128`, the merge of PR #3 (which published 0.3.3). Merging PR #4 publishes 0.3.4.
+- aiochainway version used: **v0.4.0** (`git+https://github.com/thermitehash/aiochainway@v0.4.0`; `UR4Client.ensure_config()`, `SweepResult.per_antenna_counts`).
+- Date / PR / Commit / CI (per job): 2026-11-27 / PR #4 / CI_PENDING
 
 ## Summary
+**v0.3.4, aiochainway v0.4.0 + dead port warning**:
+- `pantry_hub/reader_config.py` now calls `UR4Client.ensure_config(antennas, power_dbm)` and maps its `ConfigResult`: `verified` false → `ReaderConfigError` with the library's `mismatches` (e.g. "antennas read back as [1, 2, 3, 4], expected [1]"); a reader error → `ReaderConfigError`; otherwise the verified antennas and `len(writes)`. The local read/compare/verify code is deleted. Behaviour unchanged (writes only on a difference, no inventory until verified). There is no antenna-status call: the UR4 SDK has no antenna detection (hence the dead port warning below).
+- **Dead port warning** (door mode, `pantry_hub/dead_ports.py`, from `SweepResult.per_antenna_counts` of **completed** sweeps; aborted sweeps aren't recorded):
+  - 2+ enabled ports: a port with 0 reads in each of the last 5 completed sweeps while the other ports total ≥ 10 reads over those same 5 sweeps.
+  - 1 enabled port: 0 reads in 5 completed sweeps while `present_tags > 0` at the start of any of those sweeps.
+  - → persistent notification `pantry_hub_dead_port`, "Pantry Hub: antenna gave no reads": "Antenna on port N gave no reads in 5 sweeps — check its cable and connection." (one line per flagged port). It clears (dismissed, or updated if another port is still flagged) on that port's first read from any window, at the moment the read arrives (also during a continuous window).
+  - Warning only: never blocks reading, never changes presence.
+  - `sensor.pantry_hub_reader_activity` attributes: `per_port_reads_last_sweep` (`{"1": 29, "2": 0}`, enabled ports of the last completed sweep), `dead_ports` (list).
+
 **v0.3.3, reader antenna/power enforcement** (door mode):
 - New options `reader_antennas` (list of ports 1–4, non-empty, default `[1]`; schema `- int(1,4)`) and `reader_power_dbm` (`int(5,30)`, default 27). `reader_power_dbm > max_reader_power_dbm` refuses to start: "reader_power_dbm 27 is above max_reader_power_dbm 20: lower reader_power_dbm …".
 - On every new reader connection, before any inventory (per_window: each window; persistent: first connect and after every auto-reconnect via `on_reconnect`, or after a failure), the antenna mask and per-antenna power are read. If they differ: `set_antennas` (aiochainway always sends the save flag `0x01`) and `set_power` for each enabled antenna whose power differs, then read back and verify. A matching reader gets **no writes**. Disabled ports' power is left alone.
@@ -106,14 +112,23 @@ All checked against `grocy.openapi.json` on Grocy `master` (latest release **v4.
 - MQTT is used for the linking topics only (`discovery: false`); the native API is kept for Kroger mode.
 
 ## HA entities created
+(v0.3.4: `sensor.pantry_hub_reader_activity` gains `per_port_reads_last_sweep` and `dead_ports`; no new entities.)
 (v0.3.3: `sensor.pantry_hub_reader_activity` gains `antennas_enabled`, `reader_power_dbm`, `config_applied`, `last_config_error`; no new entities.)
 (v0.3.2: `sensor.pantry_hub_reader_activity` gains the attributes `door_entity_source` and `door_sensor_needed`; no new entities.)
 `binary_sensor.pantry_hub_reader_online`, `sensor.pantry_hub_present_tags`, `sensor.pantry_hub_unlinked_tags`, `sensor.pantry_hub_grocy_queue` (attributes: failed (includes review), review, online, last_error), `sensor.pantry_hub_last_link`, `sensor.pantry_hub_resync_differences` (added: holds the resync report), `event.pantry_hub_item` (`arrived`/`departed`), `button.pantry_hub_resync`, and (v0.3.0) `sensor.pantry_hub_reader_activity` (idle/continuous/sweep; attributes: reading mode, door, sweeps completed/aborted, last sweep/attempt, reader id, departures allowed, door notification), `sensor.pantry_hub_last_sweep` (timestamp), `button.pantry_hub_sweep_now`. All under one device "Pantry Hub" via device-based discovery (`homeassistant/device/pantry_hub/config`, identifiers `pantry_hub` + `chainway_<reader id>`) using `default_entity_id`.
 Linking station adds: `binary_sensor` Link mode, `binary_sensor` In-stock session (firmware 0.2.0), `text_sensor` Last linked tag, `switch` Link result beep (unverified).
 
 ## Spec changes vs. this spec
+v0.3.4:
+- **"Other ports total ≥ 10 reads"** is the other ports' reads summed over the same 5 sweeps (not per sweep).
+- **Single port and `present_tags`**: taken at the *start* of each sweep, and the rule needs tags present at the start of any of the 5. With a dead single port every tag departs after `depart_after_missed_sweeps` (2) misses, so `present_tags` is 0 long before the fifth sweep; checking it at evaluation time would never fire.
+- **Streak, not a fixed window**: a port's silence is counted as consecutive completed sweeps without a read, and any read from any window (sweep, continuous, even an aborted one) resets it. Otherwise a port that read only during a continuous window would be flagged again on the next sweep.
+- **Clearing is immediate**: a flagged port clears on its first tag read as it arrives (via `TagRead.antenna`), not when the window ends, since a continuous window can last `open_continuous_s` (600 s).
+- One notification id for all ports (`pantry_hub_dead_port`); its message lists each flagged port on its own line. Added attribute `dead_ports` alongside `per_port_reads_last_sweep`.
+- Door mode only (continuous mode has no sweeps).
+
 v0.3.3:
-- **aiochainway v0.4.0 not tagged**: implemented against v0.3.0's `get_antennas` / `get_power_all` / `set_antennas` / `set_power` behind a small adapter, `pantry_hub/reader_config.py` (`ensure_config(client, ReaderConfig) -> AppliedConfig`, raising `ReaderConfigError`). `ReaderSession` only calls that function. When v0.4.0 is tagged: pin it, make the adapter call `UR4Client.ensure_config()` / `get_antenna_status()`, and delete the local read/compare/verify code, so the verify logic isn't duplicated long-term (written in the module docstring).
+- **aiochainway v0.4.0 not tagged** (then): implemented against v0.3.0's `get_antennas` / `get_power_all` / `set_antennas` / `set_power` behind a small adapter, `pantry_hub/reader_config.py`. Done in v0.3.4: the adapter now calls `UR4Client.ensure_config()` and the local verify code is deleted.
 - **"After every reconnect"**: with `per_window` every window is a new connection, so the settings are read (two short commands) before every window; writes still happen only on a difference. With `persistent` they're verified once per connection (initial, after `auto_reconnect`, or after a failure).
 - **Save flag**: v0.3.0's `set_antennas` always sends the SDK's save flag; there's no separate parameter. `set_power` has no save flag in the protocol; power is re-checked on every connection anyway.
 - **Power read-back** is compared as whole dBm (the reader reports dBm × 100).
@@ -179,7 +194,9 @@ Q1–Q3 are resolved in v0.2.0 (above). Q4–Q7 stay as first-run hardware check
 6. **UDP source IP through the Supervisor's Docker bridge**: expected to be preserved (DNAT); if `dropped_sources` rises, NAT is rewriting it.
 7. HA 2026.11 MQTT discovery `default_entity_id` (replacement for `object_id`): verify the entity IDs on first run.
 
-v0.3.3 adds hardware check 14: on the real UR4, confirm the antenna setting survives a power cycle (the save flag) and whether power does too (it's re-checked on every connection either way); and that `get_power` reports whole dBm, so the read-back comparison doesn't flap. Follow-up: switch `reader_config.py` to aiochainway v0.4.0's `ensure_config()` once it's tagged.
+v0.3.3 adds hardware check 14: on the real UR4, confirm the antenna setting survives a power cycle (the save flag) and whether power does too (it's re-checked on every connection either way); and that `get_power` reports whole dBm, so the read-back comparison doesn't flap. (The follow-up to switch to aiochainway v0.4.0's `ensure_config()` is done in v0.3.4.)
+
+v0.3.4 adds hardware check 15: with both SP11s mounted (`[1, 2]`), check that each port reads in normal use (`per_port_reads_last_sweep` both > 0); with the reader powered off, unplug one antenna's cable, then confirm the dead port warning after 5 sweeps and its clearing after reconnecting (reader off first).
 
 v0.3.1 adds hardware check 13 (hardware validation §E.2): does the UR4 keep an idle TCP session open (and for how long)? If it does, `reader_connection: persistent` can become the default; until then `per_window`. Also check whether the reader acknowledges stop (the log says "didn't acknowledge stop" if not; sweeps still count).
 
@@ -201,6 +218,9 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 - U107 needs mounting beside the scanner, antenna facing out (housing doesn't fit; separate ha-kroger-restock PR later).
 
 ## Test results (tests, coverage, property tests, fault injection)
+- **v0.3.4** (284 pytest tests total, coverage 95%; ruff, mypy --strict, yamllint clean). The 14 antenna tests pass against aiochainway v0.4.0's `ensure_config()` (one assertion now expects the library's mismatch text). `tests/test_dead_ports.py` (10):
+  - Unit: two ports → flagged at sweep 5, not 4, and reported once; the other ports' 10-read total (9 → not flagged, 10 → flagged); one read breaks the streak; clears on the first read from any window (`saw()`) or the next sweep; single port needs tags present when the silence began (none → never; read fine, then tags left → never); message text.
+  - Hub with `FakeUR4` `ScriptedTag(antennas=…)`: `reader_antennas [1, 2]`, tag only on port 1 → no warning after 4 completed sweeps (`per_port_reads_last_sweep` shows port 2 at 0), notification after the 5th with the exact text, `dead_ports [2]`, the tag stays present; the tag also on port 2 → dismissed on the next sweep. A continuous window reading port 2 clears it while the window is still running. **Aborted sweeps don't count**: 6+ sweeps cut short by `disconnect_after_s` → nothing recorded; after the fault, flagged only at the 5th completed sweep. **Single port**: nothing present and nothing read for 6 sweeps → no warning; a tag arrives on port 1, then port 1 goes silent → no warning after 4, warning after 5 (the tag has departed by then, as expected).
 - **v0.3.3** (274 pytest tests total, coverage 95%; ruff, mypy --strict, yamllint clean). `tests/test_reader_antennas.py` (14, `FakeUR4`):
   - **Factory defaults corrected**: a reader at antennas [1, 2, 3, 4] / 30 dBm → `get_antennas`, `set_antennas`, `set_power`, `get_antennas` (read back), all before the first `start_inventory`; ends at mask `0x01`, port 1 at 27 dBm, port 2 untouched; exactly 2 writes; `antennas_enabled [1]`, `config_applied` set.
   - **Matching reader → zero writes** over 3 windows (still verified on each new connection); only a wrong power → exactly one `set_power`.
@@ -274,12 +294,13 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 | 22 | (test only) `test_state_not_republished_for_traffic_counters_alone` counted republishes while the arrival's second, legitimate publish (unlinked count after the store write) could still be pending | ubuntu CI on `21b60e9` (didn't reproduce in 40 local runs) | drain events, then wait for 0.3 s with no new state before counting | same test, 20 local repeats + CI |
 | 23 | (v0.3.2) Switching to another door sensor while the door was already unknown never armed the 120 s unavailable notification (`_set(UNKNOWN)` returned early because nothing changed), so a mistyped or deleted web choice would never notify | new test `test_saved_sensor_not_found_notification` | `set_entity` arms the timer for the new entity explicitly | same test |
 | 24 | (test only) Intermittent hang in the MQTT broker fixture teardown: amqtt's `Broker.shutdown()` ends with asyncio `Server.wait_closed()`, which (Python ≥ 3.12) waits for every client connection to close, and amqtt never closes them. A client socket left open (the hub mid connect/reconnect when the broker stopped) made teardown wait forever. Seen as Pytest ubuntu-latest cancelled at the 20-min limit on `a674051` | CI, then reproduced locally (1 hang in 43 runs of `test_mqtt_broker_restart_reconnects_and_republishes`) with a new test watchdog that prints every asyncio task's await chain after 120 s; it showed `broker` fixture → `Broker.shutdown` → `Server.close_instance` → `Server.wait_closed` | the test broker stops listening and closes its client connections (`Server.close_clients()`) before `shutdown()` | 80/80 repeats of that test after the fix; the watchdog stays in `tests/conftest.py` (`PANTRY_HUB_HANG_DUMP_S`) |
+| 25 | (v0.3.4, caught before release) The first dead-port version used a fixed 5-sweep window, so a port that read only during a continuous window was cleared and then flagged again on the very next sweep; it also cleared only when a window ended (up to 600 s for continuous reading) | new tests `test_clears_on_first_read_from_any_window`, `test_hub_continuous_read_clears` | per-port silent streak reset by any read; clearing on the first `TagRead` from a flagged port | same tests |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.
 2. Mosquitto + MQTT integration up; create a `linking-station` HA user for MQTT.
 3. Grocy app: enable a port, ssl off, create the **Pantry** location and an **API key**; Grocy HACS integration set up.
-4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.3`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
+4. Add `https://github.com/thermitehash/ha-apps`, install Pantry Hub (check that it pulls `ghcr.io/thermitehash/pantry-hub:0.3.4`, no local build), set the options, start, and look for `Grocy … OK` / `MQTT connected` / `Pantry Hub running` in the log.
 5. Check the entity IDs in HA match the list above (`default_entity_id`).
 6. Provision the UR4 from the Mac with `aiochainway` v0.3.0: static IP on the IoT VLAN, region USA, power ≤ 27 dBm, **command mode** (door mode, default); add the firewall rule HA → reader TCP 8888. (Continuous fallback: auto mode + UDP destination `192.168.1.38:8888`, UDP rule reader → HA.)
 7. Put one tagged item in range, open the door: `reader_online` on, `reader_activity` = continuous; an unlinked arrival appears in the web UI.
@@ -299,3 +320,4 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 21. (v0.3.2) Leave `door_entity` empty, start: a "choose the pantry door sensor" notification appears. Follow it → the web UI banner → **Settings**: the pantry door contact is near the top (door class). Save; open the pantry door → `reader_activity` = continuous. Set `door_entity` in the configuration to something else → Settings says the options are in use.
 22. (v0.3.2) With the door shut, the Settings line should read `Door: closed (raw: off)`. If it says open, first try the sensor's own invert parameter or rewire NC/NO; only then tick **Inverted** and confirm the line flips. Rename the door entity in HA: after 2 min, "Saved door sensor … not found" appears; pick it again.
 23. (v0.3.3) With one antenna on port 1, start with `reader_antennas: [1]`: the log shows "Reader antennas [1, 2, 3, 4], configured [1]: setting them (saved)" once (a factory-default reader), then nothing on later windows; `reader_activity` shows `antennas_enabled: [1]`, `reader_power_dbm: 27` and `config_applied`. Power-cycle the reader: it should still be [1] (no write logged). After mounting both SP11s on ports 1 and 2, set `[1, 2]`.
+24. (v0.3.4) With both SP11s on `[1, 2]`, open the door with tagged items in reach of both: `per_port_reads_last_sweep` shows reads on both ports after the next sweep. With the reader off, unplug port 2's cable, power on: after 5 sweeps (set `closed_sweep_interval_s` low to test) "Antenna on port 2 gave no reads in 5 sweeps" appears; reconnect (reader off first): it clears on the first read.

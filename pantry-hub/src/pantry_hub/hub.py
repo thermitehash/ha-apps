@@ -24,6 +24,7 @@ from aiochainway import (
 )
 
 from .config import DOOR_ENTITY_RE, MqttSettings, Options
+from .dead_ports import DeadPortMonitor, message as dead_port_message
 from .discovery import (
     DISCOVERY_TOPIC,
     EVENTS_TOPIC,
@@ -39,6 +40,7 @@ from .discovery import (
 )
 from .grocy import GrocyError, StockBackend
 from .homeassistant import (
+    DEAD_PORT_NOTIFICATION_ID,
     READER_CONFIG_NOTIFICATION_ID,
     SUPERVISOR_WS,
     DoorCandidate,
@@ -183,6 +185,11 @@ class Hub:
         )
         #: The "antenna settings could not be applied" notification is up.
         self._config_notified = False
+        #: Dead antenna port warning (door mode; warning only).
+        self.dead_ports: DeadPortMonitor | None = (
+            DeadPortMonitor(options.reader_antennas) if door_mode else None
+        )
+        self._dead_notified: frozenset[int] = frozenset()
         self.probe_every_s = probe_every_s
         #: Last time a window or probe talked to the reader (monotonic).
         self._last_contact = monotonic()
@@ -519,6 +526,10 @@ class Hub:
         self._last_contact = self.monotonic()
         if not task.cancelled():
             await self._reader_config_notice(task.result())
+            if self.dead_ports is not None and self.dead_ports.saw(
+                task.result().per_antenna
+            ):
+                await self._dead_port_notice()
         if task.cancelled():
             return WindowResult(
                 False, 0, 0.0, "aborted (door change or sweep request)"
@@ -550,6 +561,29 @@ class Hub:
         elif source is not None:
             await source.dismiss(READER_CONFIG_NOTIFICATION_ID)
             self._config_notified = False
+        self.mark_dirty()
+
+    async def _dead_port_notice(self) -> None:
+        """Raise, update or dismiss the dead-port notification (warning only)."""
+        assert self.dead_ports is not None
+        dead = frozenset(self.dead_ports.dead)
+        if dead == self._dead_notified:
+            return
+        source = self.door_source
+        if source is not None:
+            if dead:
+                ok = await source.notify(
+                    DEAD_PORT_NOTIFICATION_ID,
+                    "Pantry Hub: antenna gave no reads",
+                    dead_port_message(dead, self.dead_ports.sweeps),
+                )
+            else:
+                ok = await source.dismiss(DEAD_PORT_NOTIFICATION_ID)
+            if not ok:
+                return  # not connected: try again after the next sweep
+        for port in sorted(self._dead_notified - dead):
+            _LOGGER.info("Antenna on port %d reads again", port)
+        self._dead_notified = dead
         self.mark_dirty()
 
     async def _idle(self, seconds: float) -> None:
@@ -611,9 +645,22 @@ class Hub:
         reason = plan.reason.value if plan.reason else "scheduled"
         _LOGGER.info("Sweep (%s) for %.0f s", reason, plan.duration)
         self.machine.start_sweep()
+        present_at_start = len(self.machine.in_pantry())
         result, aborted_by_hub = await self._run_window(plan.duration)
         now = self.monotonic()
         completed = result.completed
+        if completed and self.dead_ports is not None:
+            newly, _ = self.dead_ports.sweep_completed(
+                result.per_antenna, present_at_start
+            )
+            for port in sorted(newly):
+                _LOGGER.warning(
+                    "Antenna on port %d gave no reads in %d sweeps — check its "
+                    "cable and connection",
+                    port,
+                    self.dead_ports.sweeps,
+                )
+            await self._dead_port_notice()
         for event in self.machine.finish_sweep(completed, now):
             self._events.put_nowait(event)
         self.planner.sweep_done(completed, now)
@@ -650,6 +697,12 @@ class Hub:
             self._seen[tag.epc] = self.wall()
             for event in self.machine.read(tag.epc, now):
                 self._events.put_nowait(event)
+            ports = self.dead_ports
+            if ports is not None and tag.antenna in ports.dead:
+                # A flagged port reads again: clear it now, not when the
+                # (possibly 10-minute) window ends.
+                ports.saw({tag.antenna: 1})
+                self._spawn(self._dead_port_notice(), "pantry_hub.dead_port")
         except Exception:
             _LOGGER.exception("Error handling a read of %s", tag.epc)
 
@@ -837,6 +890,14 @@ class Hub:
                 if self.session.config_applied
                 else None,
                 "last_config_error": self.session.last_config_error,
+                "per_port_reads_last_sweep": {
+                    str(port): n for port, n in self.dead_ports.last_sweep.items()
+                }
+                if self.dead_ports is not None
+                else None,
+                "dead_ports": sorted(self.dead_ports.dead)
+                if self.dead_ports is not None
+                else [],
                 "reader_error": self.session.last_error if self.door_mode else None,
             },
         }

@@ -10,7 +10,7 @@ license = "MIT"
 requires-python = ">=3.14"
 authors = [{ name = "thermitehash" }]
 dependencies = [
-    "aiochainway @ git+https://github.com/thermitehash/aiochainway@v0.3.0",
+    "aiochainway @ git+https://github.com/thermitehash/aiochainway@v0.4.0",
     "aiohttp==3.14.5",
     "aiomqtt==2.5.1",
     "aiosqlite==0.22.1",
