@@ -492,7 +492,14 @@ async def test_state_not_republished_for_traffic_counters_alone(
     await eventually(
         lambda: (observer.last(STATE_TOPIC) or {}).get("present_tags") == 1
     )
-    n = len(observer.messages[STATE_TOPIC])
+    # An arrival can publish twice (presence, then the unlinked count once the
+    # store write lands): wait until the state is quiet before counting.
+    await rig.h.drain_events()
+    while True:
+        n = len(observer.messages[STATE_TOPIC])
+        await asyncio.sleep(0.3)
+        if len(observer.messages[STATE_TOPIC]) == n:
+            break
     for _ in range(20):
         rig.send(EPC_A)
         await asyncio.sleep(0.02)
