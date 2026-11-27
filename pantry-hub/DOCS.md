@@ -48,6 +48,8 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
 | `reader_tcp_port` | `8888` | The UR4's TCP command port. |
 | `reading_mode` | `door` | **door**: the hub drives the reader in command mode over TCP, from the door sensor (see below). **continuous**: the reader's own auto mode pushes every read over UDP (the 0.1/0.2 behaviour); a fallback. The reader's trigger mode is never used. |
 | `reader_connection` | `per_window` | **per_window**: connect for each sweep or continuous window (retrying the connect up to 3 times) and disconnect afterwards; a continuous window keeps its one connection for its whole length. **persistent**: keep one connection open, pinged every 60 s and reconnected automatically. `per_window` is the default until it's known whether the UR4 keeps idle TCP sessions open. |
+| `reader_antennas` | `[1]` | UR4 antenna ports to enable (1–4). Bench: `[1]`. Final install with two Vulcan SP11s: `[1, 2]`. **Every enabled port must have an antenna connected.** Door mode applies and verifies this before any inventory (see below). |
+| `reader_power_dbm` | `27` | Power for each enabled antenna, 5–30 dBm. Must not be above `max_reader_power_dbm`, or the app refuses to start. |
 | `door_entity` | (empty) | The pantry door contact in Home Assistant, a `binary_sensor` (`on` = open). Optional: leave it empty and pick the sensor in the web UI's **Settings** page instead (see below). If set here, it takes precedence over the web UI. A typo that isn't a `binary_sensor.…` id is refused when you save the configuration. |
 | `open_continuous_s` | `600` | After the door opens, read continuously this long. |
 | `open_sweep_interval_s` | `300` | Then, while the door stays open, sweep this often. |
@@ -64,7 +66,7 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
 | `arrive_reads` / `arrive_window_s` | `3` / `10` | A tag must be read this many times within this window before it counts as arrived. This filters out tags carried past the door. |
 | `depart_after_s` | `900` | Not read for this much **reading time** → departed (one unit consumed). The timer only runs while the reader reads continuously (door open, or `continuous` mode); idle time never counts. |
 | `depart_requires_door_closed` | `false` | `continuous` mode only: count timer departures only while the door sensor (`door_entity` or the web UI choice) reports closed (for one arrival window). |
-| `max_reader_power_dbm` | `27` | Ceiling for reader power. The hub doesn't configure the reader, but refuses values over 27: with 8.3 dBi antennas (Vulcan SP11) that's the FCC 36 dBm EIRP limit. Use the same ceiling when provisioning the reader with `aiochainway`. |
+| `max_reader_power_dbm` | `27` | Ceiling for `reader_power_dbm`. Values over 27 are refused: with 8.3 dBi antennas (Vulcan SP11) that's the FCC 36 dBm EIRP limit. Use the same ceiling when provisioning the reader with `aiochainway`. |
 | `log_level` | `info` | `debug` logs every UDP datagram as hex. |
 
 ### Ports
@@ -120,6 +122,37 @@ closed-door schedule. Pick the sensor again to fix it.
 
 An unreachable reader at start isn't fatal either: the app starts, shows
 the reader offline, and retries each sweep.
+
+## Antennas and power
+
+In door mode Pantry Hub enforces `reader_antennas` and `reader_power_dbm` on
+the reader itself. On every new connection to the reader (each window, or
+after a reconnect with `reader_connection: persistent`), before any
+inventory, it:
+
+1. reads the enabled antenna ports and each port's power;
+2. if they differ from the options, sets them (the antenna setting is saved
+   on the reader; power is set per enabled port);
+3. reads them back and checks they match.
+
+A reader that already matches gets no writes. If a setting can't be applied
+or doesn't read back correctly, **no inventory runs**,
+`binary_sensor.pantry_hub_reader_online` turns off, and Home Assistant shows
+a "Reader antenna settings could not be applied" notification. Pantry Hub
+retries on its normal schedule (every 60 s) and dismisses the notification
+once the settings verify. `sensor.pantry_hub_reader_activity` shows
+`antennas_enabled`, `reader_power_dbm`, `config_applied` (when they last
+verified) and `last_config_error`.
+
+- **Bench setup**: `reader_antennas: [1]`, one antenna on port 1.
+- **Final install**: `reader_antennas: [1, 2]` for the two SP11s on ports 1
+  and 2.
+- **Every enabled port must have an antenna connected.** Transmitting into an
+  open port can damage the reader, and it wastes read time on a port that
+  can't see anything.
+
+`reading_mode: continuous` leaves the reader alone (it runs in its own auto
+mode there); set antennas and power when provisioning it.
 
 ## Door-driven reading (default)
 

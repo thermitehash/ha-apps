@@ -68,6 +68,10 @@ class Options:
     #: §E.2); persistent: one connection with keepalive + auto-reconnect.
     reader_connection: str = "per_window"
     max_reader_power_dbm: int = 27
+    #: Antenna ports to enable (door mode enforces them before any inventory).
+    reader_antennas: tuple[int, ...] = (1,)
+    #: Power for each enabled antenna (≤ max_reader_power_dbm).
+    reader_power_dbm: int = 27
     log_level: str = "info"
     udp_port: int = DEFAULT_UDP_PORT
     web_port: int = DEFAULT_WEB_PORT
@@ -97,6 +101,20 @@ def _int(raw: Mapping[str, Any], key: str, default: int, lo: int, hi: int) -> in
     if not lo <= value <= hi:
         raise ConfigError(f"{key} must be between {lo} and {hi}, got {value}")
     return int(value)
+
+
+def _antennas(raw: Mapping[str, Any]) -> tuple[int, ...]:
+    value = raw.get("reader_antennas", [1])
+    if not isinstance(value, list | tuple) or not value:
+        raise ConfigError(
+            f"reader_antennas must be a non-empty list of ports 1-4, got {value!r}"
+        )
+    ports: set[int] = set()
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or not 1 <= item <= 4:
+            raise ConfigError(f"reader_antennas: {item!r} is not an antenna port 1-4")
+        ports.add(item)
+    return tuple(sorted(ports))
 
 
 def _bool(raw: Mapping[str, Any], key: str, default: bool) -> bool:
@@ -194,6 +212,14 @@ def parse_options(
             f"max_reader_power_dbm {power} is above {MAX_SAFE_READER_POWER_DBM}: "
             "with 8.3 dBi antennas that exceeds the FCC 36 dBm EIRP limit"
         )
+    antennas = _antennas(raw)
+    reader_power = _int(raw, "reader_power_dbm", 27, 5, 30)
+    if reader_power > power:
+        raise ConfigError(
+            f"reader_power_dbm {reader_power} is above max_reader_power_dbm "
+            f"{power}: lower reader_power_dbm (the cap protects the FCC EIRP "
+            "limit with 8.3 dBi antennas)"
+        )
     log_level = _str(raw, "log_level", "info").lower()
     if log_level not in LOG_LEVELS:
         raise ConfigError(f"log_level must be one of {', '.join(LOG_LEVELS)}")
@@ -220,6 +246,8 @@ def parse_options(
         reader_tcp_port=_int(raw, "reader_tcp_port", 8888, 1, 65535),
         reader_connection=connection,
         max_reader_power_dbm=power,
+        reader_antennas=antennas,
+        reader_power_dbm=reader_power,
         log_level=log_level,
         udp_port=int(env.get("PANTRY_HUB_UDP_PORT", DEFAULT_UDP_PORT)),
         web_port=int(env.get("PANTRY_HUB_WEB_PORT", DEFAULT_WEB_PORT)),

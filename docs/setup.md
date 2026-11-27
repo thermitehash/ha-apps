@@ -96,7 +96,12 @@ grocy_api_key: "<from step 3>"
 grocy_location_id: <id from step 3>
 grocy_ui_url: ""                # optional, e.g. http://192.168.1.38:9192
 max_reader_power_dbm: 27
+reader_antennas: [1]            # bench; [1, 2] once both SP11s are mounted
+reader_power_dbm: 27            # ≤ max_reader_power_dbm
 ```
+
+Every port in `reader_antennas` must have an antenna connected. In door mode
+Pantry Hub sets and verifies these on the reader before it reads anything.
 
 **Network**: leave `8888/udp` → `8888`.
 
@@ -143,7 +148,7 @@ aiochainway --help
    asyncio.run(provision(
        "192.168.99.202",
        region=FrequencyRegion.USA,
-       antennas=[1, 2, 3, 4],
+       antennas=[1],          # bench; [1, 2] for the two SP11s. Only ports with an antenna!
        power=25,              # dBm; never above 27 with the 8.3 dBi SP11s
        work_mode=WorkMode.COMMAND,
        confirm=True,
