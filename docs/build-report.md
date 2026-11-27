@@ -1,7 +1,10 @@
 # Pantry Hub build report
 - App version: 0.3.2 (door sensor picker; 0.1.0–0.3.1 were released together in PR #1, 0.3.2 is in PR #2) · linking station firmware 0.2.0
 - aiochainway version used: v0.3.0 (`git+https://github.com/thermitehash/aiochainway@v0.3.0`; unchanged)
-- Date / PR / Commit / CI (per job): 2026-11-27 / CI_PENDING
+- Date / PR / Commit / CI (per job): 2026-11-27 / [thermitehash/ha-apps#2](https://github.com/thermitehash/ha-apps/pull/2) / code verified at `f1c8bfe` (this report is committed on top) / CI on `f1c8bfe`, all green:
+  - Lint: Ruff + mypy ✅ · HA app linter ✅ (accepts the `match(...)` schema) · yamllint ✅ · ESPHome linking station ✅ · Version bump (0.3.2) ✅
+  - Test: Pytest ubuntu-latest ✅ · Pytest macos-latest ✅ (256 tests, coverage gate 90%) · Sweep-now repeat ×200 (macOS) ✅
+  - Build: Prepare ✅ · Build amd64 (native, smoke test) ✅ · Build aarch64 (native, smoke test) ✅ · Publish manifest ⏭ skipped (PR; publishes on merge to main)
 
 ## Summary
 **v0.3.2, door sensor picker**:
