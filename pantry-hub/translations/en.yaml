@@ -21,8 +21,10 @@ configuration:
   door_entity:
     name: Door sensor
     description: >-
-      The pantry door contact, a binary_sensor (on = open). Required for
-      reading_mode door.
+      The pantry door contact, a binary_sensor (on = open), e.g.
+      binary_sensor.pantry_door. Leave empty to pick it in the web UI
+      (Settings) instead; if set here, it takes precedence. Without either,
+      door mode sweeps every closed_sweep_interval_s and asks for a sensor.
   open_continuous_s:
     name: Read continuously after opening (s)
     description: How long to read continuously after the door opens.

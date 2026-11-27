@@ -9,15 +9,18 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable
 import html
+import json
 import logging
 import secrets
 import time
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
+import aiohttp
 from aiohttp import web
 
 from ..grocy import GrocyError
+from ..homeassistant import DoorCandidate
 from ..linking import normalize_epc
 from ..store import iso
 
@@ -40,12 +43,18 @@ h1{font-size:20px;margin:0 0 12px}h2{font-size:16px;margin:24px 0 8px}
 .card b{display:block;font-size:20px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.muted{color:var(--muted)}
 .scroll{overflow-x:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 td code{font-size:12px;word-break:break-all}form.inline{display:inline}button{font:inherit;padding:2px 8px;cursor:pointer}
-input{font:inherit;padding:2px 4px;max-width:150px}a{color:var(--accent)}.msg{padding:8px 12px;border-radius:6px;border:1px solid var(--line);margin:8px 0}
+input{font:inherit;padding:2px 4px;max-width:150px}select{font:inherit;padding:2px 4px;max-width:100%}
+nav{margin:0 0 12px}nav a{margin-right:12px}.banner{padding:8px 12px;border-radius:6px;border:1px solid var(--warn);margin:8px 0}a{color:var(--accent)}.msg{padding:8px 12px;border-radius:6px;border:1px solid var(--line);margin:8px 0}
 """
 
 
 def _e(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
+
+
+def _js(value: str) -> str:
+    """Quote ``value`` as a JSON string that is safe inside a ``<script>``."""
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e")
 
 
 def _ago(ts: float | None) -> str:
@@ -87,6 +96,11 @@ class WebUI:
         self.app = web.Application(middlewares=[self._guard])
         self.app[ALLOW_KEY] = allow
         self.app.router.add_get("/", self.index)
+        self.app.router.add_get("/settings", self.settings)
+        self.app.router.add_get("/settings/door-state", self.door_state)
+        self.app.router.add_post(
+            "/settings/door", self._form(self._set_door, page="settings")
+        )
         self.app.router.add_post("/unlink", self._form(self._unlink))
         self.app.router.add_post("/relink", self._form(self._relink))
         self.app.router.add_post("/forget", self._form(self._forget))
@@ -128,7 +142,7 @@ class WebUI:
         return await handler(request)
 
     def _form(
-        self, action: Callable[[dict[str, str]], Awaitable[str]]
+        self, action: Callable[[dict[str, str]], Awaitable[str]], page: str = ""
     ) -> Callable[[web.Request], Awaitable[web.StreamResponse]]:
         async def handler(request: web.Request) -> web.StreamResponse:
             data = await request.post()
@@ -140,7 +154,7 @@ class WebUI:
             except (GrocyError, ValueError) as err:
                 self._flash = f"Failed: {err}"
             base = request.headers.get("X-Ingress-Path", "").rstrip("/")
-            raise web.HTTPSeeOther(f"{base}/")
+            raise web.HTTPSeeOther(f"{base}/{page}")
 
         return handler
 
@@ -204,6 +218,14 @@ class WebUI:
             return "Sweep requested"
         return "Sweep not started (one is running, or reading_mode is continuous)"
 
+    async def _set_door(self, form: dict[str, str]) -> str:
+        message = await self.hub.set_door_entity(form.get("door_entity", ""))
+        inverted = form.get("inverted") == "on"
+        if inverted != self.hub.door_inverted:
+            await self.hub.set_door_inverted(inverted)
+            message += "; inverted" if inverted else "; not inverted"
+        return message
+
     async def _resync(self, form: dict[str, str]) -> str:
         report = await self.hub.resync()
         if report.error:
@@ -233,6 +255,141 @@ class WebUI:
             'or next arrival"><input type="checkbox" name="in_stock"> already in stock</label> '
             "<button>Link</button></form>"
         )
+
+    def _nav(self, request: web.Request) -> str:
+        base = request.headers.get("X-Ingress-Path", "").rstrip("/")
+        return f'<nav><a href="{_e(base)}/">Status</a><a href="{_e(base)}/settings">Settings</a></nav>'
+
+    def _door_banner(self, request: web.Request) -> str:
+        if not self.hub.door_sensor_needed:
+            return ""
+        base = request.headers.get("X-Ingress-Path", "").rstrip("/")
+        return (
+            '<div class="banner"><b>Needs a door sensor.</b> Sweeping every '
+            f"{self.hub.options.closed_sweep_interval_s} s until one is chosen. "
+            f'<a href="{_e(base)}/settings">Choose the pantry door sensor</a>.</div>'
+        )
+
+    async def door_state(self, request: web.Request) -> web.Response:
+        """Live door status (polled by the Settings page)."""
+        return web.json_response(self.hub.door_status())
+
+    @staticmethod
+    def door_line(status: dict[str, object]) -> str:
+        """``Door: open (raw: on)`` (plain text, also built by the page's script)."""
+        if not status["entity_id"]:
+            return "Door: no sensor"
+        if status["missing"]:
+            return "Door: unknown (sensor not found in Home Assistant)"
+        raw = status["raw"] if status["raw"] is not None else "none"
+        inverted = ", inverted" if status["inverted"] else ""
+        return f"Door: {status['door']} (raw: {raw}{inverted})"
+
+    async def settings(self, request: web.Request) -> web.Response:
+        """Render the Settings page (door sensor picker)."""
+        hub = self.hub
+        flash, self._flash = self._flash, None
+        entity, source = hub.door_entity, hub.door_entity_source
+        if source == "options":
+            active = (
+                f"<b>{_e(entity)}</b> from the app options (<code>door_entity</code>). "
+                "It overrides the choice below; clear it in the app's "
+                "configuration to use this page."
+            )
+        elif source == "web_ui":
+            active = f"<b>{_e(entity)}</b>, chosen on this page."
+        elif hub.door_needed:
+            active = (
+                '<span class="warn"><b>None.</b> Pantry Hub is in the '
+                "needs-door-sensor state and sweeps every "
+                f"{hub.options.closed_sweep_interval_s} s.</span>"
+            )
+        else:
+            active = "None (not needed with <code>reading_mode: continuous</code>)."
+        base = request.headers.get("X-Ingress-Path", "").rstrip("/")
+        live = self.door_line(hub.door_status())
+        inverted_checked = " checked" if hub.door_inverted else ""
+        error = ""
+        candidates: list[DoorCandidate] = []
+        try:
+            candidates = await hub.door_candidates()
+        except (ValueError, OSError, TimeoutError, aiohttp.ClientError) as err:
+            error = f"Couldn't list Home Assistant entities: {err}"
+        current = hub.door_entity_web
+        known = {c.entity_id for c in candidates}
+
+        def option(c: DoorCandidate) -> str:
+            selected = " selected" if c.entity_id == current else ""
+            label = f"{c.name} — {c.entity_id} ({c.state})"
+            return f'<option value="{_e(c.entity_id)}"{selected}>{_e(label)}</option>'
+
+        door_like = [c for c in candidates if c.door_like]
+        others = [c for c in candidates if not c.door_like]
+        groups = ""
+        if door_like:
+            groups += (
+                '<optgroup label="Doors, garage doors, openings, windows">'
+                + "".join(option(c) for c in door_like)
+                + "</optgroup>"
+            )
+        if others:
+            groups += (
+                '<optgroup label="Other binary sensors">'
+                + "".join(option(c) for c in others)
+                + "</optgroup>"
+            )
+        if current and current not in known:
+            groups += (
+                f'<option value="{_e(current)}" selected>'
+                f"{_e(current)} (not found in Home Assistant)</option>"
+            )
+        none_selected = "" if current else " selected"
+        page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pantry Hub settings</title><style>{_CSS}</style></head><body>
+<h1>Pantry Hub <span class="muted">{_e(hub.version)}</span></h1>
+{self._nav(request)}
+{f'<div class="msg">{_e(flash)}</div>' if flash else ""}
+<h2>Pantry door sensor</h2>
+<p>In use: {active}</p>
+<p><b id="door-live">{_e(live)}</b> <span class="muted">(live)</span></p>
+{f'<p class="bad">{_e(error)}</p>' if error else ""}
+<form method="post" action="settings/door">
+<input type="hidden" name="csrf" value="{self.token}">
+<label for="door_entity">Door sensor</label><br>
+<select id="door_entity" name="door_entity">
+<option value=""{none_selected}>— none —</option>{groups}</select><br>
+<label title="Swap open and closed for a sensor that reports on = closed">
+<input type="checkbox" name="inverted"{inverted_checked}> Inverted (sensor reports <code>on</code> when closed)</label><br>
+<button>Save</button></form>
+<p class="muted">Fix an inverted sensor at the device first if you can: wire the reed switch the
+other way (NC/NO), or set the sensor's own invert parameter. Use the checkbox only for sensors
+that can't be changed. Watch the live line above: open the door and it should say
+<b>open</b>. If the raw state is already right, leave the box unticked (inverting twice
+makes it wrong again).</p>
+<script>
+(function () {{
+  var el = document.getElementById("door-live");
+  function line(s) {{
+    if (!s.entity_id) return "Door: no sensor";
+    if (s.missing) return "Door: unknown (sensor not found in Home Assistant)";
+    return "Door: " + s.door + " (raw: " + (s.raw === null ? "none" : s.raw) +
+      (s.inverted ? ", inverted" : "") + ")";
+  }}
+  function poll() {{
+    fetch({_js(base + "/settings/door-state")}, {{credentials: "same-origin"}})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (s) {{ el.textContent = line(s); }})
+      .catch(function () {{}});
+  }}
+  setInterval(poll, 2000);
+}})();
+</script>
+<p class="muted">Lists every <code>binary_sensor</code> in Home Assistant: door, garage door,
+opening and window sensors first. <code>on</code> must mean open. The choice is stored in
+Pantry Hub's database; <code>door_entity</code> in the app options, if set, takes precedence.</p>
+</body></html>"""
+        return web.Response(text=page, content_type="text/html")
 
     async def index(self, request: web.Request) -> web.Response:
         """Render the status page."""
@@ -347,7 +504,9 @@ class WebUI:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pantry Hub</title><style>{_CSS}</style></head><body>
 <h1>Pantry Hub <span class="muted">{_e(hub.version)}</span></h1>
+{self._nav(request)}
 {f'<div class="msg">{_e(flash)}</div>' if flash else ""}
+{self._door_banner(request)}
 <div class="cards">{cards_html}</div>
 <p class="muted">Reader {_e(opts.reader_host)} · last datagram {_e(state["reader"]["last_datagram"] or "never")} ·
 bad frames {state["reader"]["bad_frames"]} · dropped sources {state["reader"]["dropped_sources"]} ·

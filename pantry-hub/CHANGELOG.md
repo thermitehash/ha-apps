@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.2
+
+- **Door sensor picker** in the web UI (**Settings**): a dropdown of every
+  Home Assistant `binary_sensor` (door, garage door, opening and window
+  sensors first) with friendly name, entity id and current state. The
+  choice is stored in the app's database.
+- `door_entity` in the app options still wins when set; the Settings page
+  and the `reader_activity` attributes (`door_entity_source`) show which
+  source is in use.
+- **Door mode without a door sensor** no longer refuses to start: it runs in
+  a "needs door sensor" state (sweeps every `closed_sweep_interval_s`, a
+  banner in the web UI and a persistent notification linking to it).
+- `door_entity` is checked when you save the configuration
+  (`binary_sensor.…` or empty), so typos fail there instead of at start.
+- Without a Home Assistant token (local development) the app no longer
+  refuses to start; the door stays unknown.
+- **Inverted** checkbox next to the door picker, for sensors that report
+  `on` when closed and can't be changed at the device. The Settings page
+  shows the live interpreted and raw state (`Door: open (raw: on)`).
+- A saved door sensor that no longer exists in Home Assistant gets its own
+  notification: "Saved door sensor … not found in Home Assistant (renamed or
+  deleted?)", instead of the generic "unavailable" text.
+- Fixed: switching to another door sensor while the door was already
+  unknown never started the 2-minute "unavailable" notification timer.
+
 ## 0.3.1
 
 - Uses **aiochainway v0.3.0**. Every reading window is an

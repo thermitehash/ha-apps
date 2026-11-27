@@ -23,7 +23,7 @@ from aiochainway import (
     UR4UdpListener,
 )
 
-from .config import MqttSettings, Options
+from .config import DOOR_ENTITY_RE, MqttSettings, Options
 from .discovery import (
     DISCOVERY_TOPIC,
     EVENTS_TOPIC,
@@ -38,7 +38,13 @@ from .discovery import (
     linking_result_topic,
 )
 from .grocy import GrocyError, StockBackend
-from .homeassistant import SUPERVISOR_WS, HomeAssistantDoor
+from .homeassistant import (
+    SUPERVISOR_WS,
+    DoorCandidate,
+    HomeAssistantDoor,
+    door_candidates,
+    fetch_states,
+)
 from .linking import LinkingManager, LinkResult, best_before_for
 from .mqtt import MqttLink
 from .presence import Door, PresenceConfig, PresenceEvent, PresenceMachine
@@ -119,6 +125,7 @@ class Hub:
         retry_s: float = 60.0,
         probe_every_s: float = PROBE_IDLE_S,
         door_notify_after_s: float = 120.0,
+        settings_url: str | None = None,
     ) -> None:
         """Create; call :meth:`start`."""
         door_mode = options.reading_mode == "door"
@@ -176,13 +183,22 @@ class Hub:
         self._discover_fn = discover_fn
         self._wake = asyncio.Event()
         self._window: asyncio.Task[WindowResult] | None = None
+        self.ha_url = ha_url or SUPERVISOR_WS
+        self.ha_token = ha_token
+        #: Door mode, or continuous mode gating departures on the door.
+        self.door_needed = door_mode or options.depart_requires_door_closed
+        #: Door entity chosen in the web UI (stored in the DB); options win.
+        self.door_entity_web: str | None = None
+        #: Swap open/closed for the door sensor in use (stored in the DB).
+        self.door_inverted = False
         self.door_source: HomeAssistantDoor | None = None
-        if options.door_entity and ha_token:
+        if ha_token and self.door_needed:
             self.door_source = HomeAssistantDoor(
-                options.door_entity,
+                options.door_entity or None,
                 ha_token,
                 self._on_door,
-                url=ha_url or SUPERVISOR_WS,
+                url=self.ha_url,
+                settings_url=settings_url,
                 notify_after_s=door_notify_after_s,
             )
         self.worker = GrocyWorker(store, backend, clock=wall, on_change=self.mark_dirty)
@@ -233,6 +249,14 @@ class Hub:
 
     async def start(self) -> None:
         """Restore state and start every task."""
+        self.door_inverted = await self.store.get_meta("door_inverted") == "1"
+        if self.door_source is not None:
+            self.door_source.set_inverted(self.door_inverted)
+        stored_door = await self.store.get_meta("door_entity")
+        if stored_door and DOOR_ENTITY_RE.fullmatch(stored_door):
+            self.door_entity_web = stored_door
+            if self.door_source is not None and not self.options.door_entity:
+                await self.door_source.set_entity(stored_door)
         stored_id = await self.store.get_meta("reader_id")
         if stored_id:
             self.reader_id, self.reader_id_source = stored_id, "stored"
@@ -257,8 +281,20 @@ class Hub:
                 "Door-driven reading: UR4 %s:%d in command mode, door %s",
                 self.options.reader_host,
                 self.options.reader_tcp_port,
-                self.options.door_entity,
+                self._door_description(),
             )
+            if self.door_entity is None:
+                _LOGGER.warning(
+                    "No door sensor: running in the needs-door-sensor state "
+                    "(a sweep every %d s). Pick the door in the web UI → Settings "
+                    "or set door_entity.",
+                    self.options.closed_sweep_interval_s,
+                )
+            if self.ha_token is None:
+                _LOGGER.warning(
+                    "No Home Assistant API token: the door can't be followed and "
+                    "the door picker is unavailable"
+                )
             self._loops.append(
                 asyncio.create_task(self._reading_loop(), name="pantry_hub.reading")
             )
@@ -349,6 +385,80 @@ class Hub:
             _LOGGER.info("Reader unique id: %s (from %s)", rid, source)
             if self.mqtt is not None and self.mqtt.connected:
                 await self.publish_discovery()
+
+    # Door entity ---------------------------------------------------------------
+
+    @property
+    def door_entity(self) -> str | None:
+        """The door entity in use: app options win over the web UI choice."""
+        return self.options.door_entity or self.door_entity_web
+
+    @property
+    def door_entity_source(self) -> str | None:
+        """``options``, ``web_ui`` or ``None`` (no door sensor)."""
+        if self.options.door_entity:
+            return "options"
+        if self.door_entity_web:
+            return "web_ui"
+        return None
+
+    @property
+    def door_sensor_needed(self) -> bool:
+        """The "needs door sensor" state: a door is needed and none is set."""
+        return self.door_needed and self.door_entity is None
+
+    def _door_description(self) -> str:
+        entity, source = self.door_entity, self.door_entity_source
+        if entity is None:
+            return "not set (needs door sensor)"
+        return f"{entity} (from {'app options' if source == 'options' else 'web UI'})"
+
+    async def door_candidates(self) -> list[DoorCandidate]:
+        """binary_sensors from Home Assistant for the picker, door-like first."""
+        if not self.ha_token:
+            raise ValueError("Home Assistant API not available (no token)")
+        return door_candidates(await fetch_states(self.ha_token, url=self.ha_url))
+
+    async def set_door_entity(self, entity_id: str | None) -> str:
+        """Store the web UI's door choice (``None`` clears it); apply it if active."""
+        entity_id = (entity_id or "").strip() or None
+        if entity_id is not None and not DOOR_ENTITY_RE.fullmatch(entity_id):
+            raise ValueError(f"{entity_id!r} is not a binary_sensor entity id")
+        await self.store.set_meta("door_entity", entity_id or "")
+        self.door_entity_web = entity_id
+        _LOGGER.info("Web UI door sensor set to %s", entity_id or "none")
+        if self.options.door_entity:
+            self.mark_dirty()
+            return (
+                f"Saved {entity_id or 'no door sensor'}, but door_entity in the "
+                f"app options ({self.options.door_entity}) is in use; clear it "
+                "there to use this choice"
+            )
+        if self.door_source is not None:
+            await self.door_source.set_entity(entity_id)
+        self.mark_dirty()
+        return f"Door sensor: {entity_id}" if entity_id else "Door sensor cleared"
+
+    async def set_door_inverted(self, inverted: bool) -> None:
+        """Store and apply the "inverted" checkbox (open ↔ closed)."""
+        await self.store.set_meta("door_inverted", "1" if inverted else "0")
+        self.door_inverted = inverted
+        if self.door_source is not None:
+            self.door_source.set_inverted(inverted)
+        self.mark_dirty()
+
+    def door_status(self) -> dict[str, Any]:
+        """Live door status for the Settings page: interpreted and raw."""
+        source = self.door_source
+        return {
+            "entity_id": self.door_entity,
+            "source": self.door_entity_source,
+            "inverted": self.door_inverted,
+            "door": self.machine.door.value,
+            "raw": source.raw_state if source else None,
+            "missing": bool(source and source.missing),
+            "needed": self.door_sensor_needed,
+        }
 
     def _on_door(self, door: Door) -> None:
         """Door entity changed (open / closed / unknown)."""
@@ -666,7 +776,11 @@ class Hub:
             "reading": {
                 "mode": self.options.reading_mode,
                 "door": self.machine.door.value,
-                "door_entity": self.options.door_entity or None,
+                "door_entity": self.door_entity,
+                "door_entity_source": self.door_entity_source,
+                "door_sensor_needed": self.door_sensor_needed,
+                "door_inverted": self.door_inverted,
+                "door_raw": self.door_source.raw_state if self.door_source else None,
                 "door_unavailable_notified": bool(
                     self.door_source and self.door_source.notified
                 ),

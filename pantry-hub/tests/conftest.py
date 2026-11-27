@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+import io
 import logging
 import os
 from pathlib import Path
 import socket
+import threading
 from typing import Any
 
+from _pytest.faulthandler import fault_handler_stderr_fd_key
 from aiochainway.testing import FakeUR4, tag_record
 from amqtt.broker import Broker
 from hypothesis import settings
@@ -27,6 +30,85 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 
 logging.getLogger("amqtt").setLevel(logging.WARNING)
 logging.getLogger("transitions").setLevel(logging.WARNING)
+
+
+#: A test (setup + call + teardown) running longer than this dumps every
+#: asyncio task's stack: faulthandler only shows threads, not which coroutine
+#: is stuck (e.g. a fixture teardown waiting forever).
+HANG_DUMP_AFTER_S = float(os.environ.get("PANTRY_HUB_HANG_DUMP_S", "120"))
+
+
+def _print_await_chain(task: asyncio.Task[Any], buf: io.StringIO) -> None:
+    """Follow awaits, including into async generators (fixture teardowns)."""
+    obj: Any = task.get_coro()
+    seen: set[int] = set()
+    while obj is not None and id(obj) not in seen:
+        seen.add(id(obj))
+        frame = (
+            getattr(obj, "cr_frame", None)
+            or getattr(obj, "ag_frame", None)
+            or getattr(obj, "gi_frame", None)
+        )
+        if frame is not None:
+            code = frame.f_code
+            print(
+                f"    await chain: {code.co_filename}:{frame.f_lineno} "
+                f"in {code.co_qualname}",
+                file=buf,
+            )
+            # pytest-asyncio awaits gen_obj.__anext__(): follow the generator.
+            gen = frame.f_locals.get("gen_obj")
+            if gen is not None and getattr(gen, "ag_await", None) is not None:
+                obj = gen
+                continue
+        nxt = (
+            getattr(obj, "cr_await", None)
+            or getattr(obj, "ag_await", None)
+            or getattr(obj, "gi_yieldfrom", None)
+        )
+        if nxt is None:
+            print(f"    waiting on: {obj!r}", file=buf)
+        obj = nxt
+
+
+def _dump_asyncio_tasks(
+    name: str, loops: list[asyncio.AbstractEventLoop], fd: int
+) -> None:
+    # Written to the stderr copy pytest gives faulthandler: captured output of
+    # a test that never finishes would never be shown.
+    buf = io.StringIO()
+    print(f"\n=== {name} still running after {HANG_DUMP_AFTER_S:.0f} s ===", file=buf)
+    for loop in loops:
+        try:
+            tasks = list(asyncio.all_tasks(loop))
+        except RuntimeError:  # the set changed while we read it; try once more
+            tasks = list(asyncio.all_tasks(loop))
+        for task in tasks:
+            print(asyncio.format_call_graph(task), file=buf)
+            _print_await_chain(task, buf)
+    os.write(fd, buf.getvalue().encode())
+
+
+@pytest.fixture(autouse=True)
+def _hang_watchdog(request: pytest.FixtureRequest) -> Any:
+    loops: list[asyncio.AbstractEventLoop] = []
+    original = asyncio.BaseEventLoop.run_forever
+
+    def tracking(self: asyncio.BaseEventLoop) -> None:
+        if self not in loops:
+            loops.append(self)
+        original(self)
+
+    asyncio.BaseEventLoop.run_forever = tracking  # type: ignore[method-assign]
+    fd = request.config.stash.get(fault_handler_stderr_fd_key, 2)
+    timer = threading.Timer(
+        HANG_DUMP_AFTER_S, _dump_asyncio_tasks, (request.node.nodeid, loops, fd)
+    )
+    timer.daemon = True
+    timer.start()
+    yield
+    timer.cancel()
+    asyncio.BaseEventLoop.run_forever = original  # type: ignore[method-assign]
 
 
 class FakeClock:
@@ -143,6 +225,16 @@ class BrokerHandle:
 
     async def stop(self) -> None:
         if self.broker is not None:
+            # amqtt's shutdown ends with asyncio Server.wait_closed(), which
+            # (Python >= 3.12) waits for every client connection to close; it
+            # never closes them itself, so a leftover socket (a client mid
+            # connect or reconnect when the broker stops) hung the teardown
+            # forever. Stop listening and close the clients first.
+            for server in self.broker._servers.values():
+                instance = server.instance
+                if isinstance(instance, asyncio.Server):
+                    instance.close()
+                    instance.close_clients()
             await self.broker.shutdown()
             self.broker = None
 

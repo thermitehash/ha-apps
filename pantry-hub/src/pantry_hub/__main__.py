@@ -131,20 +131,28 @@ async def resolve_mqtt(env: Mapping[str, str]) -> MqttSettings:
     return await mqtt_from_supervisor(token)
 
 
-def resolve_home_assistant(
-    env: Mapping[str, str], options: Options
-) -> tuple[str | None, str | None]:
-    """Websocket URL + token for the door entity (Supervisor, or env for dev)."""
-    if not options.door_entity:
-        return None, None
+def resolve_home_assistant(env: Mapping[str, str]) -> tuple[str | None, str | None]:
+    """Websocket URL + token for the door entity and picker (Supervisor or env).
+
+    Without a token the hub still starts: the door stays unknown (closed-door
+    schedule) and the picker says the API is unavailable.
+    """
     token = env.get("PANTRY_HUB_HA_TOKEN") or env.get("SUPERVISOR_TOKEN")
-    url = env.get("PANTRY_HUB_HA_URL") or SUPERVISOR_WS
     if not token:
-        raise ConfigError(
-            f"door_entity {options.door_entity} needs Home Assistant API access: "
-            "not running under the Supervisor and PANTRY_HUB_HA_TOKEN is not set"
-        )
-    return url, token
+        return None, None
+    return env.get("PANTRY_HUB_HA_URL") or SUPERVISOR_WS, token
+
+
+def ingress_settings_url(env: Mapping[str, str]) -> str | None:
+    """Link to the web UI's Settings page inside Home Assistant, if known.
+
+    The Supervisor names the container after the app slug with dashes
+    (``1a2b3c4d-pantry-hub``); the ingress panel is ``/hassio/ingress/<slug>``.
+    """
+    host = env.get("HOSTNAME", "")
+    if not host or not host.endswith("pantry-hub"):
+        return None
+    return f"/hassio/ingress/{host.replace('-', '_')}"
 
 
 async def run(
@@ -168,7 +176,7 @@ async def run(
         )
         _LOGGER.info(summary)
         mqtt = await resolve_mqtt(env)
-        ha_url, ha_token = resolve_home_assistant(env, options)
+        ha_url, ha_token = resolve_home_assistant(env)
     except ConfigError as err:
         _LOGGER.error("Refusing to start: %s", err)
         await grocy.close()
@@ -183,6 +191,7 @@ async def run(
         version=version,
         ha_url=ha_url,
         ha_token=ha_token,
+        settings_url=ingress_settings_url(env),
     )
     allow_env = env.get("PANTRY_HUB_WEB_ALLOW")
     web = WebUI(

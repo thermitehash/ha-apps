@@ -48,7 +48,7 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
 | `reader_tcp_port` | `8888` | The UR4's TCP command port. |
 | `reading_mode` | `door` | **door**: the hub drives the reader in command mode over TCP, from the door sensor (see below). **continuous**: the reader's own auto mode pushes every read over UDP (the 0.1/0.2 behaviour); a fallback. The reader's trigger mode is never used. |
 | `reader_connection` | `per_window` | **per_window**: connect for each sweep or continuous window (retrying the connect up to 3 times) and disconnect afterwards; a continuous window keeps its one connection for its whole length. **persistent**: keep one connection open, pinged every 60 s and reconnected automatically. `per_window` is the default until it's known whether the UR4 keeps idle TCP sessions open. |
-| `door_entity` | — | The pantry door contact in Home Assistant, a `binary_sensor` (`on` = open). Required for `reading_mode: door`. |
+| `door_entity` | (empty) | The pantry door contact in Home Assistant, a `binary_sensor` (`on` = open). Optional: leave it empty and pick the sensor in the web UI's **Settings** page instead (see below). If set here, it takes precedence over the web UI. A typo that isn't a `binary_sensor.…` id is refused when you save the configuration. |
 | `open_continuous_s` | `600` | After the door opens, read continuously this long. |
 | `open_sweep_interval_s` | `300` | Then, while the door stays open, sweep this often. |
 | `sweep_s` | `45` | Length of one sweep. |
@@ -63,7 +63,7 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
 | `grocy_ui_url` | (empty) | Base URL your browser uses for Grocy, so links in the web UI work. If empty, links use `grocy_url`, which only works inside Home Assistant's network. |
 | `arrive_reads` / `arrive_window_s` | `3` / `10` | A tag must be read this many times within this window before it counts as arrived. This filters out tags carried past the door. |
 | `depart_after_s` | `900` | Not read for this much **reading time** → departed (one unit consumed). The timer only runs while the reader reads continuously (door open, or `continuous` mode); idle time never counts. |
-| `depart_requires_door_closed` | `false` | `continuous` mode only: count timer departures only while `door_entity` reports closed (for one arrival window). |
+| `depart_requires_door_closed` | `false` | `continuous` mode only: count timer departures only while the door sensor (`door_entity` or the web UI choice) reports closed (for one arrival window). |
 | `max_reader_power_dbm` | `27` | Ceiling for reader power. The hub doesn't configure the reader, but refuses values over 27: with 8.3 dBi antennas (Vulcan SP11) that's the FCC 36 dBm EIRP limit. Use the same ceiling when provisioning the reader with `aiochainway`. |
 | `log_level` | `info` | `debug` logs every UDP datagram as hex. |
 
@@ -78,6 +78,48 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
   broadcasts, so they only arrive if the reader and Home Assistant share a
   network segment; otherwise the id is `host:port`, which works just as
   well.
+
+## Choosing the door sensor
+
+App options can't show an entity picker, so the web UI has one: open
+**Pantry Hub** in the sidebar → **Settings**. The dropdown lists every
+`binary_sensor` in Home Assistant with its friendly name, entity id and
+current state: door, garage door, opening and window sensors first, then the
+rest. **Save** stores the choice in Pantry Hub's database (it survives
+restarts and updates).
+
+Which one is used:
+
+1. `door_entity` in the app's configuration, if set;
+2. otherwise the Settings page choice.
+
+The Settings page says which source is active (and the
+`sensor.pantry_hub_reader_activity` attributes `door_entity` /
+`door_entity_source` show it too).
+
+**No door sensor from either source** (door mode): Pantry Hub starts anyway
+in the **needs door sensor** state. It sweeps every
+`closed_sweep_interval_s` (hourly by default), shows a banner in the web UI,
+and raises a persistent notification in Home Assistant that links to the
+web UI. Both go away as soon as a sensor is chosen.
+
+**Inverted sensor** (reports `on` when the door is closed): fix it at the
+device first if you can. Wire the reed switch the other way (NC instead of
+NO, or the reverse), or set the sensor's own invert parameter (many Zigbee
+and Z-Wave contacts have one). The **Inverted** checkbox next to the picker
+is for sensors that can't be changed. The Settings page shows a live line
+such as `Door: open (raw: on)`: open the door and check that it says
+**open**. If it was already right before you ticked the box, untick it
+(inverting twice makes it wrong again).
+
+**Saved sensor not found** (renamed or deleted in Home Assistant): it stays
+selected and is marked "not found" on the Settings page. After 2 minutes a
+notification says "Saved door sensor … not found in Home Assistant (renamed
+or deleted?)". Until then and while it lasts, Pantry Hub uses the
+closed-door schedule. Pick the sensor again to fix it.
+
+An unreachable reader at start isn't fatal either: the app starts, shows
+the reader offline, and retries each sweep.
 
 ## Door-driven reading (default)
 
@@ -224,7 +266,8 @@ Open **Pantry Hub** in the sidebar. It shows status, links (unlink, or
 relink by barcode or by Grocy product id written as `#12`, optionally "already
 in stock"), unlinked tags,
 barcodes that need a Grocy product, failed operations, and the last resync.
-It's only reachable through Home Assistant ingress.
+**Settings** has the door sensor picker. It's only reachable through Home
+Assistant ingress.
 
 ## Troubleshooting
 

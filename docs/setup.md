@@ -159,8 +159,11 @@ aiochainway --help
 3. **Firewall** (door mode): allow **TCP from `192.168.1.38` to the reader's
    port 8888** (HA → IoT VLAN), with return traffic. Continuous mode instead
    needs **UDP from the reader to `192.168.1.38:8888`**.
-4. **Door sensor**: pick the pantry door contact in Home Assistant (a
-   `binary_sensor`, `on` = open) and set it as `door_entity`.
+4. **Door sensor**: open Pantry Hub in the sidebar → **Settings** and pick
+   the pantry door contact (a `binary_sensor`, `on` = open), or set it as
+   `door_entity` in the app's configuration (that wins if both are set).
+   Until one is chosen, the app sweeps hourly and shows a "needs door
+   sensor" notification.
 
 Check: the log shows `Sweep (startup)` then `Sweep done`;
 `sensor.pantry_hub_last_sweep` gets a time and

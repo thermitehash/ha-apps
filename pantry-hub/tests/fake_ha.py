@@ -18,6 +18,8 @@ TOKEN = "ha-test-token"
 class FakeHomeAssistant:
     def __init__(self) -> None:
         self.states: dict[str, str] = {}
+        self.attributes: dict[str, dict[str, Any]] = {}
+        self.fail_get_states = False
         self.services: list[tuple[str, str, dict[str, Any]]] = []
         self.connections = 0
         self.reject_auth = False
@@ -49,6 +51,11 @@ class FakeHomeAssistant:
 
     def calls(self, domain: str, service: str) -> list[dict[str, Any]]:
         return [d for dm, sv, d in self.services if dm == domain and sv == service]
+
+    def add_entity(self, entity_id: str, state: str, **attributes: Any) -> None:
+        """Add an entity with attributes (no event; for ``get_states``)."""
+        self.states[entity_id] = state
+        self.attributes[entity_id] = attributes
 
     async def set_state(self, entity_id: str, state: str | None) -> None:
         """Change (or with ``None`` remove) an entity and push it to subscribers."""
@@ -95,6 +102,32 @@ class FakeHomeAssistant:
                 await ws.send_json(
                     {"id": data["id"], "type": "event", "event": {"a": added}}
                 )
+            elif data.get("type") == "get_states":
+                if self.fail_get_states:
+                    await ws.send_json(
+                        {
+                            "id": data["id"],
+                            "type": "result",
+                            "success": False,
+                            "error": {"code": "unknown_error", "message": "boom"},
+                        }
+                    )
+                else:
+                    await ws.send_json(
+                        {
+                            "id": data["id"],
+                            "type": "result",
+                            "success": True,
+                            "result": [
+                                {
+                                    "entity_id": e,
+                                    "state": s,
+                                    "attributes": self.attributes.get(e, {}),
+                                }
+                                for e, s in self.states.items()
+                            ],
+                        }
+                    )
             elif data.get("type") == "call_service":
                 self.services.append(
                     (data["domain"], data["service"], data.get("service_data") or {})

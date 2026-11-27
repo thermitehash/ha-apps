@@ -53,6 +53,7 @@ class DoorRig:
         broker: BrokerHandle | None = None,
         discover: Callable[[float], Awaitable[list[Any]]] | None = None,
         probe_every_s: float = 600.0,
+        settings_url: str | None = None,
         **opts: Any,
     ) -> Hub:
         base: dict[str, Any] = {
@@ -90,6 +91,7 @@ class DoorRig:
                 fake.host, fake.port, **(kw | {"timeout": 1.0})
             ),
             probe_every_s=probe_every_s,
+            settings_url=settings_url,
             discover_fn=discover or no_discovery,
             retry_s=0.3,
             door_notify_after_s=0.3,
