@@ -79,7 +79,16 @@ wrong it logs why, refuses to start, and the app stops. Read the Log tab.
   at start to learn the reader's MAC for the device id. Announcements are
   broadcasts, so they only arrive if the reader and Home Assistant share a
   network segment; otherwise the id is `host:port`, which works just as
-  well.
+  well. With the reader on its own VLAN (as recommended), they never
+  arrive: give the reader a static IP and use it as `reader_host`. No
+  discovery is needed.
+- `dropped_sources` (reader activity attributes) only matters in
+  `continuous` mode: it counts UDP reads from an unexpected source address
+  (for example rewritten by NAT). Door mode doesn't use UDP.
+
+`reading_mode: continuous` is a test mode. Pantry Hub shows a health warning
+while it's on ("No door sensor: reading continuously (test mode)" when no
+door sensor is chosen), so it never runs that way silently.
 
 ## Choosing the door sensor
 

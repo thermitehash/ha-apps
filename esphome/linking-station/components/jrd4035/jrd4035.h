@@ -27,7 +27,10 @@ class JRD4035Component : public Component, public uart::UARTDevice {
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
-  void set_tx_power(float dbm) { this->tx_power_ = dbm; }
+  void set_tx_power(float dbm) {
+    this->tx_power_ = dbm;
+    this->configured_power_ = dbm;
+  }
   void set_region(uint8_t region) { this->region_ = region; }
   void set_scan_interval(uint32_t ms) { this->scan_interval_ = ms; }
   void set_rssi_window(uint32_t ms) { this->rssi_window_ = ms; }
@@ -51,6 +54,8 @@ class JRD4035Component : public Component, public uart::UARTDevice {
   void sleep_();
 
   float tx_power_{15.0f};
+  float configured_power_{15.0f};  // as set in YAML; tx_power_ may be raised
+  bool power_raised_{false};       // the module rejected a lower value
   uint8_t region_{0x02};
   uint32_t scan_interval_{100};
   uint32_t rssi_window_{1000};

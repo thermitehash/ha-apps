@@ -1,10 +1,36 @@
 # Pantry Hub build report
-- App version: 0.4.4 (tag allowance + Pantry-only lowering; 0.1.0–0.3.1 in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4, 0.4.0 in PR #5, 0.4.1 in PR #6, 0.4.2 in PR #7, 0.4.3 in PR #8, 0.4.4 in PR #9) · linking station firmware 0.4.0 (unchanged)
-- Branches: PR #9 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `968b7f4`, the merge of PR #8 (0.4.3). Merging PR #9 publishes 0.4.4.
+- App version: 0.4.5 (shutdown fix + continuous-mode warning; 0.1.0–0.3.1 in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4, 0.4.0 in PR #5, 0.4.1 in PR #6, 0.4.2 in PR #7, 0.4.3 in PR #8, 0.4.4 in PR #9, 0.4.5 in PR #10) · linking station firmware 0.4.1
+- Branches: PR #10 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `34faa3d`, the merge of PR #9 (0.4.4). Merging PR #10 publishes 0.4.5.
 - aiochainway version used: v0.4.0 (unchanged).
-- Date / PR / Commit / CI (per job): 2026-11-28 / PR #9 / `e3ef3d9` / all green: HA app linter, yamllint, Ruff + mypy, ESPHome linking station, Version bump, Pytest (ubuntu-latest), Pytest (macos-latest), Sweep-now repeat ×200 (macOS), UI smoke (Playwright), Prepare, Build amd64, Build aarch64 (multi-arch manifest skipped on PRs). 0.4.3: PR #8 at `722258f`, merged as `968b7f4`.
+- Date / PR / Commit / CI (per job): 2026-11-28 / PR #10 / CI_PENDING (0.4.4: PR #9 at `aae6bdc`, all green, merged as `34faa3d`; main runs green)
 
 ## Summary
+**v0.4.5, shutdown fix + continuous-mode warning** (no new features; waiting for the hardware checks below):
+- **Shutdown can't hang** (bug 34): `Hub.stop()` sets a stopping flag the tick and housekeeping loops check, cancels each background loop again every 0.5 s until it ends, and is capped at `stop_timeout_s` (10 s). Steps give up at 80 % of the cap and log the loop that didn't end; at the cap `stop()` logs the step and the tasks still running and returns, so HA never force-stops the app. The Grocy worker's in-flight call gets the remaining budget (was its own 20 s).
+- **Continuous mode isn't silent**: a health warning "No door sensor: reading continuously (test mode)" (or "Reading continuously (test mode)" with a door sensor) with the steps to switch to door mode.
+- **Firmware 0.4.1**: counted-session "Tag tap pause" number (1–4 s, default 1.5 s, restored); a rejected U107 TX power steps up 1 dBm at a time to the lowest accepted value (max 26 dBm) and logs it once.
+- CI: a one-off macOS job ran `test_just_bought.py` + `test_shutdown.py` ×50 for this PR (removed before merge).
+
+### Hardware checks (tracked; answers from 2026-11-28)
+The UR4, the station reflash and the door sensor aren't installed yet; these stay open until they are.
+
+| # | Check | Status | Note |
+|---|---|---|---|
+| H2 | U107 accepts 15 dBm | open | Firmware 0.4.1 steps up to the lowest accepted value and logs it; then set `u107_tx_power_dbm` to it |
+| H3 | U107 TX/RX on G1/G2 | open | "Swap GPIO1/GPIO2 if no tags are read" stays in the station README |
+| H4 | UDP source IP through the Docker bridge | not needed | Door mode only uses HA → reader TCP 8888; the UniFi reader → HA UDP rule is deliberately not created. Only for `continuous`; `dropped_sources` is the diagnostic |
+| H5 | MQTT discovery entity IDs (HA 2026.11) | **done** | All 13 entities show as `pantry_hub_*` (reader_online, reader_activity, present_tags, unlinked_tags, last_sweep, last_link, grocy_queue, resync_differences, item event, sweep_now / resync / fetch_pictures buttons, update) |
+| H6 | M14 reads the printed in-stock card (laminated or not) | open | |
+| H7 | One 45 s sweep covers the pantry with 4 SP11s | open | reader not installed |
+| H8 | UR4 UDP 1111 announcements reach HA | **no, by design** | Reader on the Pantry IoT VLAN 99 (192.168.99.0/24); static IP 192.168.99.202 everywhere; no discovery fallback needed |
+| H9 | Door sensor `on` = open | open | Not paired; `door_entity` empty, reading is `continuous` (test). 0.4.5 shows this as a health warning. When paired: door mode, then Check it → Flip if needed |
+| H10 | UR4 keeps an idle TCP session; acknowledges stop | open | `per_window` (connect per sweep) stays the default until proven |
+| H11 | Antenna / power survive a power cycle; `get_power` in whole dBm | open | |
+| H12 | Both SP11 ports on `[1, 2]`; dead-port warning on an unplugged cable | open | |
+| H13 | Station 0.4.0+ gestures (triple vs double click; 6 s hold vs 1–6 s cart sync) | open | after reflashing |
+| H14 | Counted-session tap pause long enough | open | now a setting, "Tag tap pause" 1–4 s (firmware 0.4.1) |
+| H15 | Camera "Scan barcode" over HTTPS | open | |
+
 **v0.4.4, fixes for 0.4.3's known gaps 7.1 and 7.2**:
 - **Tag allowance** (gap 7.1): `allowances` table (product, units, booked_at, source); filled by stock-take Apply (counted units), Not tagging (booked units) and Grocy-only Tag them (topped up to the untagged count). `Store.apply_arrival` / `_add_for_present` use one unit on the **first arrival of a newly linked tag** (`links.fresh`), journaling a done "in stock" add (departure still consumes); at 0, new tags add normally; units expire 7 days after booking. Link-time matching (0.4.3 `booked_match`) removed. 0.4.3 `booked_credits` migrate once into `allowances` (same units and dates; schema 6). Shown on the Pantry row, Tags → "Waiting for tags", and Details: "3 counted units still to tag".
 - **Pantry-only lowering** (gap 7.2): stock-take "Set" (and "gone") lowers with `POST /stock/products/{id}/consume` `{amount, location_id: Pantry, spoiled: false}`; raising stays an inventory correction. If the Pantry holds less than the review's drop, only that is consumed; the row records `shortfall` and `elsewhere` and shows "Grocy still shows N in other locations".
@@ -241,6 +267,8 @@ v0.1.0:
 11. Default `grocy_url` = `http://a0d7b954-grocy`. It requires enabling the Grocy app's port (Grocy's direct server only runs when a host port is set); documented.
 
 ## Open questions
+**Current status (0.4.5): see "Hardware checks (tracked)" in the Summary.** H5 is done, H4 is not needed, H8 is "no, by design"; the rest wait for the hardware. The history below is kept for reference.
+
 Q1–Q3 are resolved in v0.2.0 (above). Q4–Q7 stay as first-run hardware checks (no code changes):
 4. **U107 TX power floor**: JRD-4035/M100 modules often accept only ~18.5–26 dBm. If 15 dBm is rejected, the firmware logs a warning. Confirm on hardware and raise the default if needed.
 5. **U107 Grove TX/RX orientation** (G1/G2) is unverified; swap if no reads.
@@ -271,6 +299,10 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 - U107 needs mounting beside the scanner, antenna facing out (housing doesn't fit; separate ha-kroger-restock PR later).
 
 ## Test results (tests, coverage, property tests, fault injection)
+- **v0.4.5** (393 pytest tests incl. 14 browser tests; ruff, mypy --strict, yamllint clean; firmware host tests pass):
+  - `tests/test_shutdown.py` (4): **a cancel lost inside one tick** (publish_state swallows it once, like the CI hang) → `stop()` finishes in < 3 s and the tick task has ended; **a loop that ignores every cancel** → logged "Background loop didn't end: pantry_hub.stubborn", the rest of the shutdown still runs, `stop()` returns in < 1.5 s (cap 1 s); **a step that never returns** (worker stop) → `stop()` returns at the cap and logs "at: Grocy worker"; **continuous mode without a door sensor** → health warning with the switch-to-door steps.
+  - One-off macOS CI job: `test_just_bought.py` + `test_shutdown.py` ×50.
+  - Firmware host tests: TX power step-up (15 → 16, 18.5 → 19, cap 26; a module accepting ≥ 18.5 dBm ends at 19 after 4 steps).
 - **v0.4.4** (389 pytest tests incl. 14 browser tests; coverage 93%; ruff, mypy --strict, yamllint clean):
   - `tests/test_allowance.py` (8): **allowance of 2: two new tags add nothing, the third adds 1, inside the window**; the cereal example (count 3, Tag N, 2 more linked, all 5 arrive → Grocy 5); **expiry at 7 days** (1 min before: matched; after: the new tag's add is sent; "1 booked unit still to tag"); only a new tag's first arrival uses it (a returning tag adds; a tag linked while present is matched at linking); **Tag them fills it** (topped up, twice → still 2; arrivals add nothing; a 3rd box adds); **migration from 0.4.3** (`booked_credits` → `allowances`, same expiry, once); **lowering with a fridge entry consumes only Pantry stock** (consume with `location_id` 1, `spoiled` false, no inventory call); **Pantry shortfall** (review drop 5, pantry holds 2 → consumed 2, `shortfall` 3, `elsewhere` 2).
   - `tests/test_views_js.py` (3, Node): the review shows "Grocy still shows 2 in other locations" (and nothing extra without other stock); "Waiting for tags" list text.
@@ -380,6 +412,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 | 31 | (v0.4.1, found live) Just bought matched Grocy by Kroger's `upc` (no check digit), missed the existing product and created a duplicate | Heather's HA, Kroger Restock v0.17.2 | use `barcode`, else rebuild the check digit from `upc`; try UPC-A/EAN-13/Kroger forms; create with the printed barcode | `test_upc_without_check_digit_matches_existing_product`, `test_other_forms_of_the_code_match_too`, `test_created_product_gets_the_barcode_with_check_digit` |
 | 32 | (v0.4.3 known gap 7.1) Booked units matched *any* tag of the product for 7 days, so a genuinely new unit tagged in that week was never added | review of 0.4.3 | capped allowance used by the first arrival of newly tagged units | `test_allowance_of_two_then_stock_is_added`, `test_count_three_buy_two_tag_five` |
 | 33 | (v0.4.3 known gap 7.2) Stock-take "Set" lowered a product with a total inventory correction; Grocy could remove units from the fridge / freezer | review of 0.4.3 | consume from the Pantry location only; report the remainder | `test_lowering_consumes_only_pantry_stock`, `test_pantry_shortfall_shown_in_review` |
+| 34 | (v0.4.3, macOS CI on main only) A test teardown hung: `Hub.stop()` waited forever for the timer loop, which kept ticking after its cancellation was lost inside one tick (the call that lost it wasn't identified) | main's Test run for `968b7f4` (macOS job cancelled at 20 min; hang watchdog dump) | stopping flag checked by the loops, cancel repeated every 0.5 s, 10 s overall cap that logs and returns | `test_stop_survives_a_lost_cancel`, `test_stop_is_capped_and_names_the_stuck_loop`, `test_stop_returns_at_the_cap_when_a_step_blocks`; macOS ×50 job |
 
 ## First-run checklist when hardware arrives
 1. Free HA disk space below ~75%; take a backup.
@@ -411,3 +444,4 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 27. (v0.4.2) Update to 0.4.2. Link a product with no Grocy picture: a `pantryhub_<id>.jpg` picture appears (it never did with 0.4.1). Settings → **Fetch missing pictures** fills the rest. In Grocy, look for products 0.4.1 may have duplicated from Just bought (a 13-digit barcode starting with `000`) and merge or delete them. After the next Kroger delivery, **Not tagging** on an item you already have in Grocy adds stock to that product, with no new product.
 28. (v0.4.3) Reflash the station (firmware 0.4.0). **Triple-click**: slow green pulse. Scan something bought elsewhere: green flash, and it appears in Pantry → Just bought (scan it again: ×2). Check the Kroger cart didn't change. Single click: back to Kroger mode. On the phone (HTTPS): Pantry → **Scan barcode**, allow the camera, scan a can. **Stock-take**: hold the button 6 s (slow amber), scan the untagged items, then Tags → **Finish stock-take**, check the numbers, **Set Grocy to the counts**, then **Tag N** a product and check Grocy doesn't go up when the reader sees them.
 29. (v0.4.4) Do a stock-take of one product with a few units in the Pantry and one in the fridge, count fewer than Grocy has, **Set Grocy to the counts**: only Pantry units are consumed (check Grocy's stock journal: consume, Pantry). Then **Tag N** those units plus one newly bought: the counted ones add nothing on their first read, the new one adds 1; Tags → Waiting for tags counts down.
+30. (v0.4.5) Work through the hardware check table (H2–H15) as the UR4, the door sensor and the reflashed station go in. Restart the app from HA once: the log ends with "Stopping Pantry Hub" and the restart takes seconds, never a forced stop.

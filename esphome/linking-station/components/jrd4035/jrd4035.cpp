@@ -81,7 +81,21 @@ void JRD4035Component::loop() {
       }
     } else if (frame.type == ::jrd4035_proto::TYPE_RESPONSE && frame.cmd == ::jrd4035_proto::CMD_SET_POWER) {
       bool ok = !frame.params.empty() && frame.params[0] == 0x00;
-      if (!ok) ESP_LOGW(TAG, "Module rejected TX power %.1f dBm; check its supported range", this->tx_power_);
+      if (ok && this->power_raised_) {
+        ESP_LOGW(TAG, "TX power is %.1f dBm: the lowest the module accepts (configured %.1f dBm)",
+                 this->tx_power_, this->configured_power_);
+        this->power_raised_ = false;  // log once; the raised value is kept
+      } else if (!ok) {
+        float next = ::jrd4035_proto::next_power_after_reject(this->tx_power_);
+        if (next > this->tx_power_) {
+          ESP_LOGW(TAG, "Module rejected TX power %.1f dBm; trying %.1f dBm", this->tx_power_, next);
+          this->tx_power_ = next;
+          this->power_raised_ = true;
+          this->send_(::jrd4035_proto::set_power(this->tx_power_));
+        } else {
+          ESP_LOGW(TAG, "Module rejected TX power %.1f dBm; check its supported range", this->tx_power_);
+        }
+      }
     }
   }
 
