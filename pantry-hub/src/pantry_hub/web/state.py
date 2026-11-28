@@ -287,6 +287,8 @@ async def build_state(hub: Hub) -> dict[str, Any]:
             for n in needs
         ],
         "events": list(reversed(hub.recent_events)),
+        "pictures": _pictures(hub),
+        "just_bought": await _just_bought(hub),
         "resync": _resync(hub),
         "options": {
             "reading_mode": opts.reading_mode,
@@ -314,6 +316,42 @@ def _resync(hub: Hub) -> dict[str, Any] | None:
     }
 
 
+def _pictures(hub: Hub) -> dict[str, Any]:
+    """Kroger Restock product pictures: availability + backfill progress."""
+    pics = hub.pictures
+    if pics is None:
+        return {"available": False, "running": False, "text": None, "versions": {}}
+    p = pics.progress
+    started = p.running or p.finished_at is not None
+    return {
+        "available": pics.available,
+        "running": p.running,
+        "text": p.text() if started else None,
+        "versions": {str(k): v for k, v in pics.versions.items()},
+    }
+
+
+async def _just_bought(hub: Hub) -> dict[str, Any]:
+    """Kroger deliveries to tag, plus the running counted session."""
+    jb = hub.just_bought
+    counted = hub.linking.counted
+    session = None
+    if counted is not None and (
+        not counted.ended or hub.linking.active(counted.station)
+    ):
+        session = counted.progress()
+    if jb is None:
+        return {"available": False, "rows": [], "to_tag": 0, "session": session}
+    rows = await jb.rows()
+    return {
+        "available": jb.available is True,
+        "rows": rows,
+        "to_tag": sum(r["to_tag"] for r in rows if not r["older"]),
+        "station": hub.tag_station(),
+        "session": session,
+    }
+
+
 def _diagnostics(hub: Hub, s: dict[str, Any], door_mode: bool) -> list[list[str]]:
     """Key/value rows for the banner's Details (strings, already formatted)."""
     r = s["reading"]
@@ -329,6 +367,11 @@ def _diagnostics(hub: Hub, s: dict[str, Any], door_mode: bool) -> list[list[str]
         ["Grocy queue", str(s["grocy_queue"])],
         ["MQTT", _yn(mqtt.connected if mqtt else None, unknown="off")],
     ]
+    pics = hub.pictures
+    if pics is None or pics.available is False:
+        rows.append(["Product pictures", "Kroger Restock not found."])
+    elif pics.available:
+        rows.append(["Product pictures", "from Kroger Restock"])
     if door_mode:
         rows += [
             ["Connection", str(r["reader_connection"])],

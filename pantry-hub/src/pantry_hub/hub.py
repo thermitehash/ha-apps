@@ -32,14 +32,17 @@ from .discovery import (
     HA_STATUS_TOPIC,
     LAST_LINK_TOPIC,
     LINKING_SUB,
+    PICTURES_COMMAND_TOPIC,
     RESYNC_COMMAND_TOPIC,
     RESYNC_RESULT_TOPIC,
     STATE_TOPIC,
     SWEEP_COMMAND_TOPIC,
     discovery_payload,
     linking_result_topic,
+    linking_start_topic,
 )
-from .grocy import GrocyError, StockBackend
+from .grocy import GrocyClient, GrocyError, Product, StockBackend
+from .ha_api import HomeAssistantApi, HomeAssistantEvents, rest_url_from_ws
 from .homeassistant import (
     DEAD_PORT_NOTIFICATION_ID,
     READER_CONFIG_NOTIFICATION_ID,
@@ -49,8 +52,10 @@ from .homeassistant import (
     door_candidates,
     fetch_states,
 )
+from .just_bought import EVENT_TYPE, JustBought
 from .linking import LinkingManager, LinkResult, best_before_for
 from .mqtt import MqttLink
+from .pictures import RETRY_DELAYS_S, PictureService
 from .presence import Door, PresenceConfig, PresenceEvent, PresenceMachine
 from .reader import (
     ClientFactory,
@@ -61,7 +66,7 @@ from .reader import (
 )
 from .reader_config import ReaderConfig
 from .reading import Activity, Plan, ReadingConfig, ReadingPlanner
-from .store import Link, Store, iso
+from .store import Link, Received, Store, iso
 from .worker import GrocyWorker
 
 _LOGGER = logging.getLogger(__name__)
@@ -74,6 +79,10 @@ TOUCH_EVERY_S = 30.0
 PROBE_EVERY_S = 60.0
 #: Door mode: connect + ping + disconnect this often while idle.
 PROBE_IDLE_S = 600.0
+#: Just bought housekeeping (expire old rows) this often.
+HOUSEKEEPING_S = 3600.0
+#: Station "Tag them" goes to before any station has been used.
+DEFAULT_STATION = "kroger_scanner"
 
 _COUNTERS = ("last_datagram", "datagrams", "tags", "bad_frames", "dropped_sources")
 
@@ -133,6 +142,10 @@ class Hub:
         probe_every_s: float = PROBE_IDLE_S,
         door_notify_after_s: float = 120.0,
         settings_url: str | None = None,
+        picture_retry_delays: tuple[float, ...] = RETRY_DELAYS_S,
+        picture_spacing_s: float | None = None,
+        counted_idle: float | None = None,
+        ha_backoff_s: float = 2.0,
     ) -> None:
         """Create; call :meth:`start`."""
         door_mode = options.reading_mode == "door"
@@ -230,6 +243,8 @@ class Hub:
             linking_kwargs["tag_timeout"] = tag_timeout
         if rssi_window is not None:
             linking_kwargs["rssi_window"] = rssi_window
+        if counted_idle is not None:
+            linking_kwargs["counted_idle"] = counted_idle
         self.linking = LinkingManager(
             store,
             backend,
@@ -237,9 +252,47 @@ class Hub:
             location_id=options.grocy_location_id,
             on_linked=self._on_linked,
             on_needs_product=self.mark_dirty,
+            on_booked_match=self._on_booked_match,
             clock=wall,
             **linking_kwargs,
         )
+        # Kroger Restock: product pictures + "Just bought" (needs the HA API
+        # and a real Grocy client; skipped silently otherwise).
+        self.ha_api: HomeAssistantApi | None = None
+        self.pictures: PictureService | None = None
+        self.just_bought: JustBought | None = None
+        self.ha_events: HomeAssistantEvents | None = None
+        if ha_token and isinstance(backend, GrocyClient):
+            self.ha_api = HomeAssistantApi(rest_url_from_ws(self.ha_url), ha_token)
+            picture_kwargs: dict[str, Any] = {}
+            if picture_spacing_s is not None:
+                picture_kwargs["spacing_s"] = picture_spacing_s
+            self.pictures = PictureService(
+                backend,
+                self.ha_api,
+                store,
+                clock=wall,
+                retry_delays=picture_retry_delays,
+                on_change=self.mark_dirty,
+                **picture_kwargs,
+            )
+            self.just_bought = JustBought(
+                store,
+                backend,
+                self.ha_api,
+                self.pictures,
+                location_id=options.grocy_location_id,
+                clock=wall,
+                on_change=self.mark_dirty,
+            )
+            self.ha_events = HomeAssistantEvents(
+                self.ha_url,
+                ha_token,
+                EVENT_TYPE,
+                self.just_bought.on_event,
+                on_connect=self._on_ha_events_connect,
+                min_backoff=ha_backoff_s,
+            )
         self.reader = ReaderHealth()
         self.listener: UR4UdpListener | None = None
         self.mqtt: MqttLink | None = None
@@ -249,6 +302,7 @@ class Hub:
                 HA_STATUS_TOPIC,
                 RESYNC_COMMAND_TOPIC,
                 SWEEP_COMMAND_TOPIC,
+                PICTURES_COMMAND_TOPIC,
             ]
             self.mqtt = MqttLink(
                 mqtt_settings,
@@ -348,6 +402,13 @@ class Hub:
             self._loops.append(
                 asyncio.create_task(self._probe_loop(), name="pantry_hub.probe")
             )
+        if self.ha_events is not None:
+            self.ha_events.start()
+            self._loops.append(
+                asyncio.create_task(
+                    self._housekeeping_loop(), name="pantry_hub.housekeeping"
+                )
+            )
         if self.mqtt is not None:
             self.mqtt.start()
         await self.refresh_counts()
@@ -368,6 +429,12 @@ class Hub:
         await asyncio.gather(*events, return_exceptions=True)
         self._loops.clear()
         await self.linking.close()
+        if self.ha_events is not None:
+            await self.ha_events.stop()
+        if self.pictures is not None:
+            await self.pictures.close()
+        if self.ha_api is not None:
+            await self.ha_api.close()
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -815,6 +882,17 @@ class Hub:
             except Exception:
                 _LOGGER.exception("Error in the hub timer")
 
+    async def _housekeeping_loop(self) -> None:
+        while True:
+            try:
+                if self.just_bought is not None:
+                    await self.just_bought.housekeeping()
+                if self.pictures is not None and self.pictures.available is None:
+                    await self.pictures.refresh_available()
+            except Exception:
+                _LOGGER.exception("Error in Just bought housekeeping")
+            await asyncio.sleep(HOUSEKEEPING_S)
+
     def _track_reader_traffic(self, now: float) -> None:
         if self.listener is None:
             return
@@ -982,7 +1060,11 @@ class Hub:
                 await self.linking.handle_barcode(station, payload)
             elif kind == "tag":
                 await self.linking.handle_tag(station, payload)
-            return  # our own "result" messages come back here too
+            return  # our own "result" / "start" messages come back here too
+        if topic == PICTURES_COMMAND_TOPIC:
+            message = self.fetch_missing_pictures()
+            _LOGGER.info("Fetch missing pictures (MQTT): %s", message)
+            return
         if topic == HA_STATUS_TOPIC:
             if payload.strip().lower() == b"online":
                 _LOGGER.info("Home Assistant came online; republishing discovery")
@@ -1010,8 +1092,75 @@ class Hub:
     async def _on_linked(self, link: Link, op_id: int | None) -> None:
         if op_id is not None:
             self.worker.wake()
+        if self.pictures is not None:
+            self.pictures.on_link(link.product_id, link.barcode)
         await self._publish_last_link(link)
         self.mark_dirty()
+
+    def _on_booked_match(self, link: Link) -> None:
+        self.recent_events.append(
+            {
+                "kind": "matched_booked",
+                "epc": link.epc,
+                "product": link.product_name,
+                "product_id": link.product_id,
+                "at": self.wall(),
+                "note": "matched a unit already booked in Grocy; not added again",
+            }
+        )
+        self.mark_dirty()
+
+    # Kroger Restock ------------------------------------------------------------
+
+    async def _on_ha_events_connect(self) -> None:
+        if self.just_bought is not None:
+            await self.just_bought.catch_up()
+
+    def fetch_missing_pictures(self) -> str:
+        """Start the picture backfill (web UI / MQTT); return a message."""
+        if self.pictures is None:
+            return "Product pictures need Kroger Restock and the Home Assistant API"
+        self._spawn(self._backfill(), "pantry_hub.picture_backfill_start")
+        return "Fetching missing pictures"
+
+    async def _backfill(self) -> None:
+        assert self.pictures is not None
+        products = await self.store.linked_products()
+        for row in await self.store.received(include_done=True):
+            if row.grocy_product_id is not None:
+                products.setdefault(row.grocy_product_id, row.upc)
+        if not self.pictures.start_backfill(products):
+            _LOGGER.info("Picture backfill already running")
+
+    def tag_station(self) -> str:
+        """Station a "Tag them" session goes to: the one used last."""
+        return self.linking.last_station or DEFAULT_STATION
+
+    async def tag_received(self, row_id: int) -> str:
+        """Start "Tag them" for a Just bought row; return a message."""
+        if self.just_bought is None:
+            raise ValueError("Kroger Restock is not available")
+        station = self.tag_station()
+        jb = self.just_bought
+
+        async def start(barcode: str, product: Product, row: Received) -> None:
+            async def each(link: Link) -> None:
+                await jb.tagged_one(row.id, link)
+
+            await self.linking.start_counted(
+                station, product, barcode, row.to_tag, on_each=each
+            )
+            if self.mqtt is not None:
+                await self.mqtt.publish(
+                    linking_start_topic(station),
+                    json.dumps({"barcode": barcode, "count": row.to_tag}),
+                    qos=1,
+                    queue=False,
+                )
+
+        product = await jb.tag(row_id, start)
+        self.mark_dirty()
+        return f"Tap each {product.name} on the {station} station"
 
     async def _publish_last_link(self, link: Link) -> None:
         if self.mqtt is None:
@@ -1066,6 +1215,8 @@ class Hub:
             default_best_before_days=product.default_best_before_days,
             station="web",
         )
+        if not in_stock:
+            in_stock = await self.linking.booked_match(link)
         op_id = await self.store.replace_link(
             link,
             location_id=self.options.grocy_location_id,

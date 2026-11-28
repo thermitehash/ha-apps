@@ -285,13 +285,59 @@ isn't in the pantry right now) is skipped. When it leaves, one unit is
 still consumed at the Pantry location. Every later arrival is added
 normally. Off by default.
 
+### Tagging a Kroger delivery (Just bought)
+
+With the **Kroger Restock** integration installed, delivered items show on
+the Pantry tab under **Just bought** ("Just bought · 6 items to tag"), each
+with its picture, size and "×3 of 3 to tag". For each one:
+
+- **Tag them**: the linking station Pantry Hub heard from last (default
+  `kroger_scanner`) pulses blue. Tap one tag at a time on it; the page counts
+  "2 of 3 linked". Tags already linked to that product are skipped. It stops
+  at the count, or 60 s after the last tag (tap **Tag them** again for the
+  rest). The tagged items reach Grocy stock when they go into the pantry,
+  like any linked tag.
+- **Not tagging**: removes the row. With **Add to Grocy stock** ticked (the
+  default) the untagged units are booked in Grocy as a purchase, with the
+  price Kroger reported. If you tag one of them within 7 days anyway, its
+  arrival is matched against that booking (listed in recent events) and not
+  added again.
+
+If Grocy doesn't know the barcode, Pantry Hub creates the product from
+Kroger's name, brand and size (and picture). Rows older than 14 days move
+under **Older** and are deleted after 30 days; nothing is ever booked by
+itself. The card is hidden when Kroger Restock isn't installed. The linking
+station needs firmware 0.3.0 or later.
+
+### Product pictures
+
+When a barcode is linked and its Grocy product has no picture, Pantry Hub
+looks the barcode up in Kroger Restock (`kroger_restock.lookup_product`; only
+the barcode leaves your network), downloads the image (at most 5 MB, 10 s),
+shrinks it to 600 px and saves it in Grocy as `pantryhub_<product id>.jpg`.
+An empty product name, or one that's just the barcode, and an empty
+description ("Brand · size") are filled in; names you typed are kept. It runs
+in the background and retries a few times, so linking is never slowed down.
+
+Pantry Hub only changes products whose picture is empty or one it set itself
+(`pantryhub_…`); pictures you chose in Grocy stay. **Settings → Product
+pictures → Fetch missing pictures** (or `button.pantry_hub_fetch_pictures`)
+goes through every product Pantry Hub has linked, one lookup every 2 seconds,
+showing progress like "12 of 40, 3 not found". A product Kroger has no
+picture for isn't asked about again for 30 days.
+
+Without Kroger Restock nothing is looked up, and Details shows "Product
+pictures: Kroger Restock not found."
+
 ### MQTT topics
 
 | Topic | Direction | Payload |
 |---|---|---|
 | `pantry_hub/linking/<station>/barcode` | station → hub | `{"barcode": "...", "ts": ..., "in_stock"?: true}` |
 | `pantry_hub/linking/<station>/tag` | station → hub | `{"epc": "...", "rssi": -45.2, "ts": ..., "in_stock"?: true}` |
-| `pantry_hub/linking/<station>/result` | hub → station | `{"status": "linked\|unknown_barcode\|tag_already_linked\|timeout\|error", "product": "...", "message": "..."}` |
+| `pantry_hub/linking/<station>/result` | hub → station | `{"status": "linked\|unknown_barcode\|tag_already_linked\|timeout\|error", "product": "...", "message": "..."}`; in a counted session also `"count", "linked", "remaining"` |
+| `pantry_hub/linking/<station>/start` | hub → station | `{"barcode": "...", "count": 3}`: start a counted session (Tag them) |
+| `pantry_hub/pictures/press` | anyone → hub | fetch missing pictures |
 | `pantry_hub/events` | hub → anyone | `{"event_type": "arrived\|departed", "epc", "product", "product_id", "linked", "ts"}` |
 | `pantry_hub/state` | hub → HA (retained) | sensor values |
 | `pantry_hub/status` | hub → HA (retained, LWT) | `online` / `offline` |
@@ -311,6 +357,7 @@ normally. Off by default.
 | `sensor.pantry_hub_last_sweep` | Time of the last completed sweep. |
 | `button.pantry_hub_sweep_now` | Sweep now (door mode). During a continuous window it sweeps, then continuous reading resumes. |
 | `button.pantry_hub_resync` | Compare and report. Resync never changes Grocy; fix differences there. |
+| `button.pantry_hub_fetch_pictures` | Fetch missing product pictures from Kroger Restock. |
 
 Stock levels come from the Grocy integration (HACS). Pantry Hub doesn't
 duplicate them.
@@ -329,7 +376,8 @@ a wide screen):
   MQTT, sweep counters, reads per antenna port). Then the door and when the
   pantry was last checked (**Check now** checks immediately), and what's in
   the pantry, grouped by Grocy product with a count and "since Tue". Product
-  pictures come from Grocy when it has one.
+  pictures come from Grocy when it has one. With Kroger Restock, **Just
+  bought** above it lists deliveries to tag.
 - **Tags**: tags that aren't linked yet (**How to link** shows the linking
   station steps, and a field to link by barcode or Grocy product id written as
   `#12`, optionally "already in stock"; **Forget**), linked tags (search; the
@@ -337,8 +385,8 @@ a wide screen):
   or **Consume now** / **Dismiss** for one waiting for review), and barcodes
   that need a Grocy product.
 - **Settings**: the door sensor picker and check (above), the reader options
-  that matter (change them in the app's Configuration tab), and **Compare
-  with Grocy** (the resync report).
+  that matter (change them in the app's Configuration tab), **Compare
+  with Grocy** (the resync report) and **Fetch missing pictures**.
 
 It follows the phone's light or dark mode, and is only reachable through Home
 Assistant ingress.

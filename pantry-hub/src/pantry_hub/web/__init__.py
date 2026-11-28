@@ -27,6 +27,7 @@ import aiohttp
 from aiohttp import web
 
 from ..grocy import GrocyError
+from ..just_bought import JustBoughtError
 from ..linking import normalize_epc
 from .state import build_state
 
@@ -45,8 +46,13 @@ STATIC_TYPES = {
     ".css": "text/css",
     ".svg": "image/svg+xml",
 }
-#: Product pictures are fetched from Grocy at most this often per product.
+#: Product pictures are fetched from Grocy at most this often per product
+#: (a picture Pantry Hub sets itself is shown at once: its version changes).
 PICTURE_TTL_S = 3600.0
+#: "No picture" answers are re-checked sooner (a picture added in Grocy).
+NO_PICTURE_TTL_S = 300.0
+#: Browser cache for a picture; the page adds ``?v=<version>`` to bust it.
+PICTURE_CACHE = "private, max-age=86400"
 ActionFn = Callable[[dict[str, str]], Awaitable[str]]
 
 
@@ -69,8 +75,8 @@ async def no_store(
         raise
     if request.path.startswith("/static/") and response.status == 200:
         response.headers["Cache-Control"] = STATIC_CACHE
-    elif request.path.startswith("/api/product-picture/") and response.status == 200:
-        response.headers["Cache-Control"] = "private, max-age=3600"
+    elif request.path.startswith("/api/picture/") and response.status == 200:
+        response.headers["Cache-Control"] = PICTURE_CACHE
     else:
         response.headers["Cache-Control"] = "no-store"
         response.headers.setdefault("Pragma", "no-cache")
@@ -97,7 +103,7 @@ class WebUI:
         r.add_get("/api/state", self.api_state)
         r.add_get("/api/door", self.api_door)
         r.add_get("/api/door-candidates", self.api_door_candidates)
-        r.add_get("/api/product-picture/{product_id}", self.api_product_picture)
+        r.add_get("/api/picture/{product_id}", self.api_picture)
         actions: dict[str, ActionFn] = {
             "/unlink": self._unlink,
             "/relink": self._relink,
@@ -110,11 +116,16 @@ class WebUI:
             "/sweep": self._sweep,
             "/settings/door": self._set_door,
             "/settings/inverted": self._set_inverted,
+            "/pictures/fetch": self._fetch_pictures,
+            "/bought/tag": self._bought_tag,
+            "/bought/skip": self._bought_skip,
         }
         for path, action in actions.items():
             r.add_post(path, self._action(action))
         self._runner: web.AppRunner | None = None
-        self._pictures: dict[int, tuple[float, tuple[bytes, str] | None]] = {}
+        self._pictures: dict[
+            tuple[int, int], tuple[float, tuple[bytes, str] | None]
+        ] = {}
 
     async def start(self, host: str, port: int) -> None:
         """Serve on ``host:port``."""
@@ -212,8 +223,8 @@ class WebUI:
             }
         )
 
-    async def api_product_picture(self, request: web.Request) -> web.Response:
-        """Proxy the Grocy product picture (thumbnail); 404 if there is none."""
+    async def api_picture(self, request: web.Request) -> web.Response:
+        """Proxy the Grocy product picture (thumbnail); 204 if there is none."""
         try:
             product_id = int(request.match_info["product_id"])
         except ValueError as err:
@@ -226,10 +237,14 @@ class WebUI:
         return web.Response(body=body, content_type=ctype)
 
     async def _picture(self, product_id: int) -> tuple[bytes, str] | None:
-        cached = self._pictures.get(product_id)
+        pics = self.hub.pictures
+        key = (product_id, pics.versions.get(product_id, 0) if pics else 0)
+        cached = self._pictures.get(key)
         now = time.monotonic()
-        if cached is not None and now - cached[0] < PICTURE_TTL_S:
-            return cached[1]
+        if cached is not None:
+            ttl = PICTURE_TTL_S if cached[1] is not None else NO_PICTURE_TTL_S
+            if now - cached[0] < ttl:
+                return cached[1]
         fetch = getattr(self.hub.backend, "product_picture", None)
         picture: tuple[bytes, str] | None = None
         if fetch is not None:
@@ -237,7 +252,9 @@ class WebUI:
                 picture = await fetch(product_id)
             except GrocyError as err:
                 _LOGGER.debug("No picture for product %d: %s", product_id, err)
-        self._pictures[product_id] = (now, picture)
+        if len(self._pictures) > 1000:
+            self._pictures.clear()
+        self._pictures[key] = (now, picture)
         return picture
 
     # Actions ---------------------------------------------------------------------
@@ -265,7 +282,7 @@ class WebUI:
                 )
             try:
                 message = await action(form)
-            except (GrocyError, ValueError) as err:
+            except (GrocyError, ValueError, JustBoughtError) as err:
                 return web.json_response({"ok": False, "message": f"Failed: {err}"})
             return web.json_response({"ok": True, "message": message})
 
@@ -339,6 +356,29 @@ class WebUI:
         message = await self.hub.set_door_entity(form.get("door_entity", ""))
         if "inverted" in form:
             await self._set_inverted(form)
+        return message
+
+    async def _fetch_pictures(self, form: dict[str, str]) -> str:
+        return self.hub.fetch_missing_pictures()
+
+    @staticmethod
+    def _row_id(form: dict[str, str]) -> int:
+        try:
+            return int(form.get("row", ""))
+        except ValueError as err:
+            raise ValueError("unknown Just bought item") from err
+
+    async def _bought_tag(self, form: dict[str, str]) -> str:
+        return await self.hub.tag_received(self._row_id(form))
+
+    async def _bought_skip(self, form: dict[str, str]) -> str:
+        if self.hub.just_bought is None:
+            raise ValueError("Kroger Restock is not available")
+        add = form.get("add_stock", "on").strip().lower() in ("on", "true", "1")
+        message = await self.hub.just_bought.not_tagging(
+            self._row_id(form), add_stock=add
+        )
+        self.hub.mark_dirty()
         return message
 
     async def _set_inverted(self, form: dict[str, str]) -> str:

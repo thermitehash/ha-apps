@@ -247,3 +247,10 @@ details[open] > summary::before { content: "▾"; }
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 .title .sub { font-weight: 400; }
+
+/* Just bought (Kroger Restock) */
+.tag-count { font-size: var(--fs-sm, 14px); color: var(--muted); white-space: nowrap; }
+.list > .item.older { opacity: .6; }
+.older-group summary { cursor: pointer; color: var(--muted); padding: var(--sp-2) 0; }
+.session { border-radius: var(--r-sm); background: var(--ph-sage-tint); padding: 14px; display: flex; flex-direction: column; gap: 4px; }
+.session .title { font-weight: 600; }

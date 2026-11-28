@@ -90,6 +90,8 @@ TOP_KEYS = {
     "failed_ops",
     "needs_product",
     "events",
+    "pictures",
+    "just_bought",
     "resync",
     "options",
     "diagnostics",

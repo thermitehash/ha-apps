@@ -5,6 +5,7 @@ MQTT topics (prefix ``pantry_hub/``)::
     linking/<station_id>/barcode  ← {"barcode": "...", "ts": ...}
     linking/<station_id>/tag      ← {"epc": "...", "rssi": -45.2, "ts": ...}
     linking/<station_id>/result   → {"status": "...", "product": "...", "message": "..."}
+    linking/<station_id>/start    → {"barcode": "...", "count": 3}   (counted session)
 
 Either message may carry ``"in_stock": true``: Grocy already counts this
 unit, so the add of its current (or next) pantry arrival is skipped.
@@ -13,7 +14,17 @@ unit, so the add of its current (or next) pantry arrival is skipped.
 ``timeout`` or ``error``.
 
 Linking never changes Grocy stock: if the item then goes into the pantry, the
-normal arrival flow adds it (no double counting).
+normal arrival flow adds it (no double counting). One exception keeps that
+true: a unit booked in Grocy without a tag ("Just bought" → Not tagging) and
+then linked within a week is marked "already in stock", so its arrival is
+matched against the booked unit instead of adding again.
+
+A *counted* session (Just bought → Tag them) is started by the hub, not by a
+barcode scan: the hub publishes ``start`` so the station enters link mode,
+then links one tag per tap up to ``count``. Each result then carries
+``count``, ``linked`` and ``remaining``; the station keeps scanning while
+``remaining`` > 0. The session ends at ``count`` or 60 s after the last tap.
+Tags already linked to the product are skipped (not counted).
 """
 
 from __future__ import annotations
@@ -35,6 +46,10 @@ from .store import Link, Store
 _LOGGER = logging.getLogger(__name__)
 
 TAG_TIMEOUT_S = 15.0
+#: Counted session: seconds without a tap before it ends.
+COUNTED_IDLE_S = 60.0
+#: A unit booked without a tag matches a link made within this many seconds.
+BOOKED_MATCH_S = 7 * 86400.0
 RSSI_WINDOW_S = 1.0
 STATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 EPC_RE = re.compile(r"^(?:[0-9A-F]{4}){1,31}$")
@@ -52,6 +67,9 @@ class LinkResult:
     product: str = ""
     barcode: str = ""
     epc: str = ""
+    #: Counted session only: units to link and units linked so far.
+    count: int | None = None
+    linked: int = 0
 
     def payload(self) -> dict[str, Any]:
         """JSON-able dict."""
@@ -64,6 +82,10 @@ class LinkResult:
             out["barcode"] = self.barcode
         if self.epc:
             out["epc"] = self.epc
+        if self.count is not None:
+            out["count"] = self.count
+            out["linked"] = self.linked
+            out["remaining"] = max(self.count - self.linked, 0)
         return out
 
 
@@ -77,6 +99,38 @@ class _Session:
     window_opened: float | None = None
     in_stock: bool = False
     task: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
+class _Counted:
+    """Counted session: link up to ``count`` tags to one product."""
+
+    station: str
+    barcode: str
+    product: Product
+    count: int
+    last_tap: float  # loop time
+    on_each: Callable[[Link], Awaitable[None]] | None = None
+    linked: int = 0
+    skipped: int = 0
+    tags: dict[str, float | None] = field(default_factory=dict)
+    first_tag: asyncio.Event = field(default_factory=asyncio.Event)
+    window_opened: float | None = None
+    task: asyncio.Task[None] | None = None
+    ended: str = ""
+
+    def progress(self) -> dict[str, Any]:
+        """For the web UI: ``2 of 3 linked``."""
+        return {
+            "station": self.station,
+            "barcode": self.barcode,
+            "product": self.product.name,
+            "count": self.count,
+            "linked": self.linked,
+            "skipped": self.skipped,
+            "text": f"{self.linked} of {self.count} linked",
+            "ended": self.ended,
+        }
 
 
 def normalize_epc(raw: object) -> str | None:
@@ -102,6 +156,7 @@ def _decode(payload: bytes) -> dict[str, Any] | None:
 
 PublishFn = Callable[[str, LinkResult], Awaitable[None]]
 LinkedFn = Callable[[Link, int | None], Awaitable[None]]
+MatchedFn = Callable[[Link], None]
 
 
 class LinkingManager:
@@ -119,6 +174,8 @@ class LinkingManager:
         clock: Callable[[], float] = time.time,
         tag_timeout: float = TAG_TIMEOUT_S,
         rssi_window: float = RSSI_WINDOW_S,
+        counted_idle: float = COUNTED_IDLE_S,
+        on_booked_match: MatchedFn | None = None,
     ) -> None:
         """Create."""
         self.store = store
@@ -130,9 +187,31 @@ class LinkingManager:
         self.clock = clock
         self.tag_timeout = tag_timeout
         self.rssi_window = rssi_window
-        self._sessions: dict[str, _Session] = {}
+        self.counted_idle = counted_idle
+        self.on_booked_match = on_booked_match
+        self._sessions: dict[str, _Session | _Counted] = {}
         #: Most recent successful link (for ``sensor.pantry_hub_last_link``).
         self.last_link: Link | None = None
+        #: Station that last sent a barcode or tag (where "Tag them" goes).
+        self.last_station: str | None = None
+        #: Last counted session (kept after it ends, for "2 of 3 linked").
+        self.counted: _Counted | None = None
+
+    async def booked_match(self, link: Link) -> bool:
+        """Use a unit booked without a tag for ``link``'s product, if any."""
+        if not await self.store.take_booked_credit(
+            link.product_id, self.clock(), BOOKED_MATCH_S
+        ):
+            return False
+        _LOGGER.info(
+            "Tag %s matched a %s unit already booked in Grocy: its arrival "
+            "won't add stock again",
+            link.epc,
+            link.product_name,
+        )
+        if self.on_booked_match is not None:
+            self.on_booked_match(link)
+        return True
 
     def active(self, station: str) -> bool:
         """Whether ``station`` has a session waiting for a tag."""
@@ -173,6 +252,7 @@ class LinkingManager:
             )
             return
         barcode = barcode.strip()
+        self.last_station = station
         old = self._sessions.pop(station, None)
         if old is not None and old.task is not None:
             old.task.cancel()
@@ -199,18 +279,17 @@ class LinkingManager:
                 station, LinkResult("error", "Bad tag message from the station")
             )
             return
+        self.last_station = station
         session = self._sessions.get(station)
         if session is None:
             await self._result(
                 station, LinkResult("error", "Scan a barcode first", epc=epc)
             )
             return
-        raw_rssi = data.get("rssi") if data else None
-        rssi = (
-            float(raw_rssi)
-            if isinstance(raw_rssi, int | float) and not isinstance(raw_rssi, bool)
-            else None
-        )
+        if isinstance(session, _Counted):
+            self._collect(session, epc, data)
+            return
+        rssi = self._rssi(data)
         if _in_stock(data):
             session.in_stock = True
         now = self.clock()
@@ -226,6 +305,175 @@ class LinkingManager:
             prev = session.tags[epc]
             if rssi is not None and (prev is None or rssi > prev):
                 session.tags[epc] = rssi
+
+    @staticmethod
+    def _rssi(data: dict[str, Any] | None) -> float | None:
+        raw = data.get("rssi") if data else None
+        return (
+            float(raw)
+            if isinstance(raw, int | float) and not isinstance(raw, bool)
+            else None
+        )
+
+    def _collect(self, s: _Counted, epc: str, data: dict[str, Any] | None) -> None:
+        """Gather one tap's reads (strongest RSSI within the window wins)."""
+        now = asyncio.get_running_loop().time()
+        rssi = self._rssi(data)
+        if s.window_opened is None:
+            s.window_opened = now
+            s.first_tag.set()
+        elif now - s.window_opened > self.rssi_window:
+            return
+        prev = s.tags.get(epc)
+        if epc not in s.tags or (rssi is not None and (prev is None or rssi > prev)):
+            s.tags[epc] = rssi
+
+    # Counted sessions ------------------------------------------------------------
+
+    async def start_counted(
+        self,
+        station: str,
+        product: Product,
+        barcode: str,
+        count: int,
+        *,
+        on_each: Callable[[Link], Awaitable[None]] | None = None,
+    ) -> None:
+        """Link up to ``count`` tags to ``product`` at ``station``.
+
+        Replaces any session on that station. The caller tells the station to
+        enter link mode (``linking/<station>/start``).
+        """
+        if not STATION_ID_RE.fullmatch(station):
+            raise ValueError(f"invalid station id {station!r}")
+        if count < 1:
+            raise ValueError("count must be at least 1")
+        old = self._sessions.pop(station, None)
+        if old is not None and old.task is not None:
+            old.task.cancel()
+        s = _Counted(
+            station=station,
+            barcode=barcode,
+            product=product,
+            count=count,
+            last_tap=asyncio.get_running_loop().time(),
+            on_each=on_each,
+        )
+        self._sessions[station] = s
+        self.counted = s
+        s.task = asyncio.create_task(
+            self._run_counted(s), name=f"pantry_hub.link_counted.{station}"
+        )
+
+    def _counted_result(
+        self, s: _Counted, status: Status, message: str, epc: str = ""
+    ) -> LinkResult:
+        return LinkResult(
+            status,
+            message,
+            product=s.product.name,
+            barcode=s.barcode,
+            epc=epc,
+            count=s.count,
+            linked=s.linked,
+        )
+
+    async def _run_counted(self, s: _Counted) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            while s.linked < s.count:
+                remaining = self.counted_idle - (loop.time() - s.last_tap)
+                try:
+                    async with asyncio.timeout(max(remaining, 0.0)):
+                        await s.first_tag.wait()
+                except TimeoutError:
+                    s.ended = "timeout"
+                    await self._result(
+                        s.station,
+                        self._counted_result(
+                            s,
+                            "timeout",
+                            f"No tag for {self.counted_idle:g} s: "
+                            f"{s.linked} of {s.count} linked",
+                        ),
+                    )
+                    return
+                await asyncio.sleep(self.rssi_window)
+                tags, s.tags = s.tags, {}
+                s.first_tag.clear()
+                s.window_opened = None
+                s.last_tap = loop.time()
+                await self._counted_tap(s, self.choose(tags))
+            s.ended = "done"
+        except asyncio.CancelledError:
+            s.ended = s.ended or "cancelled"
+            raise
+        except Exception as err:
+            s.ended = "error"
+            _LOGGER.exception("Counted linking failed on %s", s.station)
+            await self._result(
+                s.station, self._counted_result(s, "error", f"Internal error: {err}")
+            )
+        finally:
+            if self._sessions.get(s.station) is s:
+                del self._sessions[s.station]
+
+    async def _counted_tap(self, s: _Counted, epc: str) -> None:
+        existing = await self.store.get_link(epc)
+        if existing is not None:
+            s.skipped += 1
+            same = existing.product_id == s.product.id
+            text = (
+                f"Already linked to {existing.product_name}; skipped"
+                if same
+                else f"Tag is linked to {existing.product_name}; skipped"
+            )
+            await self._result(
+                s.station,
+                self._counted_result(
+                    s,
+                    "tag_already_linked",
+                    f"{text} ({s.linked} of {s.count} linked)",
+                    epc,
+                ),
+            )
+            return
+        link = Link(
+            epc=epc,
+            product_id=s.product.id,
+            product_name=s.product.name,
+            linked_at=self.clock(),
+            barcode=s.barcode,
+            default_best_before_days=s.product.default_best_before_days,
+            station=s.station,
+        )
+        in_stock = await self.booked_match(link)
+        created, op_id = await self.store.create_link(
+            link,
+            location_id=self.location_id,
+            best_before=best_before_for(link, self.clock()),
+            in_stock=in_stock,
+        )
+        if not created:  # pragma: no cover - linked between the check and here
+            s.skipped += 1
+            return
+        s.linked += 1
+        self.last_link = link
+        await self._result(
+            s.station,
+            self._counted_result(
+                s,
+                "linked",
+                f"Linked {s.linked} of {s.count}: {s.product.name}",
+                epc,
+            ),
+        )
+        if self.on_linked is not None:
+            await self.on_linked(link, op_id)
+        if s.on_each is not None:
+            await s.on_each(link)
+
+    # Barcode sessions --------------------------------------------------------------
 
     async def _run(self, session: _Session) -> None:
         station, barcode = session.station, session.barcode
@@ -331,11 +579,12 @@ class LinkingManager:
             default_best_before_days=product.default_best_before_days,
             station=station,
         )
+        in_stock = session.in_stock or await self.booked_match(link)
         created, op_id = await self.store.create_link(
             link,
             location_id=self.location_id,
             best_before=best_before_for(link, self.clock()),
-            in_stock=session.in_stock,
+            in_stock=in_stock,
         )
         if not created:
             again = await self.store.get_link(epc)
@@ -357,11 +606,7 @@ class LinkingManager:
             LinkResult(
                 "linked",
                 f"Linked to {product.name}"
-                + (
-                    " (already in stock: no add for this arrival)"
-                    if session.in_stock
-                    else ""
-                ),
+                + (" (already in stock: no add for this arrival)" if in_stock else ""),
                 product=product.name,
                 barcode=barcode,
                 epc=epc,

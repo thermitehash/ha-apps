@@ -26,6 +26,9 @@ class FakeProduct:
     default_best_before_days: int = 0
     #: PNG bytes served as the product picture (None: no picture).
     picture: bytes | None = None
+    description: str = ""
+    #: picture_file_name; defaults to product-<id>.png when ``picture`` is set.
+    picture_file_name: str | None = None
 
 
 @dataclass
@@ -59,6 +62,9 @@ class FakeGrocy:
         self._runner: web.AppRunner | None = None
         self.url = ""
         self.down = False
+        #: Uploaded product picture files by name.
+        self.files: dict[str, bytes] = {}
+        self.quantity_units = [{"id": 2, "name": "Piece"}]
 
     # Setup -----------------------------------------------------------------
 
@@ -93,6 +99,13 @@ class FakeGrocy:
         r.add_get("/api/stock/products/{id}", self.product)
         r.add_get("/api/stock/products/{id}/entries", self.product_entries)
         r.add_get("/api/files/productpictures/{name}", self.picture)
+        r.add_put("/api/files/productpictures/{name}", self.put_picture)
+        r.add_get("/api/objects/products/{id}", self.product_object)
+        r.add_put("/api/objects/products/{id}", self.update_product)
+        r.add_post("/api/objects/products", self.create_product)
+        r.add_post("/api/objects/product_barcodes", self.create_barcode)
+        r.add_get("/api/objects/product_barcodes", self.list_barcodes)
+        r.add_get("/api/objects/quantity_units", self.units)
         r.add_post("/api/stock/products/{id}/add", self.add)
         r.add_post("/api/stock/products/{id}/consume", self.consume)
         self._runner = web.AppRunner(app, access_log=None)
@@ -114,7 +127,12 @@ class FakeGrocy:
 
     @web.middleware
     async def _mw(self, request: web.Request, handler: Any) -> web.StreamResponse:
-        body = await request.json() if request.can_read_body else None
+        if not request.can_read_body:
+            body = None
+        elif request.content_type == "application/json":
+            body = await request.json()
+        else:
+            body = await request.read()
         self.calls.append((request.method, request.path, body))
         if self.down:
             raise web.HTTPServiceUnavailable(text="down")
@@ -152,7 +170,8 @@ class FakeGrocy:
             "id": p.id,
             "name": p.name,
             "default_best_before_days": p.default_best_before_days,
-            "picture_file_name": f"product-{p.id}.png" if p.picture else None,
+            "picture_file_name": FakeGrocy.picture_name(p),
+            "description": p.description,
         }
 
     # Handlers --------------------------------------------------------------
@@ -191,15 +210,71 @@ class FakeGrocy:
             {"product": self._pjson(p), "stock_amount": self.amount(p.id)}
         )
 
+    @staticmethod
+    def picture_name(p: FakeProduct) -> str | None:
+        if p.picture_file_name is not None:
+            return p.picture_file_name
+        return f"product-{p.id}.png" if p.picture else None
+
     async def picture(self, request: web.Request) -> web.Response:
         import base64
 
         name = base64.b64decode(request.match_info["name"]).decode()
+        assert request.query.get("force_serve_as") == "picture"
+        if name in self.files:
+            return web.Response(body=self.files[name], content_type="image/jpeg")
         for p in self.products.values():
-            if p.picture is not None and name == f"product-{p.id}.png":
-                assert request.query.get("force_serve_as") == "picture"
+            if p.picture is not None and name == self.picture_name(p):
                 return web.Response(body=p.picture, content_type="image/png")
         return web.Response(status=404)
+
+    async def put_picture(self, request: web.Request) -> web.Response:
+        import base64
+
+        name = base64.b64decode(request.match_info["name"]).decode()
+        body = request[BODY]
+        assert isinstance(body, bytes) and body
+        self.files[name] = body
+        return web.Response(status=204)
+
+    async def product_object(self, request: web.Request) -> web.Response:
+        return web.json_response(self._pjson(self._pid(request)))
+
+    async def update_product(self, request: web.Request) -> web.Response:
+        p = self._pid(request)
+        body: Any = request[BODY]
+        for key, value in body.items():
+            if key == "name":
+                p.name = value
+            elif key == "description":
+                p.description = value
+            elif key == "picture_file_name":
+                p.picture_file_name = value
+        return web.Response(status=204)
+
+    async def create_product(self, request: web.Request) -> web.Response:
+        body: Any = request[BODY]
+        assert body["qu_id_stock"] == self.quantity_units[0]["id"]
+        p = self.add_product(str(body["name"]))
+        p.description = str(body.get("description", ""))
+        return web.json_response({"created_object_id": p.id})
+
+    async def create_barcode(self, request: web.Request) -> web.Response:
+        body: Any = request[BODY]
+        self.products[int(body["product_id"])].barcodes.append(str(body["barcode"]))
+        return web.json_response({"created_object_id": 1})
+
+    async def list_barcodes(self, request: web.Request) -> web.Response:
+        query = request.query.get("query[]", "")
+        assert query.startswith("product_id=")
+        p = self.products.get(int(query.split("=", 1)[1]))
+        rows = [] if p is None else p.barcodes
+        return web.json_response(
+            [{"product_id": p.id, "barcode": b} for b in rows] if p else []
+        )
+
+    async def units(self, request: web.Request) -> web.Response:
+        return web.json_response(self.quantity_units)
 
     async def product_entries(self, request: web.Request) -> web.Response:
         p = self._pid(request)

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.1
+
+Needs the **Kroger Restock** integration for the new parts; without it
+Pantry Hub works as before (Details says "Product pictures: Kroger Restock
+not found.").
+
+- **Product pictures**: when you link a barcode (station or web UI) and the
+  Grocy product has no picture, Pantry Hub asks Kroger Restock
+  (`kroger_restock.lookup_product`, only the barcode is sent), downloads the
+  image, resizes it (600 px, JPEG) and stores it in Grocy as
+  `pantryhub_<id>.jpg`. An empty product name or description is filled in
+  too. Linking never waits for it; failures are retried in the background.
+  Pictures you set yourself are never touched.
+- **Fetch missing pictures** in Settings (and `button.pantry_hub_fetch_pictures`
+  / `pantry_hub/pictures/press`): looks up every product Pantry Hub knows,
+  one every 2 s, showing "12 of 40, 3 not found". Products Kroger has no
+  picture for are skipped for 30 days.
+- 40 px thumbnails in Pantry rows and linked tags, with a neutral icon when
+  there's no picture.
+- **Just bought**: Kroger deliveries (`kroger_restock_received` events, with
+  a catch-up at start and after reconnects) show above "In the pantry" as
+  "Just bought · 6 items to tag". **Tag them** puts the linking station into
+  a counted link session (blue pulse; one tag per tap, "2 of 3 linked";
+  already-linked tags are skipped; ends at the count or after 60 s). **Not
+  tagging** removes the row and, with "Add to Grocy stock" (default), books
+  the untagged units as a Grocy purchase with their price. If one of those
+  units is tagged within 7 days, its pantry arrival doesn't add it again.
+  Unknown barcodes get a Grocy product from Kroger's name, brand, size and
+  picture. Rows fade into "Older" after 14 days and go after 30; nothing is
+  ever booked automatically.
+- Linking station firmware 0.3.0: accepts `pantry_hub/linking/<station>/start`
+  `{"barcode", "count"}` for counted sessions. Reflash to use Tag them.
+- The picture route is now `GET /api/picture/<id>` (cached for a day; the
+  page adds a version so a new picture shows at once).
+
 ## 0.4.0
 
 - **No more stale page**: opening Pantry Hub from the sidebar shows current
