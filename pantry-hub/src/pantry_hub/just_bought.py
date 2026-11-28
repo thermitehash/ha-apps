@@ -494,7 +494,7 @@ class JustBought:
         except GrocyError as err:
             await self.store.reopen_received(row.id)
             raise JustBoughtError(f"Grocy refused the purchase: {err}") from err
-        await self.store.add_booked_credit(product.id, units, self.clock())
+        await self.store.add_allowance(product.id, units, self.clock(), "not_tagging")
         _LOGGER.info(
             "Booked %d × %s in Grocy without tags (matched if tagged within 7 days)",
             units,

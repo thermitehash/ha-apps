@@ -11,8 +11,7 @@ from typing import Any
 import pytest
 
 from pantry_hub.just_bought import OLDER_AFTER_S, PURGE_AFTER_S, Item
-from pantry_hub.linking import BOOKED_MATCH_S
-from pantry_hub.store import Link
+from pantry_hub.store import ALLOWANCE_S, Link
 
 from .conftest import BrokerHandle, FakeClock, eventually
 from .fake_grocy import FakeGrocy
@@ -393,7 +392,7 @@ async def test_not_tagging_books_purchase_and_later_tag_does_not_double_count(
     assert grocy.amount(beans.id) == 3
     assert await rows(rig) == []
     assert rig.store is not None
-    assert await rig.store.booked_credits() == {beans.id: 3}
+    assert await rig.store.allowance_units(rig.clock()) == {beans.id: 3}
     # Two days later one of those cans gets a tag at the station …
     clock.advance(2 * 86400)
     await observer.publish("pantry_hub/linking/kitchen/barcode", {"barcode": BEANS})
@@ -401,26 +400,24 @@ async def test_not_tagging_books_purchase_and_later_tag_does_not_double_count(
     await observer.publish("pantry_hub/linking/kitchen/tag", {"epc": EPCS[0]})
     res = "pantry_hub/linking/kitchen/result"
     await eventually(lambda: observer.last(res) is not None)
-    assert "already in stock" in observer.last(res)["message"]
+    # (0.4.4: matched on its first arrival, not when linked.)
+    assert observer.last(res)["message"] == "Linked to Beans"
+    assert await rig.store.allowance_units(rig.clock()) == {beans.id: 3}
     # … and goes into the pantry: matched, not added again.
     await rig.arrive(EPCS[0])
     await rig.idle()
     assert grocy.amount(beans.id) == 3
-    assert await rig.store.booked_credits() == {beans.id: 2}
-    assert rig.h.recent_events[0]["kind"] == "matched_booked"
+    assert await rig.store.allowance_units(rig.clock()) == {beans.id: 2}
+    assert any(e["kind"] == "matched_booked" for e in rig.h.recent_events)
     # A second can, tagged from the web UI: matched too.
     await rig.h.relink(EPCS[1], barcode=BEANS)
     await rig.arrive(EPCS[1])
     await rig.idle()
     assert grocy.amount(beans.id) == 3
-    assert await rig.store.booked_credits() == {beans.id: 1}
-    # After 7 days the last booked unit no longer matches: a new tag is a
-    # normal new unit whose arrival adds stock.
-    clock.advance(BOOKED_MATCH_S)
-    link = await rig.h.relink(EPCS[2], barcode=BEANS)
-    stored = await rig.store.get_link(link.epc)
-    assert stored is not None and stored.skip_add_cycle is None
-    assert await rig.store.booked_credits() == {}
+    assert await rig.store.allowance_units(rig.clock()) == {beans.id: 1}
+    # After 7 days the last booked unit has expired (see test_allowance.py).
+    clock.advance(ALLOWANCE_S)
+    assert await rig.store.allowance_units(rig.clock()) == {}
 
 
 async def test_not_tagging_without_stock_and_partial(
@@ -454,7 +451,7 @@ async def test_not_tagging_without_stock_and_partial(
         assert reply["message"] == "Added 2 × Beans to Grocy stock"
     assert grocy.amount(beans.id) == 2
     assert rig.store is not None
-    assert await rig.store.booked_credits() == {beans.id: 2}
+    assert await rig.store.allowance_units(rig.clock()) == {beans.id: 2}
 
 
 async def test_purchase_refused_keeps_the_row(
@@ -471,7 +468,7 @@ async def test_purchase_refused_keeps_the_row(
     assert reply["ok"] is False and "refused" in reply["message"]
     assert [r["id"] for r in await rows(rig)] == [row_id]
     assert rig.store is not None
-    assert await rig.store.booked_credits() == {}
+    assert await rig.store.allowance_units(rig.clock()) == {}
 
 
 # Kroger Restock v0.17.2 contract (0.4.2) -----------------------------------------
@@ -602,6 +599,6 @@ async def test_rows_from_041_database_get_rebuilt_barcode(tmp_path: Path) -> Non
         assert row.barcode is None and row.upc == BEANS_KROGER
         assert row.grocy_barcode == BEANS
         assert row.source == "kroger"  # 0.4.3 column, NULL in old rows
-        assert await store.get_meta("schema_version") == "5"
+        assert await store.get_meta("schema_version") == "6"
     finally:
         await store.close()

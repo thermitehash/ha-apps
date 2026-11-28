@@ -189,7 +189,7 @@ function boughtRow(r, state, ui) {
   const skip = skipOpen
     ? `<form class="inline-form" data-form="skip" data-epc="${r.id}">
 <label class="check"><input type="checkbox" name="add_stock" checked> Add to Grocy stock</label>
-<p class="sub">${r.to_tag === 1 ? "The untagged item is" : `The ${r.to_tag} untagged items are`} booked as a purchase. If you tag one within a week, it isn’t counted twice.</p>
+<p class="sub">${r.to_tag === 1 ? "The untagged item is" : `The ${r.to_tag} untagged items are`} booked as a purchase. Tagging them later (within 7 days) won’t add them again; more tags than that add stock as usual.</p>
 <div class="actions"><button class="btn primary" type="submit">Remove from list</button><button class="btn" type="button" data-action="skip-toggle" data-row="${r.id}">Cancel</button></div>
 </form>`
     : "";
@@ -284,7 +284,10 @@ export function stocktakeCard(state) {
       const diff = r.difference === 0 ? "—" : signed(r.difference);
       const tags = r.tags ? ` + ${r.tags} tagged` : "";
       const counted = r.scanned ? `${r.counted}${tags}` : `not scanned${tags}`;
-      const note = r.applied === "set" ? "Grocy set" : r.applied === "purchase" ? "Purchase added" : r.applied === "gone" ? "Set to gone" : "";
+      let note = r.applied === "set" ? "Grocy set" : r.applied === "purchase" ? "Purchase added" : r.applied === "gone" ? "Set to gone" : "";
+      if (r.applied && (r.shortfall > 0 || (r.difference < 0 && r.elsewhere > 0))) {
+        note += `${note ? " · " : ""}Grocy still shows ${fmt(r.elsewhere)} in other locations`;
+      }
       const tag =
         applied && r.scanned && r.to_tag > 0
           ? `<button class="btn" type="button" data-action="post" data-path="/stocktake/tag" data-product_id="${r.product_id}">Tag ${r.to_tag}</button>`
@@ -303,6 +306,17 @@ export function stocktakeCard(state) {
 <label class="check"><input type="checkbox" name="gone"> Products I didn't scan are gone</label>
 <div class="actions"><button class="btn primary" type="submit">Apply to Grocy</button><button class="btn" type="button" data-action="post" data-path="/stocktake/close" data-confirm="Cancel this stock-take? Grocy isn't changed.">Cancel</button></div>
 </form></div>`;
+}
+
+export function allowanceList(state, ui) {
+  const list = state.allowances || [];
+  if (!list.length) return "";
+  const rows = list
+    .map(
+      (a) => `<li class="item row">${pic(a.product_id, state, ui)}<span class="grow"><span class="title">${esc(a.name)}</span><span class="sub">${esc(a.text)} · until ${esc(day(a.expires, state.now))}</span></span></li>`,
+    )
+    .join("");
+  return `<div class="section-head"><h2>Waiting for tags · ${list.length}</h2></div><p class="sub">Already in Grocy: the first reader arrival of each newly tagged unit adds nothing, until these run out (or after 7 days). Further tags add stock as usual.</p><ul class="list" role="list">${rows}</ul>`;
 }
 
 export function grocyUntagged(state, ui) {
@@ -342,7 +356,8 @@ export function pantryItems(state, ui) {
   const rows = p.items
     .map((item) => {
       const thumb = pic(item.product_id, state, ui);
-      const since = item.since != null ? `since ${day(item.since, state.now)}` : "";
+      const allowance = (state.allowances || []).find((a) => a.product_id === item.product_id);
+      const since = [item.since != null ? `since ${day(item.since, state.now)}` : "", allowance ? allowance.text : ""].filter(Boolean).join(" · ");
       return `<li class="item row">${thumb}<span class="grow"><span class="title">${esc(item.name)}</span><span class="sub">${esc(since)}</span></span><span class="qty" aria-label="${item.quantity} in the pantry">${item.quantity}</span></li>`;
     })
     .join("");

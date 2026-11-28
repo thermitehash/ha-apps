@@ -95,6 +95,7 @@ TOP_KEYS = {
     "scan",
     "stocktake",
     "grocy_untagged",
+    "allowances",
     "resync",
     "options",
     "diagnostics",

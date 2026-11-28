@@ -379,6 +379,32 @@ class FakeGrocy:
         p = self._pid(request)
         body: Any = request[BODY]
         sid = body.get("stock_entry_id")
+        amount = float(body.get("amount", 1))
+        if not sid:
+            # By amount, from one location only (like Grocy with location_id).
+            loc = body.get("location_id")
+            mine = [
+                e
+                for e in self.entries
+                if e.product_id == p.id and (loc is None or e.location_id == loc)
+            ]
+            if sum(e.amount for e in mine) < amount:
+                return web.json_response(
+                    {
+                        "error_message": "Amount to be consumed cannot be > current stock amount"
+                    },
+                    status=400,
+                )
+            left = amount
+            for e in mine:
+                take = min(e.amount, left)
+                e.amount -= take
+                left -= take
+                if e.amount <= 0:
+                    self.entries.remove(e)
+                if left <= 0:
+                    break
+            return web.json_response([{"id": 3, "transaction_type": "consume"}])
         for i, e in enumerate(self.entries):
             if e.product_id != p.id:
                 continue

@@ -3,6 +3,40 @@
 Decisions taken while building a release, one line of reason each, so they
 can be reviewed and reverted. Newest release first.
 
+## 0.4.4: tag allowance + Pantry-only lowering
+
+1. **Matched at the first arrival, not at linking.** The allowance is used
+   when a *newly linked* tag first reaches the pantry (or at linking, if the
+   tag is already there). Linking no longer marks a tag "already in stock"
+   from booked units, so the station's message is plain "Linked to …".
+   Explicit "already in stock" links (the mode card, the web checkbox) are
+   unchanged and don't touch the allowance.
+2. **"Newly tagged"** = a link whose first arrival hasn't been seen
+   (new `links.fresh` column). Links from before 0.4.4 count as seen, so
+   they never use an allowance; a relink is new again.
+3. **Allowance table**: one row per booking (stock-take Apply: the counted
+   units; Not tagging: the booked units; Grocy-only Tag them: Grocy's
+   untagged units), each expiring 7 days after it was booked; the oldest is
+   used first. Grocy-only **Tag them** tops the product's allowance up to the
+   untagged count instead of adding, so pressing it twice doesn't double it.
+   Tag N doesn't add more (the stock-take already did).
+4. **Migration**: 0.4.3's `booked_credits` rows (remaining units and booking
+   time, so the same expiry) move to `allowances` once, marked `migrated`;
+   the old table is emptied.
+5. **Where it's shown**: the product's Pantry row, a "Waiting for tags" list
+   on the Tags page (the product may not be on the Pantry page yet) and a
+   line per product in Details. Wording: "counted" for stock-take and
+   Grocy-only units, "booked" for Not tagging.
+6. **Lowering = consume from the Pantry** (`/stock/products/{id}/consume`,
+   `location_id` = Pantry, `spoiled: false`, note "Pantry Hub stock-take").
+   Raising stays an inventory correction (total + missing; Grocy puts the
+   added units in the Pantry). The drop is the one the review showed
+   (Grocy pantry − target); if the Pantry now holds less, only that is
+   consumed and the row shows "Grocy still shows N in other locations"
+   (other-location amount from the product's entries at Apply time). The
+   note is also shown after a plain lowering when other locations hold
+   stock.
+
 ## 0.4.3: Unload + Stock-take
 
 1. **Long-press = hold 6 s.** "Hold 1–6 s" already syncs the Kroger cart, so

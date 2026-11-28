@@ -248,6 +248,7 @@ async def build_state(hub: Hub) -> dict[str, Any]:
             "sweeps_aborted": reading["sweeps_aborted"],
             "departures_allowed": reading["departures_allowed"],
         },
+        "allowances": await _allowances(hub),
         "pantry": {
             "items": items,
             "products": len(items),
@@ -314,6 +315,8 @@ async def build_state(hub: Hub) -> dict[str, Any]:
         },
         "diagnostics": _diagnostics(hub, s, dead is not None),
     }
+    # Details: each product still waiting for tags of units already in Grocy.
+    state["diagnostics"] += [[a["name"], a["text"]] for a in state["allowances"]]
     state["health"] = health_for(state)
     return state
 
@@ -353,6 +356,44 @@ def _pictures(hub: Hub) -> dict[str, Any]:
         "auth_failed": pics.auth_failed,
         "status": pics.status_line(),
     }
+
+
+def allowance_text(units: int, sources: list[str]) -> str:
+    """``3 counted units still to tag`` (``booked`` for Not tagging rows)."""
+    counted = all(s in ("stocktake", "grocy") for s in sources)
+    word = "counted" if counted else "booked"
+    return f"{units} {word} unit{'s' if units != 1 else ''} still to tag"
+
+
+async def _allowances(hub: Hub) -> list[dict[str, Any]]:
+    """Products whose next tagged units are already in Grocy (7-day allowance)."""
+    found = await hub.store.allowances(hub.wall())
+    if not found:
+        return []
+    names = {lk.product_id: lk.product_name for lk in await hub.store.links()}
+    gu = hub.grocy_untagged
+    for row in gu.rows if gu is not None else []:
+        names.setdefault(int(row["product_id"]), str(row["name"]))
+    for r in await hub.store.received(include_done=True):
+        if r.grocy_product_id is not None:
+            names.setdefault(r.grocy_product_id, r.name)
+    if hub.scans is not None:
+        for review in hub.scans.stocktake.review:
+            names.setdefault(review.product_id, review.name)
+    return sorted(
+        (
+            {
+                "product_id": pid,
+                "name": names.get(pid, f"Product #{pid}"),
+                "units": a["units"],
+                "sources": a["sources"],
+                "expires": a["expires"],
+                "text": allowance_text(a["units"], a["sources"]),
+            }
+            for pid, a in found.items()
+        ),
+        key=lambda r: str(r["name"]).casefold(),
+    )
 
 
 def _scan(hub: Hub) -> dict[str, Any]:

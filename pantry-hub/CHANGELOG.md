@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.4
+
+Fixes two known gaps of 0.4.3.
+
+- **No more swallowed new units.** Units counted in a stock-take, booked with
+  Not tagging, or tagged from Grocy-only stock are now a capped **tag
+  allowance** per product ("3 counted units still to tag"). The first reader
+  arrival of each newly tagged unit uses one up and adds nothing; once it's
+  used up, new tags add stock normally, even within the week (count 3,
+  buy 2 more, tag all 5: the last 2 add stock). 0.4.3 matched any tag of the
+  product for 7 days, so a genuinely new unit could be missed. The allowance
+  still expires after 7 days. Booked units from 0.4.3 carry over with their
+  quantities and dates.
+- **Stock-take "Set" never touches other locations.** Lowering a product now
+  consumes from the Pantry location explicitly (not spoiled) instead of a
+  total inventory correction, which Grocy could take from the fridge or
+  freezer. If the Pantry holds less than the drop, only what's there is
+  consumed and the review says "Grocy still shows N in other locations".
+
 ## 0.4.3
 
 - **Unload**: get groceries bought outside Kroger Restock (the Kroger app, in

@@ -299,9 +299,8 @@ with its picture, size and "×3 of 3 to tag". For each one:
   like any linked tag.
 - **Not tagging**: removes the row. With **Add to Grocy stock** ticked (the
   default) the untagged units are booked in Grocy as a purchase, with the
-  price Kroger reported. If you tag one of them within 7 days anyway, its
-  arrival is matched against that booking (listed in recent events) and not
-  added again.
+  price Kroger reported. Those units become a **tag allowance** (below), so
+  tagging them later doesn't add them again.
 
 Deliveries are matched to Grocy by the barcode printed on the package
 (Kroger Restock's `barcode`, e.g. `049000028911`); Kroger's own 13-digit
@@ -355,9 +354,13 @@ items are counted by the reader. **Finish stock-take** shows the review: per
 product the counted units (plus tags the reader sees), Grocy's amount in the
 pantry, and the difference. Then:
 
-- **Set Grocy to the counts**: an inventory correction per product (Grocy's
-  inventory, not a purchase), so prices and history aren't faked. Units of
-  that product in other locations are kept.
+- **Set Grocy to the counts**: per product, missing units are added with an
+  inventory correction (not a purchase), so prices and history aren't
+  faked; extra units are **consumed from the Pantry location only** (not as
+  spoiled). Other locations are never touched. If the Pantry holds fewer
+  units than the review wanted to remove (stock changed in between), only
+  what's there is consumed and the review says "Grocy still shows N in
+  other locations".
 - **Add missing items as purchases**: only positive differences are added
   (no price); surplus in Grocy is left alone.
 
@@ -367,15 +370,27 @@ usually 0). Products whose every unit is tagged and agree with Grocy don't
 appear: the reader owns them.
 
 After applying, each counted product has **Tag N**: tap it, then tap each
-item on the station. Those items' first reader arrival doesn't add them
-again (like Not tagging, for 7 days).
+item on the station. The counted units are a tag allowance (below).
+
+### Tag allowance (no double counting)
+
+Units Grocy already has but that aren't tagged yet (counted in a stock-take,
+booked with **Not tagging**, or Grocy-only stock you tap **Tag them** for)
+become an allowance for that product: "3 counted units still to tag". The
+**first reader arrival of each newly tagged unit** uses one up and adds
+nothing to Grocy. When it's used up, new tags add stock as usual, even in the
+same week: count 3 boxes of cereal, buy 2 more, tag all 5, and the first 3
+arrivals add nothing while the last 2 add stock. An allowance expires after
+7 days. It's shown on the Pantry row, under **Tags → Waiting for tags**, and
+in **Details**. Tags that were linked before (coming back into the pantry)
+never use it.
 
 ### In Grocy, not tagged
 
 The Tags page lists products Grocy has in the pantry location with more
 units than tags (for example stock you entered in Grocy by hand), with
-**Tag them**. Those links are "already in stock", so tagging never adds them
-to Grocy again.
+**Tag them**. Grocy's untagged units become a tag allowance (pressing it twice
+doesn't double it), so tagging them never adds them to Grocy again.
 
 ### Product pictures
 

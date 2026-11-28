@@ -256,7 +256,6 @@ class Hub:
             location_id=options.grocy_location_id,
             on_linked=self._on_linked,
             on_needs_product=self.mark_dirty,
-            on_booked_match=self._on_booked_match,
             clock=wall,
             **linking_kwargs,
         )
@@ -863,6 +862,8 @@ class Hub:
                 "Arrived: %s (%s)", event.epc, product or "unlinked; no Grocy change"
             )
             await self._publish_event("arrived", event.epc, res.link)
+            if res.matched_booked and res.link is not None:
+                self._on_booked_match(res.link)
         else:
             dep = await self.store.apply_departure(event.epc, now)
             if dep.consume_op_id is not None:
@@ -1147,6 +1148,11 @@ class Hub:
         self.mark_dirty()
 
     def _on_booked_match(self, link: Link) -> None:
+        _LOGGER.info(
+            "Tag %s: first arrival matched a %s unit already in Grocy; not added",
+            link.epc,
+            link.product_name,
+        )
         self.recent_events.append(
             {
                 "kind": "matched_booked",
@@ -1240,7 +1246,13 @@ class Hub:
         async def each(link: Link) -> None:
             untagged.invalidate()
 
-        await self._start_counted(station, product, count, each, in_stock=True)
+        # Like a stock-take: the units Grocy has become an allowance that the
+        # first arrivals of these tags use up (topped up, not added, so
+        # pressing Tag them twice doesn't double it).
+        await self.store.add_allowance(
+            product_id, count, self.wall(), "grocy", top_up=True
+        )
+        await self._start_counted(station, product, count, each)
         return f"Tap each {product.name} on the {station} station ({count} to tag)"
 
     async def _start_counted(
@@ -1370,8 +1382,6 @@ class Hub:
             default_best_before_days=product.default_best_before_days,
             station="web",
         )
-        if not in_stock:
-            in_stock = await self.linking.booked_match(link)
         op_id = await self.store.replace_link(
             link,
             location_id=self.options.grocy_location_id,
