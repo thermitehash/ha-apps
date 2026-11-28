@@ -25,6 +25,7 @@ from pantry_hub.store import Store
 from .conftest import FakeClock, eventually
 from .fake_grocy import FakeGrocy
 from .fake_ha import TOKEN, FakeHomeAssistant
+from .fake_kroger import FakeKroger
 from .ingress_proxy import IngressProxy
 from .rig import Rig
 from .web_client import WebClient
@@ -104,13 +105,12 @@ async def host() -> AsyncIterator[ImageHost]:
     await h.stop()
 
 
-def kroger(ha: FakeHomeAssistant, answers: dict[str, dict[str, Any]]) -> None:
-    """Register kroger_restock.lookup_product answering from ``answers``."""
-
-    async def lookup(data: dict[str, Any]) -> dict[str, Any]:
-        return answers.get(str(data["barcode"]), {"found": False})
-
-    ha.add_action("kroger_restock", "lookup_product", lookup)
+def kroger(ha: FakeHomeAssistant, answers: dict[str, dict[str, Any]]) -> FakeKroger:
+    """Kroger Restock v0.17.2 knowing the products in ``answers`` (by barcode)."""
+    k = FakeKroger(ha)
+    for code, fields in answers.items():
+        k.add(code, **{f: v for f, v in fields.items() if f != "found"})
+    return k
 
 
 @pytest.fixture
@@ -186,7 +186,7 @@ async def test_link_uploads_picture_to_grocy(
     assert rig.h.pictures is not None
     await rig.h.pictures.wait_idle()
     # Only the barcode went to Home Assistant.
-    assert ha.rest("kroger_restock", "lookup_product") == [{"barcode": "0001"}]
+    assert ha.rest("kroger_restock", "lookup_product") == [{"upc": "0001"}]
     name = f"pantryhub_{beans.id}.jpg"
     assert jpeg_size(grocy.files[name]) == (600, 400)
     assert beans.picture_file_name == name
@@ -225,7 +225,7 @@ async def test_user_name_and_pictures_left_alone(
     assert rig.h.pictures is not None
     await rig.h.pictures.wait_idle()
     assert mine.picture_file_name == "my-photo.png"  # never touched
-    assert ha.rest("kroger_restock", "lookup_product") == [{"barcode": "0002"}]
+    assert ha.rest("kroger_restock", "lookup_product") == [{"upc": "0002"}]
     assert named.name == "Our rice"  # a person's name stays
     assert named.picture_file_name == f"pantryhub_{named.id}.jpg"
 
@@ -380,7 +380,7 @@ async def test_backfill_throttled_with_progress_and_30_day_memory(
         await svc.wait_idle()
         assert sleeps == [2.0, 2.0, 2.0]  # 4 lookups, 2 s apart
         assert svc.progress.text() == "4 of 4, 1 not found"
-        assert [d["barcode"] for d in ha.rest("kroger_restock", "lookup_product")] == [
+        assert [d["upc"] for d in ha.rest("kroger_restock", "lookup_product")] == [
             "1",
             "2",
             "3",
@@ -399,9 +399,7 @@ async def test_backfill_throttled_with_progress_and_30_day_memory(
         clock.advance(MISS_TTL_S + 1)
         assert svc.start_backfill(products)
         await svc.wait_idle()
-        assert [d["barcode"] for d in ha.rest("kroger_restock", "lookup_product")] == [
-            "2"
-        ]
+        assert [d["upc"] for d in ha.rest("kroger_restock", "lookup_product")] == ["2"]
     finally:
         await svc.close()
         await api.close()
@@ -502,3 +500,163 @@ async def test_picture_route_under_ingress_prefix(
                 assert state["pictures"]["versions"] == {str(beans.id): 1}
         finally:
             await proxy.stop()
+
+
+# Kroger Restock v0.17.2 contract (0.4.2) -----------------------------------------
+
+
+async def test_lookup_product_rejects_barcode_key(ha: FakeHomeAssistant) -> None:
+    """0.4.1 sent {"barcode": ...}: Kroger Restock answers 400 (regression)."""
+    from pantry_hub.ha_api import HomeAssistantApiError
+
+    k = FakeKroger(ha)
+    k.add("049000028911", name="Coca-Cola")
+    api = HomeAssistantApi(ha.rest_url, TOKEN)
+    try:
+        with pytest.raises(HomeAssistantApiError, match="HTTP 400"):
+            await api.call(
+                "kroger_restock", "lookup_product", {"barcode": "049000028911"}
+            )
+        with pytest.raises(HomeAssistantApiError, match="HTTP 400"):
+            await api.call(
+                "kroger_restock",
+                "lookup_product",
+                {"upc": "049000028911", "product_id": "0004900002891"},
+            )
+        got = await api.call(
+            "kroger_restock", "lookup_product", {"upc": "049000028911"}
+        )
+        assert got["found"] is True
+        assert got["upc"] == "0004900002891" and got["barcode"] == "049000028911"
+    finally:
+        await api.close()
+
+
+async def test_real_barcode_picture_uses_upc_key(
+    rig: Rig, grocy: FakeGrocy, ha: FakeHomeAssistant, host: ImageHost
+) -> None:
+    coke = grocy.add_product("Coke", ["049000028911"])
+    k = FakeKroger(ha)
+    k.add("049000028911", name="Coca-Cola", image_url=host.url("ok.png"))
+    await start(rig, ha)
+    await rig.h.relink(EPC, barcode="049000028911")
+    assert rig.h.pictures is not None
+    await rig.h.pictures.wait_idle()
+    assert k.lookups() == [{"upc": "049000028911"}]  # passed as scanned
+    assert coke.picture_file_name == f"pantryhub_{coke.id}.jpg"
+
+
+@pytest.mark.parametrize("reason", ["not_found", "plu_code", "not_a_product_barcode"])
+async def test_not_a_kroger_product_skipped_30_days(
+    rig: Rig, grocy: FakeGrocy, ha: FakeHomeAssistant, reason: str
+) -> None:
+    beans = grocy.add_product("Bananas", ["4011"])
+    k = FakeKroger(ha)
+    k.reasons["0000000004011"] = reason
+    await start(rig, ha)
+    await rig.h.relink(EPC, barcode="4011")
+    assert rig.h.pictures is not None and rig.store is not None
+    await rig.h.pictures.wait_idle()
+    assert await rig.store.picture_miss(beans.id) == rig.clock()
+    assert len(k.lookups()) == 1  # not retried
+
+
+async def test_rate_limited_backs_off_an_hour(
+    tmp_path: Path, grocy: FakeGrocy, ha: FakeHomeAssistant, host: ImageHost
+) -> None:
+    from pantry_hub.grocy import GrocyClient
+    from pantry_hub.pictures import RATE_LIMIT_BACKOFF_S
+
+    from .fake_grocy import API_KEY
+
+    clock = FakeClock()
+    store = await Store.open(tmp_path / "db")
+    client = GrocyClient(grocy.url, API_KEY)
+    api = HomeAssistantApi(ha.rest_url, TOKEN)
+    a = grocy.add_product("A", ["1"])
+    b = grocy.add_product("B", ["2"])
+    k = FakeKroger(ha)
+    k.add("1", image_url=host.url("ok.png"))
+    k.add("2", image_url=host.url("ok.png"))
+    k.all_reason = "rate_limited"
+    sleeps: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        sleeps.append(s)
+        clock.advance(s)
+        if s >= RATE_LIMIT_BACKOFF_S - 1:
+            k.all_reason = None  # Kroger lifted the limit meanwhile
+
+    svc = PictureService(client, api, store, clock=clock, sleep=fake_sleep)
+    try:
+        assert svc.start_backfill({a.id: "1", b.id: "2"})
+        await svc.wait_idle()
+        assert len(k.lookups()) == 1  # stopped at the first rate_limited
+        assert svc.progress.text() == (
+            "0 of 2. Stopped: Kroger rate limit, try again in an hour"
+        )
+        assert svc.status_line() == "Kroger rate limit: paused for up to an hour"
+        assert await store.picture_miss(a.id) is None  # not a "no picture"
+        # Within the hour: no call at all.
+        clock.advance(RATE_LIMIT_BACKOFF_S - 60)
+        assert await svc.fetch(a.id, "1") == "rate_limited"
+        assert len(k.lookups()) == 1
+        # After it: lookups again.
+        k.all_reason = None
+        clock.advance(61)
+        assert await svc.fetch(a.id, "1") == "set"
+        assert svc.status_line() is None
+        # A link-time fetch hitting the limit waits out the hour, then retries.
+        k.all_reason = "rate_limited"
+        n = len(k.lookups())
+        svc.on_link(b.id, "2")
+        await svc.wait_idle()
+        assert len(k.lookups()) == n + 2  # limited, then the retry an hour later
+        assert any(s >= RATE_LIMIT_BACKOFF_S - 1 for s in sleeps)
+        assert b.picture_file_name == f"pantryhub_{b.id}.jpg"
+    finally:
+        await svc.close()
+        await api.close()
+        await client.close()
+        await store.close()
+
+
+async def test_auth_failed_stops_and_asks_to_sign_in(
+    rig: Rig, grocy: FakeGrocy, ha: FakeHomeAssistant, host: ImageHost
+) -> None:
+    beans = grocy.add_product("Beans", ["0001"])
+    rice = grocy.add_product("Rice", ["0002"])
+    k = FakeKroger(ha)
+    k.add("0001", image_url=host.url("ok.png"))
+    k.add("0002", image_url=host.url("ok.png"))
+    k.all_reason = "auth_failed"
+    await start(rig, ha)
+    await rig.h.relink(EPC, barcode="0001")
+    assert rig.h.pictures is not None
+    await rig.h.pictures.wait_idle()
+    await rig.h.relink("E28011700000020F1A2B3C10", barcode="0002")
+    await rig.h.pictures.wait_idle()
+    assert len(k.lookups()) == 1  # stopped fetching after auth_failed
+    async with WebClient(rig.h) as c:
+        state = await c.state()
+        assert [
+            "Product pictures",
+            "Kroger Restock needs you to sign in again",
+        ] in state["diagnostics"]
+        titles = [i["title"] for i in state["health"]["issues"]]
+        assert "Kroger Restock needs you to sign in again" in titles
+        # Signed in again: Fetch missing pictures tries again.
+        k.all_reason = None
+        await c.post("/pictures/fetch")
+        await eventually(
+            lambda: (
+                rig.h.pictures is not None
+                and rig.h.pictures.progress.finished_at is not None
+            )
+        )
+        state = await c.state()
+    assert beans.picture_file_name and rice.picture_file_name
+    assert state["pictures"]["auth_failed"] is False
+    assert "Kroger Restock needs you to sign in again" not in [
+        i["title"] for i in state["health"]["issues"]
+    ]

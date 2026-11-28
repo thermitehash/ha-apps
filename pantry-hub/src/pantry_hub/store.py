@@ -22,9 +22,11 @@ from typing import Literal
 
 import aiosqlite
 
+from .barcodes import from_kroger_upc
+
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -90,6 +92,7 @@ CREATE TABLE IF NOT EXISTS received (
     item_id TEXT NOT NULL,
     received_at TEXT NOT NULL,
     upc TEXT NOT NULL,
+    barcode TEXT,
     kroger_product_id TEXT,
     name TEXT NOT NULL,
     brand TEXT,
@@ -116,6 +119,8 @@ CREATE TABLE IF NOT EXISTS booked_credits (
 _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "links": [("skip_add_cycle", "INTEGER")],
     "ops": [("resolution", "TEXT")],
+    # 0.4.2: the printed barcode (with check digit) next to Kroger's upc.
+    "received": [("barcode", "TEXT")],
 }
 
 OpKind = Literal["add", "consume"]
@@ -301,6 +306,7 @@ class Received:
     id: int
     item_id: str
     received_at: str
+    #: Kroger's 13-digit code without the check digit ("" if not sent).
     upc: str
     kroger_product_id: str | None
     name: str
@@ -314,6 +320,14 @@ class Received:
     grocy_product_id: int | None
     tagged: int
     done_at: float | None
+    #: Printed barcode with check digit, as Grocy stores it (None in rows
+    #: stored by 0.4.1: rebuilt from ``upc``).
+    barcode: str | None = None
+
+    @property
+    def grocy_barcode(self) -> str:
+        """Barcode to match / create in Grocy (check digit included)."""
+        return self.barcode or from_kroger_upc(self.upc) or self.upc
 
     @property
     def to_tag(self) -> int:
@@ -324,7 +338,7 @@ class Received:
 _RECEIVED_COLS = (
     "id, item_id, received_at, upc, kroger_product_id, name, brand, size, "
     "image_url, quantity, price, order_ref, stored_at, grocy_product_id, tagged, "
-    "done_at"
+    "done_at, barcode"
 )
 
 
@@ -346,6 +360,7 @@ def _received(row: sqlite3.Row) -> Received:
         grocy_product_id=row["grocy_product_id"],
         tagged=int(row["tagged"]),
         done_at=row["done_at"],
+        barcode=row["barcode"],
     )
 
 
@@ -1078,13 +1093,15 @@ class Store:
         image_url: str | None = None,
         price: float | None = None,
         order_ref: str | None = None,
+        barcode: str | None = None,
     ) -> int | None:
         """Store a received item once per ``(item_id, received_at)``; its row id."""
         async with self._lock:
             cur = await self._conn.execute(
                 "INSERT OR IGNORE INTO received (item_id, received_at, upc, "
                 "kroger_product_id, name, brand, size, image_url, quantity, price, "
-                "order_ref, stored_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "order_ref, stored_at, barcode) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item_id,
                     received_at,
@@ -1098,6 +1115,7 @@ class Store:
                     price,
                     order_ref,
                     now,
+                    barcode,
                 ),
             )
             row_id = cur.lastrowid if cur.rowcount == 1 else None

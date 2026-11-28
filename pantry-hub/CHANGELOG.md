@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.2
+
+Fixes the Kroger Restock integration. **0.4.1's product pictures and Just
+bought matching didn't work against the real Kroger Restock (v0.17.2)**:
+0.4.1 was built against a guessed contract.
+
+- **Product pictures now work.** `kroger_restock.lookup_product` takes `upc`
+  (or `product_id`), not `barcode`; 0.4.1 sent `barcode`, which Kroger Restock
+  refuses (HTTP 400), so no picture was ever fetched. The scanned / Grocy
+  barcode is now sent as `upc` (Kroger Restock normalizes UPC-A, EAN-13,
+  UPC-E and padding itself).
+- When Kroger has no product, its `reason` is used: `not_found`, `plu_code`
+  or `not_a_product_barcode` → not asked again for 30 days; `rate_limited` →
+  no lookups for an hour; `auth_failed` → lookups stop and Details (and the
+  health list) say "Kroger Restock needs you to sign in again". Tap **Fetch
+  missing pictures** after signing in to start again.
+- **Just bought no longer creates duplicate Grocy products.** Kroger's `upc`
+  has no check digit, so 0.4.1 never found the existing Grocy product
+  (stored as the printed code, e.g. `049000028911`) and created a new one.
+  Pantry Hub now uses Kroger Restock's printed `barcode` (or rebuilds the
+  check digit from `upc`), and also tries the EAN-13 and Kroger 13-digit
+  forms before creating a product. A product it creates gets the printed
+  barcode, with the check digit. Kroger's `upc` and `product_id` are kept
+  for reference.
+- If 0.4.1 already created duplicates for you, merge or delete them in Grocy
+  (they have a 13-digit barcode starting with `000`). Pantry Hub doesn't
+  remove them.
+- Rows already in Just bought from 0.4.1 get the rebuilt barcode
+  automatically (database upgrade).
+
 ## 0.4.1
 
 Needs the **Kroger Restock** integration for the new parts; without it

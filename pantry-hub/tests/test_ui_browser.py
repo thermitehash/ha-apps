@@ -400,35 +400,24 @@ async def test_pictures_and_just_bought(
     hub = stack.rig.h
     now = hub.wall()
 
-    def item(
-        item_id: str, upc: str, name: str, qty: int, age_s: float
-    ) -> dict[str, Any]:
-        from datetime import UTC, datetime
+    from datetime import UTC, datetime
 
-        at = datetime.fromtimestamp(now - age_s, UTC).isoformat()
-        return {
-            "item_id": item_id,
-            "upc": upc,
-            "name": name,
-            "size": "15 oz",
-            "quantity_received": qty,
-            "price": 0.89,
-            "received_at": at,
-        }
+    from .fake_kroger import FakeKroger, item
 
-    recent = [
-        item("1", "0001", "Black beans", 3, 3600),
-        item("2", "0099", "Old crackers", 1, 20 * 86400),
+    def at(age_s: float) -> str:
+        return datetime.fromtimestamp(now - age_s, UTC).isoformat()
+
+    kroger = FakeKroger(ha)  # Kroger Restock v0.17.2 shapes
+    kroger.recent = [
+        item(item_id="1", barcode="0001", name="Black beans", received_at=at(3600)),
+        item(
+            item_id="2",
+            barcode="0099",
+            name="Old crackers",
+            quantity=1,
+            received_at=at(20 * 86400),
+        ),
     ]
-
-    async def recent_received(data: dict[str, Any]) -> dict[str, Any]:
-        return {"items": recent}
-
-    async def lookup(data: dict[str, Any]) -> dict[str, Any]:
-        return {"found": False}
-
-    ha.add_action("kroger_restock", "recent_received", recent_received)
-    ha.add_action("kroger_restock", "lookup_product", lookup)
     assert hub.ha_api is not None and hub.just_bought is not None
     assert hub.pictures is not None
     await hub.ha_api.services(refresh=True)

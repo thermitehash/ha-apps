@@ -28,6 +28,7 @@ import logging
 import time
 from typing import Any
 
+from .barcodes import grocy_barcode, variants
 from .grocy import GrocyClient, GrocyError, Product
 from .ha_api import HomeAssistantApi, HomeAssistantApiError
 from .pictures import DOMAIN, PictureError, PictureService
@@ -84,6 +85,9 @@ class Item:
 
     item_id: str
     received_at: str
+    #: Printed barcode with check digit: what Grocy stores and matches.
+    barcode: str
+    #: Kroger's 13-digit code without check digit (reference only).
     upc: str
     name: str
     quantity: int
@@ -99,9 +103,12 @@ class Item:
         """Validate an event / catch-up entry (None if unusable)."""
         item_id = _text(data.get("item_id"), 100)
         received_at = _text(data.get("received_at"), 40)
-        upc = _text(data.get("upc"), 64)
+        upc = _text(data.get("upc"), 64) or ""
+        # Kroger's upc has no check digit, so Grocy wouldn't find it: use the
+        # printed `barcode`, else rebuild the check digit from `upc`.
+        barcode = grocy_barcode(_text(data.get("barcode"), 64), upc)
         quantity = _number(data.get("quantity_received"))
-        if not item_id or not received_at or not upc or quantity is None:
+        if not item_id or not received_at or not barcode or quantity is None:
             return None
         qty = int(quantity)
         if qty < 1:
@@ -109,8 +116,9 @@ class Item:
         return cls(
             item_id=item_id,
             received_at=received_at,
+            barcode=barcode,
             upc=upc,
-            name=_text(data.get("name")) or upc,
+            name=_text(data.get("name")) or barcode,
             quantity=min(qty, MAX_QUANTITY),
             kroger_product_id=_text(data.get("product_id"), 64),
             brand=_text(data.get("brand")),
@@ -176,6 +184,7 @@ class JustBought:
             item_id=item.item_id,
             received_at=item.received_at,
             upc=item.upc,
+            barcode=item.barcode,
             name=item.name,
             quantity=item.quantity,
             now=stored_at,
@@ -263,7 +272,7 @@ class JustBought:
             except GrocyError:
                 pass  # deleted in Grocy: look it up again
         try:
-            product = await self.grocy.product_by_barcode(row.upc)
+            product = await self._find(row.grocy_barcode)
             if product is None:
                 product = await self._create(row)
         except GrocyError as err:
@@ -271,10 +280,24 @@ class JustBought:
         await self.store.set_received_product(row.id, product.id)
         return product
 
+    async def _find(self, barcode: str) -> Product | None:
+        """Grocy product with this barcode in any of its forms.
+
+        The printed code, its UPC-A / EAN-13 twin and Kroger's 13-digit
+        zero-padded form are all tried before a new product is created, so a
+        product stored either way is found and not duplicated.
+        """
+        for code in variants(barcode):
+            product: Product | None = await self.grocy.product_by_barcode(code)
+            if product is not None:
+                return product
+        return None
+
     async def _create(self, row: Received) -> Product:
         name, brand, size = row.name, row.brand, row.size
+        barcode = row.grocy_barcode
         try:
-            info = await self.pictures.lookup(row.upc)
+            info = await self.pictures.lookup(barcode)
         except PictureError as err:  # the lookup only improves the name
             _LOGGER.info("Product lookup for a new Grocy product failed: %s", err)
             info = None
@@ -285,12 +308,12 @@ class JustBought:
         description = " · ".join(v for v in (brand, size) if v)
         product: Product = await self.grocy.create_product(
             name,
-            barcode=row.upc,
+            barcode=barcode,  # printed form, with check digit
             location_id=self.location_id,
             description=description,
         )
         _LOGGER.info("Created Grocy product %r for a Kroger delivery", name)
-        self.pictures.on_link(product.id, row.upc)
+        self.pictures.on_link(product.id, barcode)
         return product
 
     async def tag(self, row_id: int, start: StartFn) -> Product:
@@ -300,7 +323,7 @@ class JustBought:
             raise JustBoughtError("Every unit is already tagged")
         product = await self.product_for(row)
         row = await self._row(row_id)
-        await start(row.upc, product, row)
+        await start(row.grocy_barcode, product, row)
         return product
 
     async def tagged_one(self, row_id: int, link: Link) -> None:

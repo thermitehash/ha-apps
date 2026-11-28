@@ -17,6 +17,7 @@ from pantry_hub.store import Link
 from .conftest import BrokerHandle, FakeClock, eventually
 from .fake_grocy import FakeGrocy
 from .fake_ha import TOKEN, FakeHomeAssistant
+from .fake_kroger import FakeKroger, item
 from .rig import Observer, Rig
 from .web_client import WebClient
 
@@ -31,38 +32,19 @@ def iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).isoformat().replace("+00:00", "Z")
 
 
+#: Coca-Cola 12 oz: printed UPC-A (Grocy) and Kroger's form (no check digit).
+BEANS = "049000028911"
+BEANS_KROGER = "0004900002891"
+
+
 def payload(clock: FakeClock, **over: Any) -> dict[str, Any]:
-    data: dict[str, Any] = {
-        "item_id": "it-1",
-        "upc": "0001111042850",
-        "product_id": "0001111042850",
-        "name": "Kroger Black Beans",
-        "brand": "Kroger",
-        "size": "15 oz",
-        "image_url": None,
-        "quantity_received": 3,
-        "price": 0.89,
-        "received_at": iso(clock()),
-        "order_ref": "ORD-1",
-    }
-    data.update(over)
-    return data
-
-
-class Kroger:
-    """Kroger Restock's actions on the fake Home Assistant."""
-
-    def __init__(self, ha: FakeHomeAssistant) -> None:
-        self.recent: list[dict[str, Any]] = []
-        self.lookup: dict[str, dict[str, Any]] = {}
-        ha.add_action("kroger_restock", "recent_received", self._recent)
-        ha.add_action("kroger_restock", "lookup_product", self._lookup)
-
-    async def _recent(self, data: dict[str, Any]) -> dict[str, Any]:
-        return {"items": list(self.recent)}
-
-    async def _lookup(self, data: dict[str, Any]) -> dict[str, Any]:
-        return self.lookup.get(str(data["barcode"]), {"found": False})
+    """A real-shaped kroger_restock_received item (see fake_kroger)."""
+    return item(
+        item_id=over.pop("item_id", "it-1"),
+        barcode=over.pop("barcode", BEANS),
+        received_at=over.pop("received_at", iso(clock())),
+        **over,
+    )
 
 
 @pytest.fixture
@@ -115,24 +97,29 @@ def test_item_parse_rejects_bad_payloads() -> None:
     assert Item.parse(payload(clock)) is not None
     for bad in (
         {"item_id": None},
-        {"upc": ""},
+        {"upc": "", "barcode": None},
+        {"upc": None, "barcode": ""},
         {"quantity_received": 0},
         {"quantity_received": "x"},
         {"received_at": None},
     ):
-        assert Item.parse(payload(clock, **bad)) is None, bad
+        data = payload(clock)
+        data.update(bad)
+        assert Item.parse(data) is None, bad
     capped = Item.parse(payload(clock, quantity_received=500, name=None))
     assert capped is not None and capped.quantity == 99
-    assert capped.name == "0001111042850"
+    assert capped.name == BEANS
 
 
 async def test_event_and_catch_up_deduped(
     rig: Rig, ha: FakeHomeAssistant, clock: FakeClock
 ) -> None:
-    kroger = Kroger(ha)
+    kroger = FakeKroger(ha)
     kroger.recent = [
         payload(clock),
-        payload(clock, item_id="it-2", name="Oats", upc="0002", quantity_received=1),
+        payload(
+            clock, item_id="it-2", name="Oats", barcode="0002", quantity_received=1
+        ),
     ]
     await start(rig, ha)
     # Caught up at start. (Wait for the rows, not the call: the fake records
@@ -142,7 +129,7 @@ async def test_event_and_catch_up_deduped(
     assert [r["name"] for r in await rows(rig)] == ["Oats", "Kroger Black Beans"]
     # The same item as a live event: no duplicate. A new one: added.
     await ha.fire_event("kroger_restock_received", payload(clock))
-    new = payload(clock, item_id="it-3", name="Rice", upc="0003")
+    new = payload(clock, item_id="it-3", name="Rice", barcode="0003")
     await ha.fire_event("kroger_restock_received", new)
     await eventually(lambda: has_rows(rig, 3))
     # Same item_id, another delivery (received_at differs): a new row.
@@ -151,7 +138,7 @@ async def test_event_and_catch_up_deduped(
     await eventually(lambda: has_rows(rig, 4))
     # Reconnect → catch up again: the old items stay deduped, an item
     # delivered while disconnected is picked up.
-    kroger.recent.append(payload(clock, item_id="it-4", name="Flour", upc="0004"))
+    kroger.recent.append(payload(clock, item_id="it-4", name="Flour", barcode="0004"))
     await ha.drop()
     await eventually(lambda: has_rows(rig, 5))
     assert len(ha.rest("kroger_restock", "recent_received")) == 2
@@ -190,7 +177,7 @@ async def test_missing_kroger_hides_card(rig: Rig, ha: FakeHomeAssistant) -> Non
 async def test_expiry_older_then_deleted(
     rig: Rig, ha: FakeHomeAssistant, clock: FakeClock
 ) -> None:
-    Kroger(ha)
+    FakeKroger(ha)
     await start(rig, ha)
     jb = rig.h.just_bought
     assert jb is not None
@@ -220,13 +207,8 @@ async def test_tag_creates_grocy_product_from_lookup(
     clock: FakeClock,
     observer: Observer,
 ) -> None:
-    kroger = Kroger(ha)
-    kroger.lookup["0001111042850"] = {
-        "found": True,
-        "name": "Kroger® Black Beans",
-        "brand": "Kroger",
-        "size": "15 oz",
-    }
+    kroger = FakeKroger(ha)
+    kroger.add(BEANS, name="Kroger® Black Beans", brand="Kroger", size="15 oz")
     kroger.recent = [payload(clock)]
     await start(rig, ha)
     await eventually(lambda: has_rows(rig, 1))
@@ -239,19 +221,19 @@ async def test_tag_creates_grocy_product_from_lookup(
     }
     created = [p for p in grocy.products.values() if p.name == "Kroger® Black Beans"]
     assert len(created) == 1
-    assert created[0].barcodes == ["0001111042850"]
+    assert created[0].barcodes == [BEANS]
     assert created[0].description == "Kroger · 15 oz"
     assert (await rows(rig))[0]["product_id"] == created[0].id
     # Start command for the station.
     await eventually(lambda: observer.last(START) is not None)
-    assert observer.last(START) == {"barcode": "0001111042850", "count": 3}
+    assert observer.last(START) == {"barcode": BEANS, "count": 3}
 
 
 async def test_existing_product_found_by_barcode(
     rig: Rig, ha: FakeHomeAssistant, grocy: FakeGrocy, clock: FakeClock
 ) -> None:
-    beans = grocy.add_product("Beans", ["0001111042850"])
-    Kroger(ha).recent = [payload(clock)]
+    beans = grocy.add_product("Beans", [BEANS])
+    FakeKroger(ha).recent = [payload(clock)]
     await start(rig, ha)
     await eventually(lambda: has_rows(rig, 1))
     jb = rig.h.just_bought
@@ -275,8 +257,8 @@ async def test_counted_session_stops_at_count_and_skips_duplicates(
     clock: FakeClock,
     observer: Observer,
 ) -> None:
-    beans = grocy.add_product("Beans", ["0001111042850"])
-    Kroger(ha).recent = [payload(clock)]
+    beans = grocy.add_product("Beans", [BEANS])
+    FakeKroger(ha).recent = [payload(clock)]
     await start(rig, ha)
     assert rig.store is not None
     await rig.store.create_link(
@@ -296,7 +278,7 @@ async def test_counted_session_stops_at_count_and_skips_duplicates(
             "status": "linked",
             "product": "Beans",
             "message": "Linked 1 of 3: Beans",
-            "barcode": "0001111042850",
+            "barcode": BEANS,
             "epc": EPCS[0],
             "count": 3,
             "linked": 1,
@@ -337,8 +319,8 @@ async def test_counted_session_times_out(
     clock: FakeClock,
     observer: Observer,
 ) -> None:
-    grocy.add_product("Beans", ["0001111042850"])
-    Kroger(ha).recent = [payload(clock)]
+    grocy.add_product("Beans", [BEANS])
+    FakeKroger(ha).recent = [payload(clock)]
     await start(rig, ha, counted_idle=0.4)
     await eventually(lambda: has_rows(rig, 1))
     row_id = (await rows(rig))[0]["id"]
@@ -364,9 +346,9 @@ async def test_barcode_scan_replaces_counted_session(
     clock: FakeClock,
     observer: Observer,
 ) -> None:
-    grocy.add_product("Beans", ["0001111042850"])
+    grocy.add_product("Beans", [BEANS])
     grocy.add_product("Rice", ["0002"])
-    Kroger(ha).recent = [payload(clock)]
+    FakeKroger(ha).recent = [payload(clock)]
     await start(rig, ha)
     await eventually(lambda: has_rows(rig, 1))
     await rig.h.tag_received((await rows(rig))[0]["id"])
@@ -388,8 +370,8 @@ async def test_not_tagging_books_purchase_and_later_tag_does_not_double_count(
     clock: FakeClock,
     observer: Observer,
 ) -> None:
-    beans = grocy.add_product("Beans", ["0001111042850"])
-    Kroger(ha).recent = [payload(clock)]
+    beans = grocy.add_product("Beans", [BEANS])
+    FakeKroger(ha).recent = [payload(clock)]
     await start(rig, ha)
     await eventually(lambda: has_rows(rig, 1))
     row_id = (await rows(rig))[0]["id"]
@@ -414,9 +396,7 @@ async def test_not_tagging_books_purchase_and_later_tag_does_not_double_count(
     assert await rig.store.booked_credits() == {beans.id: 3}
     # Two days later one of those cans gets a tag at the station …
     clock.advance(2 * 86400)
-    await observer.publish(
-        "pantry_hub/linking/kitchen/barcode", {"barcode": "0001111042850"}
-    )
+    await observer.publish("pantry_hub/linking/kitchen/barcode", {"barcode": BEANS})
     await asyncio.sleep(0.05)
     await observer.publish("pantry_hub/linking/kitchen/tag", {"epc": EPCS[0]})
     res = "pantry_hub/linking/kitchen/result"
@@ -429,7 +409,7 @@ async def test_not_tagging_books_purchase_and_later_tag_does_not_double_count(
     assert await rig.store.booked_credits() == {beans.id: 2}
     assert rig.h.recent_events[0]["kind"] == "matched_booked"
     # A second can, tagged from the web UI: matched too.
-    await rig.h.relink(EPCS[1], barcode="0001111042850")
+    await rig.h.relink(EPCS[1], barcode=BEANS)
     await rig.arrive(EPCS[1])
     await rig.idle()
     assert grocy.amount(beans.id) == 3
@@ -437,7 +417,7 @@ async def test_not_tagging_books_purchase_and_later_tag_does_not_double_count(
     # After 7 days the last booked unit no longer matches: a new tag is a
     # normal new unit whose arrival adds stock.
     clock.advance(BOOKED_MATCH_S)
-    link = await rig.h.relink(EPCS[2], barcode="0001111042850")
+    link = await rig.h.relink(EPCS[2], barcode=BEANS)
     stored = await rig.store.get_link(link.epc)
     assert stored is not None and stored.skip_add_cycle is None
     assert await rig.store.booked_credits() == {}
@@ -450,10 +430,12 @@ async def test_not_tagging_without_stock_and_partial(
     clock: FakeClock,
     observer: Observer,
 ) -> None:
-    beans = grocy.add_product("Beans", ["0001111042850"])
-    Kroger(ha).recent = [
+    beans = grocy.add_product("Beans", [BEANS])
+    FakeKroger(ha).recent = [
         payload(clock),
-        payload(clock, item_id="it-2", upc="0002", name="Oats", quantity_received=2),
+        payload(
+            clock, item_id="it-2", barcode="0002", name="Oats", quantity_received=2
+        ),
     ]
     await start(rig, ha)
     await eventually(lambda: has_rows(rig, 2))
@@ -478,8 +460,8 @@ async def test_not_tagging_without_stock_and_partial(
 async def test_purchase_refused_keeps_the_row(
     rig: Rig, ha: FakeHomeAssistant, grocy: FakeGrocy, clock: FakeClock
 ) -> None:
-    grocy.add_product("Beans", ["0001111042850"])
-    Kroger(ha).recent = [payload(clock)]
+    grocy.add_product("Beans", [BEANS])
+    FakeKroger(ha).recent = [payload(clock)]
     await start(rig, ha)
     await eventually(lambda: has_rows(rig, 1))
     row_id = (await rows(rig))[0]["id"]
@@ -490,3 +472,135 @@ async def test_purchase_refused_keeps_the_row(
     assert [r["id"] for r in await rows(rig)] == [row_id]
     assert rig.store is not None
     assert await rig.store.booked_credits() == {}
+
+
+# Kroger Restock v0.17.2 contract (0.4.2) -----------------------------------------
+
+
+def test_item_uses_printed_barcode_and_keeps_kroger_codes() -> None:
+    clock = FakeClock()
+    real = Item.parse(payload(clock))
+    assert real is not None
+    assert real.barcode == BEANS  # what Grocy stores
+    assert real.upc == BEANS_KROGER and real.kroger_product_id == BEANS_KROGER
+    # No barcode field: the check digit is rebuilt from Kroger's upc.
+    bare = Item.parse(payload(clock, with_barcode=False))
+    assert bare is not None and bare.barcode == BEANS
+
+
+async def test_upc_without_check_digit_matches_existing_product(
+    rig: Rig, ha: FakeHomeAssistant, grocy: FakeGrocy, clock: FakeClock
+) -> None:
+    """0.4.1 matched Kroger's upc as is: no match, so a duplicate was created."""
+    coke = grocy.add_product("Coke 12 oz", [BEANS])
+    kroger = FakeKroger(ha)
+    kroger.add(BEANS, name="Coca-Cola Classic")
+    kroger.recent = [
+        payload(clock, with_barcode=False),  # only Kroger's upc
+        payload(clock, item_id="it-2"),
+    ]
+    await start(rig, ha)
+    await eventually(lambda: has_rows(rig, 2))
+    async with WebClient(rig.h) as c:
+        for row in await rows(rig):
+            assert (await c.post("/bought/skip", row=row["id"], add_stock="on"))["ok"]
+    assert len(grocy.products) == 1  # no duplicate
+    assert grocy.amount(coke.id) == 6
+    assert rig.store is not None
+    stored = await rig.store.received(include_done=True)
+    assert {r.barcode for r in stored} == {BEANS}
+    assert {r.upc for r in stored} == {BEANS_KROGER}
+
+
+@pytest.mark.parametrize(
+    "stored_as", ["0049000028911", "0004900002891"], ids=["ean13", "kroger13"]
+)
+async def test_other_forms_of_the_code_match_too(
+    rig: Rig,
+    ha: FakeHomeAssistant,
+    grocy: FakeGrocy,
+    clock: FakeClock,
+    stored_as: str,
+) -> None:
+    coke = grocy.add_product("Coke 12 oz", [stored_as])
+    FakeKroger(ha).recent = [payload(clock)]
+    await start(rig, ha)
+    await eventually(lambda: has_rows(rig, 1))
+    assert rig.h.just_bought is not None and rig.store is not None
+    row = await rig.store.get_received((await rows(rig))[0]["id"])
+    assert row is not None
+    assert (await rig.h.just_bought.product_for(row)).id == coke.id
+    assert len(grocy.products) == 1
+
+
+async def test_created_product_gets_the_barcode_with_check_digit(
+    rig: Rig,
+    ha: FakeHomeAssistant,
+    grocy: FakeGrocy,
+    clock: FakeClock,
+    observer: Observer,
+) -> None:
+    kroger = FakeKroger(ha)
+    kroger.add(BEANS, name="Coca-Cola Classic", brand="Coca-Cola", size="12 fl oz")
+    kroger.recent = [payload(clock, with_barcode=False)]
+    await start(rig, ha)
+    await eventually(lambda: has_rows(rig, 1))
+    row_id = (await rows(rig))[0]["id"]
+    await rig.h.tag_received(row_id)
+    created = list(grocy.products.values())
+    assert [p.barcodes for p in created] == [[BEANS]]
+    assert created[0].name == "Coca-Cola Classic"
+    # The lookup sent the printed code as `upc`; the station gets it too.
+    assert kroger.lookups()[0] == {"upc": BEANS}
+    await eventually(lambda: observer.last(START) is not None)
+    assert observer.last(START) == {"barcode": BEANS, "count": 3}
+    # Scanning that printed barcode at the station later finds the same product.
+    assert (await rig.client.product_by_barcode(BEANS)).id == created[0].id  # type: ignore[union-attr]
+
+
+async def test_recent_received_days_items_shape(
+    rig: Rig, ha: FakeHomeAssistant, clock: FakeClock
+) -> None:
+    kroger = FakeKroger(ha)
+    kroger.days = 14
+    kroger.recent = [payload(clock), payload(clock, item_id="it-2", barcode="0002")]
+    await start(rig, ha)
+    await eventually(lambda: has_rows(rig, 2))
+    assert rig.h.just_bought is not None
+    # Kroger Restock answers {"days": 14, "items": [...]}; catching up again
+    # finds nothing new.
+    assert await rig.h.just_bought.catch_up() == 0
+
+
+async def test_rows_from_041_database_get_rebuilt_barcode(tmp_path: Path) -> None:
+    """A 0.4.1 DB has no `barcode` column and stored Kroger's upc only."""
+    import sqlite3
+
+    from pantry_hub.store import Store
+
+    db = tmp_path / "old.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE received (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL,
+            received_at TEXT NOT NULL, upc TEXT NOT NULL, kroger_product_id TEXT,
+            name TEXT NOT NULL, brand TEXT, size TEXT, image_url TEXT,
+            quantity INTEGER NOT NULL, price REAL, order_ref TEXT,
+            stored_at REAL NOT NULL, grocy_product_id INTEGER,
+            tagged INTEGER NOT NULL DEFAULT 0, done_at REAL,
+            UNIQUE (item_id, received_at));
+        INSERT INTO received (item_id, received_at, upc, name, quantity, stored_at)
+        VALUES ('it-1', '2026-11-27T10:00:00Z', '0004900002891', 'Coke', 2, 1.0);
+        """
+    )
+    con.commit()
+    con.close()
+    store = await Store.open(db)
+    try:
+        (row,) = await store.received()
+        assert row.barcode is None and row.upc == BEANS_KROGER
+        assert row.grocy_barcode == BEANS
+        assert await store.get_meta("schema_version") == "4"
+    finally:
+        await store.close()

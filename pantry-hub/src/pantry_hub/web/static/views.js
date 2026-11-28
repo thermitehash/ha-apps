@@ -221,7 +221,8 @@ export function picturesCard(state) {
     return `<p class="sub">Product pictures come from Kroger Restock, which isn’t installed (or its lookup action is missing).</p>`;
   }
   const progress = p.text ? `<p class="sub" role="status" aria-live="polite">${esc(p.text)}</p>` : "";
-  return `<p class="sub">Pictures are looked up by barcode in Kroger Restock and saved in Grocy. Products with a picture you chose are never changed.</p>${progress}
+  const status = p.status ? `<p class="error-text">${esc(p.status)}</p>` : "";
+  return `<p class="sub">Pictures are looked up by barcode in Kroger Restock and saved in Grocy. Products with a picture you chose are never changed.</p>${status}${progress}
 <div class="actions"><button class="btn" type="button" data-action="post" data-path="/pictures/fetch" ${p.running ? "disabled" : ""}>${p.running ? "Fetching…" : "Fetch missing pictures"}</button></div>`;
 }
 

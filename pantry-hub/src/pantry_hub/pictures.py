@@ -3,8 +3,8 @@
 On a barcode link (and from the "Fetch missing pictures" backfill), for a
 Grocy product without a picture::
 
-    kroger_restock.lookup_product(barcode)   (Home Assistant action; only the
-                                              barcode leaves the house)
+    kroger_restock.lookup_product(upc=<barcode>)  (Home Assistant action; only
+                                                  the barcode leaves the house)
     → download image_url (10 s, 5 MB, image/* only, http/https only)
     → resize to 600 px long edge, JPEG q85
     → PUT /api/files/productpictures/<base64 "pantryhub_<id>.jpg">
@@ -51,8 +51,22 @@ BACKFILL_SPACING_S = 2.0
 #: Background retries after a failed attempt (seconds before each retry).
 RETRY_DELAYS_S: tuple[float, ...] = (10.0, 60.0, 300.0)
 NOT_FOUND_LINE = "Product pictures: Kroger Restock not found."
+SIGN_IN_TEXT = "Kroger Restock needs you to sign in again"
+#: ``reason`` values of a ``found: false`` answer that mean "no such product
+#: at Kroger": remembered for :data:`MISS_TTL_S`.
+MISS_REASONS = frozenset({"not_found", "plu_code", "not_a_product_barcode"})
+#: After ``reason: rate_limited`` no lookup is made for this long.
+RATE_LIMIT_BACKOFF_S = 3600.0
 
-Outcome = Literal["set", "has_picture", "not_found", "skipped", "no_kroger"]
+Outcome = Literal[
+    "set",
+    "has_picture",
+    "not_found",
+    "skipped",
+    "no_kroger",
+    "rate_limited",
+    "auth_failed",
+]
 
 
 class PictureError(Exception):
@@ -102,6 +116,8 @@ class BackfillProgress:
     set: int = 0
     failed: int = 0
     finished_at: float | None = None
+    #: Why it stopped early (signed out / rate limited), if it did.
+    stopped: str | None = None
 
     def text(self) -> str:
         """``12 of 40, 3 not found``."""
@@ -112,7 +128,8 @@ class BackfillProgress:
             parts.append(f"{self.not_found} not found")
         if self.failed:
             parts.append(f"{self.failed} failed")
-        return ", ".join(parts)
+        text = ", ".join(parts)
+        return f"{text}. Stopped: {self.stopped}" if self.stopped else text
 
 
 class PictureService:
@@ -142,6 +159,11 @@ class PictureService:
         #: Last answer to "is kroger_restock.lookup_product there?" (None: not asked).
         self.available: bool | None = None
         self.progress = BackfillProgress()
+        #: Kroger Restock answered ``auth_failed``: no lookups until a person
+        #: presses "Fetch missing pictures" (or the app restarts).
+        self.auth_failed = False
+        #: Kroger Restock answered ``rate_limited``: no lookups before this.
+        self.paused_until: float | None = None
         #: Bumped when Pantry Hub sets a product's picture (busts caches).
         self.versions: dict[int, int] = {}
         self._tasks: dict[int, asyncio.Task[None]] = {}
@@ -167,8 +189,14 @@ class PictureService:
             self._http = None
 
     def status_line(self) -> str | None:
-        """Details line when Kroger Restock is missing."""
-        return NOT_FOUND_LINE if self.available is False else None
+        """Details value when lookups can't run (missing, signed out, limited)."""
+        if self.available is False:
+            return "Kroger Restock not found."
+        if self.auth_failed:
+            return SIGN_IN_TEXT
+        if self.paused_until is not None and self.clock() < self.paused_until:
+            return "Kroger rate limit: paused for up to an hour"
+        return None
 
     def _changed(self) -> None:
         if self.on_change is not None:
@@ -201,7 +229,11 @@ class PictureService:
             if delay:
                 await self.sleep(delay)
             try:
-                await self.fetch(product_id, barcode)
+                outcome = await self.fetch(product_id, barcode)
+                if outcome == "rate_limited" and self.paused_until is not None:
+                    # Try once more when the back-off is over.
+                    await self.sleep(max(self.paused_until - self.clock(), 0.0))
+                    await self.fetch(product_id, barcode)
                 return
             except PictureError as err:
                 level = logging.WARNING if attempt == len(delays) else logging.INFO
@@ -233,15 +265,50 @@ class PictureService:
             self._changed()
         return found
 
+    def blocked(self) -> Outcome | None:
+        """Why no lookup may be made now (signed out / rate limited), if so."""
+        if self.auth_failed:
+            return "auth_failed"
+        if self.paused_until is not None:
+            if self.clock() < self.paused_until:
+                return "rate_limited"
+            self.paused_until = None
+            self._changed()
+        return None
+
     async def lookup(self, barcode: str) -> dict[str, Any] | None:
-        """``kroger_restock.lookup_product`` response, or None if it's missing."""
+        """``kroger_restock.lookup_product`` response, or None if it's missing.
+
+        Kroger Restock v0.17.2 takes ``upc`` *or* ``product_id`` (plus an
+        optional ``config_entry_id``) and normalizes UPC-A, EAN-13, UPC-E and
+        padding itself, so the code is passed as scanned / stored in Grocy.
+        A ``found: false`` answer is returned as it is; ``rate_limited`` and
+        ``auth_failed`` also pause later lookups.
+        """
         if not await self._kroger_available():
             return None
         assert self.ha is not None
         try:
-            return await self.ha.call(DOMAIN, LOOKUP_SERVICE, {"barcode": barcode})
+            info = await self.ha.call(DOMAIN, LOOKUP_SERVICE, {"upc": barcode})
         except HomeAssistantApiError as err:
             raise PictureError(f"product lookup failed: {err}") from err
+        if not info.get("found"):
+            self._note_reason(info.get("reason"))
+        return info
+
+    def _note_reason(self, reason: object) -> None:
+        """Act on a ``found: false`` reason that affects every lookup."""
+        if reason == "rate_limited":
+            self.paused_until = self.clock() + RATE_LIMIT_BACKOFF_S
+            _LOGGER.warning(
+                "Kroger rate limit: no product lookups for %d min",
+                RATE_LIMIT_BACKOFF_S // 60,
+            )
+            self._changed()
+        elif reason == "auth_failed" and not self.auth_failed:
+            self.auth_failed = True
+            _LOGGER.warning("%s; product pictures paused", SIGN_IN_TEXT)
+            self._changed()
 
     async def fetch(
         self, product_id: int, barcode: str, *, replace_ours: bool = False
@@ -263,12 +330,25 @@ class PictureService:
             return "skipped"  # a person chose this picture
         if current and not replace_ours:
             return "has_picture"
+        blocked = self.blocked()
+        if blocked is not None:
+            return blocked
         info = await self.lookup(barcode)
         if info is None:
             return "no_kroger"
+        if not info.get("found"):
+            reason = info.get("reason")
+            if reason == "rate_limited":
+                return "rate_limited"
+            if reason == "auth_failed":
+                return "auth_failed"
+            if reason not in MISS_REASONS:
+                raise PictureError(f"Kroger Restock lookup failed ({reason})")
+            await self.store.set_picture_miss(product_id, self.clock())
+            return "not_found"
         await self._fill_text(product_id, row, info, barcode)
         url = info.get("image_url")
-        if not info.get("found") or not isinstance(url, str) or not url:
+        if not isinstance(url, str) or not url:
             await self.store.set_picture_miss(product_id, self.clock())
             return "not_found"
         image = await self.download(url)
@@ -295,7 +375,12 @@ class PictureService:
         name = str(row.get("name") or "").strip()
         new_name = info.get("name")
         # Empty, or the placeholder some lookups leave: the barcode itself.
-        if (not name or name == barcode) and isinstance(new_name, str) and new_name:
+        placeholders = {barcode, info.get("barcode"), info.get("upc")}
+        if (
+            (not name or name in placeholders)
+            and isinstance(new_name, str)
+            and new_name
+        ):
             fields["name"] = new_name.strip()[:200]
         if not str(row.get("description") or "").strip():
             desc = " · ".join(
@@ -353,6 +438,11 @@ class PictureService:
         """Start "Fetch missing pictures"; False if one is already running."""
         if self._backfill is not None and not self._backfill.done():
             return False
+        # A person pressing it may have signed in to Kroger Restock again:
+        # lift an auth_failed pause (not a rate limit: Kroger decides that).
+        if self.auth_failed:
+            self.auth_failed = False
+            _LOGGER.info("Trying Kroger Restock again after a sign-in failure")
         self.progress = BackfillProgress(running=True)
         self._changed()
         self._backfill = asyncio.create_task(
@@ -404,6 +494,13 @@ class PictureService:
                     await self.sleep(self.spacing_s)
                 try:
                     outcome = await self.fetch(pid, barcode, replace_ours=pid in ours)
+                    if outcome in ("rate_limited", "auth_failed"):
+                        progress.stopped = (
+                            SIGN_IN_TEXT
+                            if outcome == "auth_failed"
+                            else "Kroger rate limit, try again in an hour"
+                        )
+                        break
                     if outcome == "not_found":
                         progress.not_found += 1
                     else:

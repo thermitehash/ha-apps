@@ -303,6 +303,10 @@ with its picture, size and "×3 of 3 to tag". For each one:
   arrival is matched against that booking (listed in recent events) and not
   added again.
 
+Deliveries are matched to Grocy by the barcode printed on the package
+(Kroger Restock's `barcode`, e.g. `049000028911`); Kroger's own 13-digit
+code without the check digit (`0004900002891`) and the EAN-13 form are tried
+too, so a product stored either way is found.
 If Grocy doesn't know the barcode, Pantry Hub creates the product from
 Kroger's name, brand and size (and picture). Rows older than 14 days move
 under **Older** and are deleted after 30 days; nothing is ever booked by
@@ -312,8 +316,8 @@ station needs firmware 0.3.0 or later.
 ### Product pictures
 
 When a barcode is linked and its Grocy product has no picture, Pantry Hub
-looks the barcode up in Kroger Restock (`kroger_restock.lookup_product`; only
-the barcode leaves your network), downloads the image (at most 5 MB, 10 s),
+looks the barcode up in Kroger Restock (`kroger_restock.lookup_product` with
+`upc` set to the barcode; only the barcode leaves your network), downloads the image (at most 5 MB, 10 s),
 shrinks it to 600 px and saves it in Grocy as `pantryhub_<product id>.jpg`.
 An empty product name, or one that's just the barcode, and an empty
 description ("Brand · size") are filled in; names you typed are kept. It runs
@@ -327,7 +331,11 @@ showing progress like "12 of 40, 3 not found". A product Kroger has no
 picture for isn't asked about again for 30 days.
 
 Without Kroger Restock nothing is looked up, and Details shows "Product
-pictures: Kroger Restock not found."
+pictures: Kroger Restock not found." If Kroger Restock reports that its
+Kroger sign-in failed, lookups stop and Details says "Kroger Restock needs
+you to sign in again": sign in again in Kroger Restock, then tap **Fetch
+missing pictures**. If Kroger rate-limits the lookups, Pantry Hub waits an
+hour before asking again.
 
 ### MQTT topics
 
