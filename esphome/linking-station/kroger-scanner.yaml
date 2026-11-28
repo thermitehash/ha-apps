@@ -59,7 +59,7 @@ esphome:
   friendly_name: ${friendly_name}
   project:
     name: thermitehash.pantry_linking_station
-    version: "0.4.0"
+    version: "0.4.1"
   includes:
     - include/link_mode.h
   on_boot:
@@ -347,6 +347,21 @@ binary_sensor:
     icon: mdi:link-variant
     lambda: return link_mode::state().link_mode();
 
+number:
+  - platform: template
+    id: tag_tap_pause
+    name: Tag tap pause
+    icon: mdi:timer-sand
+    unit_of_measurement: s
+    min_value: 1
+    max_value: 4
+    step: 0.5
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    mode: box
+
 switch:
   - platform: template
     id: link_beep
@@ -617,7 +632,9 @@ script:
   - id: counted_next_tag
     mode: restart
     then:
-      - delay: 1500ms
+      # "Tag tap pause" (1–4 s, default 1.5 s): time for the tag just linked
+      # to leave the antenna before the next scan.
+      - delay: !lambda "return (uint32_t) (id(tag_tap_pause).state * 1000);"
       - if:
           condition:
             lambda: return link_mode::state().counted();

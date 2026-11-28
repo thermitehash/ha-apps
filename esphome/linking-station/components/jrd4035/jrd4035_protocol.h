@@ -75,6 +75,19 @@ inline std::vector<uint8_t> set_power(float dbm) {
   return build_command(CMD_SET_POWER, {static_cast<uint8_t>(centi >> 8), static_cast<uint8_t>(centi & 0xFF)});
 }
 
+// Highest TX power the module family accepts (M100 / JRD-4035: ~26 dBm).
+constexpr float MAX_TX_POWER = 26.0f;
+
+// After the module rejects `dbm`, the next power to try: 1 dBm higher, up
+// to MAX_TX_POWER. Returns a value <= dbm when there is nothing left to try.
+// Low power is wanted (only the item in hand is read), so the station steps
+// up from the configured value to the lowest one the module accepts.
+inline float next_power_after_reject(float dbm) {
+  if (dbm >= MAX_TX_POWER) return dbm;
+  float next = static_cast<float>(static_cast<int>(dbm + 1.0f));  // whole dBm
+  return next > MAX_TX_POWER ? MAX_TX_POWER : next;
+}
+
 struct Frame {
   uint8_t type = 0;
   uint8_t cmd = 0;

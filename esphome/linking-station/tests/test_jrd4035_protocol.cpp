@@ -72,6 +72,19 @@ int main() {
   s.reset();
   assert(!s.has());
 
+  // TX power step-up after a rejection: whole dBm, capped at MAX_TX_POWER.
+  assert(next_power_after_reject(15.0f) == 16.0f);
+  assert(next_power_after_reject(18.5f) == 19.0f);
+  assert(next_power_after_reject(25.5f) == 26.0f);
+  assert(next_power_after_reject(26.0f) == 26.0f);  // nothing left to try
+  float p = 15.0f;
+  int steps = 0;
+  while (next_power_after_reject(p) > p && p < 18.5f) {  // a module that accepts >= 18.5
+    p = next_power_after_reject(p);
+    steps++;
+  }
+  assert(p == 19.0f && steps == 4);
+
   std::puts("jrd4035 protocol tests passed");
   return 0;
 }

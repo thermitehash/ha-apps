@@ -123,6 +123,32 @@ def issues_for(state: dict[str, Any]) -> list[Issue]:
                 "Fix",
             )
         )
+    reading = state.get("reading") or {}
+    if reading.get("mode") == "continuous" and not door["needed"]:
+        # 0.4.5: continuous reading is a test mode; say so instead of running
+        # silently without the door sensor.
+        no_door = not door.get("entity_id")
+        found.append(
+            Issue(
+                "warn",
+                "No door sensor: reading continuously (test mode)"
+                if no_door
+                else "Reading continuously (test mode)",
+                (
+                    "Pantry Hub reads the pantry all the time instead of when "
+                    "the door opens. Pair the door sensor, pick it in Settings, "
+                    "then set reading_mode to door in the app's Configuration."
+                )
+                if no_door
+                else (
+                    "Pantry Hub reads the pantry all the time instead of when "
+                    "the door opens. Set reading_mode to door in the app's "
+                    "Configuration to use the door sensor."
+                ),
+                "settings",
+                "Settings",
+            )
+        )
     pictures = state.get("pictures") or {}
     if pictures.get("auth_failed"):
         found.append(

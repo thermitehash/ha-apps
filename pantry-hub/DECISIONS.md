@@ -3,6 +3,36 @@
 Decisions taken while building a release, one line of reason each, so they
 can be reviewed and reverted. Newest release first.
 
+## 0.4.5: shutdown fix + continuous-mode warning
+
+1. **Stopping flag + repeated cancel**: `Hub.stop()` sets `_stopping` (the
+   tick and housekeeping loops check it each turn) and cancels every
+   background loop again every 0.5 s until it has ended.
+2. **10 s overall cap**: the shutdown runs as its own task; `stop()` waits
+   at most `stop_timeout_s` (10 s) for it, then logs the step it was at and
+   the tasks still running, and returns. Each step gives up at 80 % of the
+   cap, so a loop that didn't end is named before `stop()` returns. The
+   Grocy worker gets what's left of the budget for its in-flight call
+   (it used to wait up to 20 s on its own).
+3. **Root cause not pinned down**: the macOS dump showed the timer loop
+   still ticking after its cancel, with nothing in Pantry Hub catching
+   cancellation on that path; the fix doesn't depend on finding which call
+   lost it.
+4. **One-off CI proof**: a macOS job ran `test_just_bought.py` (and the new
+   shutdown tests) 50× once for this PR, then was removed before merging.
+5. **Continuous-mode warning**: shown whenever `reading_mode: continuous`
+   (unless the door-needed warning already shows), worded for the no-door-
+   sensor case; low priority, after the reader / Grocy / MQTT problems.
+6. **Firmware 0.4.1**: the counted-session tap pause is a template number
+   (1–4 s, step 0.5, restored after reboot, default 1.5 s); a rejected TX
+   power steps up 1 dBm at a time to 26 dBm, the accepted value is logged
+   once and kept for the session (not written back to the YAML).
+7. **Hardware answers**: UDP source IP (Docker bridge) not needed in door
+   mode; MQTT discovery entity IDs confirmed; UR4 announcements don't cross
+   VLANs by design (static IP 192.168.99.202, no discovery fallback);
+   connect-per-sweep stays the default. Recorded in the build report's
+   hardware check table.
+
 ## 0.4.4: tag allowance + Pantry-only lowering
 
 1. **Matched at the first arrival, not at linking.** The allowance is used

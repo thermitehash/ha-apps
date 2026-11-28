@@ -80,7 +80,8 @@ Hub, the hub publishes `pantry_hub/linking/kroger_scanner/start`
 `{"barcode": "...", "count": 3}`. The station enters link mode (same dim
 **blue** pulse) and starts the U107 without a barcode scan. Tap one tag at a
 time: each result flashes as usual (green linked, magenta already linked and
-skipped), then after 1.5 s the station scans for the next tag. It stops when
+skipped), then after the **Tag tap pause** (a setting on the device page,
+1–4 s, default 1.5 s; firmware 0.4.1+) the station scans for the next tag. It stops when
 the hub's result says `remaining: 0`, on a timeout or error (red), when you
 scan a barcode (a normal link replaces it), or when link mode ends. The hub
 ends the session 60 s after the last tag.
@@ -108,9 +109,11 @@ and is unit-tested on the host.
 ### U107 radio
 
 - TX power defaults to **15 dBm** (`u107_tx_power_dbm`), low so only the item
-  in your hand is read. The U107 is specified up to 26 dBm. The firmware
-  logs a warning if the module rejects a value; check the first-run
-  checklist.
+  in your hand is read. The U107 is specified up to 26 dBm. If the module
+  rejects the value (some JRD-4035/M100 modules only accept ~18.5–26 dBm),
+  firmware 0.4.1+ steps up 1 dBm at a time to the **lowest value it
+  accepts** and logs it once ("TX power is 19.0 dBm: the lowest the module
+  accepts"). Put that value in `u107_tx_power_dbm` to skip the steps.
 - The radio transmits only during a link scan. Outside a scan the module is
   sent to sleep (`0x17`) and nothing polls it, so in normal Kroger use the
   wall scanner never reads tagged items nearby. The Grove port still

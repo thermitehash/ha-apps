@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.5
+
+- **Stopping never hangs.** Shutdown no longer depends only on cancelling
+  its background loops: they also check a stopping flag, a cancel that got
+  lost is repeated, and stopping is capped at about 10 seconds. If
+  something still doesn't finish, Pantry Hub logs what was left and stops
+  anyway, so Home Assistant never has to force-stop the app. (Found as a
+  one-off test hang on macOS in 0.4.3's CI.)
+- **Continuous reading is no longer silent.** With `reading_mode:
+  continuous` (the test mode) the health line says so: "No door sensor:
+  reading continuously (test mode)" when no door sensor is chosen, with the
+  steps to switch to door mode.
+- Linking station firmware 0.4.1: the pause between taps in a counted
+  session is a setting ("Tag tap pause", 1–4 s, default 1.5 s); if the RFID
+  module rejects the configured power (15 dBm), the station steps up to the
+  lowest power it accepts and logs it.
+
 ## 0.4.4
 
 Fixes two known gaps of 0.4.3.

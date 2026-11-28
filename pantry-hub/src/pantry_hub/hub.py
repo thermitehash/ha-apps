@@ -84,6 +84,10 @@ PROBE_EVERY_S = 60.0
 PROBE_IDLE_S = 600.0
 #: Just bought housekeeping (expire old rows) this often.
 HOUSEKEEPING_S = 3600.0
+#: Shutdown never takes (much) longer than this.
+STOP_TIMEOUT_S = 10.0
+#: A background loop that didn't end is cancelled again after this long.
+CANCEL_RETRY_S = 0.5
 #: Station "Tag them" goes to before any station has been used.
 DEFAULT_STATION = "kroger_scanner"
 
@@ -150,6 +154,7 @@ class Hub:
         counted_idle: float | None = None,
         ha_backoff_s: float = 2.0,
         scan_idle_s: float | None = None,
+        stop_timeout_s: float = STOP_TIMEOUT_S,
     ) -> None:
         """Create; call :meth:`start`."""
         door_mode = options.reading_mode == "door"
@@ -343,6 +348,11 @@ class Hub:
                 on_connect=self._on_mqtt_connect,
             )
         self.last_resync: ResyncReport | None = None
+        #: Shutdown: loops check this flag, so they end even if a cancel is lost.
+        self._stopping = False
+        self.stop_timeout_s = stop_timeout_s
+        self._stop_deadline = 0.0
+        self._stop_step = ""
         self.started_at = wall()
         self._events: asyncio.Queue[PresenceEvent | None] = asyncio.Queue()
         self._seen: dict[str, float] = {}
@@ -449,20 +459,75 @@ class Hub:
         await self.refresh_counts()
 
     async def stop(self) -> None:
-        """Graceful shutdown: flush SQLite, finish the in-flight Grocy call, go offline."""
+        """Graceful shutdown: flush SQLite, finish the in-flight Grocy call, go offline.
+
+        Never takes much longer than :attr:`stop_timeout_s` (10 s): if a step
+        doesn't finish (a background loop that lost its cancellation, say),
+        the step is logged and stop returns anyway, so Home Assistant never
+        has to force-stop the app.
+        """
         _LOGGER.info("Stopping Pantry Hub")
+        self._stopping = True
+        task = asyncio.create_task(self._stop(), name="pantry_hub.stop")
+        done, _ = await asyncio.wait({task}, timeout=self.stop_timeout_s)
+        if task in done:
+            task.result()  # re-raise a real error
+            return
+        still = sorted(
+            t.get_name() for t in [*self._loops, *self._tasks] if not t.done()
+        )
+        _LOGGER.warning(
+            "Stopping took over %.0f s (at: %s; still running: %s); giving up",
+            self.stop_timeout_s,
+            self._stop_step,
+            ", ".join(still) or "nothing",
+        )
+
+    async def _end_tasks(self, tasks: list[asyncio.Task[Any]], what: str) -> None:
+        """Cancel until each task has ended; a lost cancellation is repeated.
+
+        Waits :data:`CANCEL_RETRY_S` between cancels. Gives up (logging the
+        tasks that didn't end) at the stop deadline.
+        """
+        loop = asyncio.get_running_loop()
+        pending = {t for t in tasks if not t.done()}
+        while pending:
+            remaining = self._stop_deadline - loop.time()
+            if remaining <= 0:
+                _LOGGER.warning(
+                    "%s didn't end: %s",
+                    what,
+                    ", ".join(sorted(t.get_name() for t in pending)),
+                )
+                return
+            for t in pending:
+                t.cancel()
+            _, pending = await asyncio.wait(
+                pending, timeout=min(CANCEL_RETRY_S, remaining)
+            )
+
+    async def _stop(self) -> None:
+        loop = asyncio.get_running_loop()
+        # Steps give up a little before stop()'s cap, so the loop that didn't
+        # end is logged before stop() returns.
+        self._stop_deadline = loop.time() + self.stop_timeout_s * 0.8
+        self._stop_step = "reader"
         if self.listener is not None:
             await self.listener.stop()
         if self.door_source is not None:
             await self.door_source.stop()
+        self._stop_step = "background loops"
         tick_tasks = [t for t in self._loops if t.get_name() != "pantry_hub.events"]
-        for task in tick_tasks:
-            task.cancel()
-        await asyncio.gather(*tick_tasks, return_exceptions=True)
+        await self._end_tasks(tick_tasks, "Background loop")
+        self._stop_step = "queued arrivals/departures"
         self._events.put_nowait(None)  # drain queued arrivals/departures first
         events = [t for t in self._loops if t.get_name() == "pantry_hub.events"]
-        await asyncio.gather(*events, return_exceptions=True)
+        if events:
+            remaining = max(self._stop_deadline - loop.time() - 2.0, 0.1)
+            await asyncio.wait(events, timeout=remaining)
+            await self._end_tasks(events, "Event loop")
         self._loops.clear()
+        self._stop_step = "linking, Kroger Restock, pictures"
         await self.linking.close()
         if self.ha_events is not None:
             await self.ha_events.stop()
@@ -472,14 +537,19 @@ class Hub:
             await self.pictures.close()
         if self.ha_api is not None:
             await self.ha_api.close()
-        for task in list(self._tasks):
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._stop_step = "helper tasks"
+        await self._end_tasks(list(self._tasks), "Helper task")
+        self._stop_step = "SQLite flush"
         await self._flush_seen()
+        self._stop_step = "reader session"
         await self.session.close()
-        await self.worker.stop()
+        self._stop_step = "Grocy worker"
+        # The in-flight Grocy call gets what's left of the shutdown budget.
+        await self.worker.stop(timeout=max(self._stop_deadline - loop.time(), 0.5))
+        self._stop_step = "MQTT"
         if self.mqtt is not None:
             await self.mqtt.stop()
+        self._stop_step = "done"
 
     def _spawn(self, coro: Coroutine[Any, Any, Any], name: str) -> None:
         task = asyncio.create_task(coro, name=name)
@@ -907,7 +977,7 @@ class Hub:
 
     async def _tick_loop(self) -> None:
         last_touch = self.monotonic()
-        while True:
+        while not self._stopping:
             await asyncio.sleep(self.tick_s)
             try:
                 now = self.monotonic()
@@ -924,7 +994,7 @@ class Hub:
                 _LOGGER.exception("Error in the hub timer")
 
     async def _housekeeping_loop(self) -> None:
-        while True:
+        while not self._stopping:
             try:
                 if self.just_bought is not None:
                     await self.just_bought.housekeeping()
