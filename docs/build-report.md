@@ -2,7 +2,7 @@
 - App version: 0.4.5 (shutdown fix + continuous-mode warning; 0.1.0–0.3.1 in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4, 0.4.0 in PR #5, 0.4.1 in PR #6, 0.4.2 in PR #7, 0.4.3 in PR #8, 0.4.4 in PR #9, 0.4.5 in PR #10) · linking station firmware 0.4.1
 - Branches: PR #10 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `34faa3d`, the merge of PR #9 (0.4.4). Merging PR #10 publishes 0.4.5.
 - aiochainway version used: v0.4.0 (unchanged).
-- Date / PR / Commit / CI (per job): 2026-11-28 / PR #10 / CI_PENDING (0.4.4: PR #9 at `aae6bdc`, all green, merged as `34faa3d`; main runs green)
+- Date / PR / Commit / CI (per job): 2026-11-28 / PR #10 / `ce7cbee` / all green: HA app linter, yamllint, Ruff + mypy, ESPHome linking station (firmware 0.4.1 compile), Version bump, Pytest (ubuntu-latest), Pytest (macos-latest), Sweep-now repeat ×200 (macOS), **Just bought repeat ×50 (macOS): 1150 passed in 240 s** (one-off job, removed in the next commit), UI smoke (Playwright), Prepare, Build amd64, Build aarch64 (multi-arch manifest skipped on PRs). 0.4.4: PR #9 at `aae6bdc`, merged as `34faa3d`.
 
 ## Summary
 **v0.4.5, shutdown fix + continuous-mode warning** (no new features; waiting for the hardware checks below):
@@ -301,7 +301,7 @@ Q8 is resolved in v0.3.0 (printed mode card). New hardware check: 9. confirm the
 ## Test results (tests, coverage, property tests, fault injection)
 - **v0.4.5** (393 pytest tests incl. 14 browser tests; ruff, mypy --strict, yamllint clean; firmware host tests pass):
   - `tests/test_shutdown.py` (4): **a cancel lost inside one tick** (publish_state swallows it once, like the CI hang) → `stop()` finishes in < 3 s and the tick task has ended; **a loop that ignores every cancel** → logged "Background loop didn't end: pantry_hub.stubborn", the rest of the shutdown still runs, `stop()` returns in < 1.5 s (cap 1 s); **a step that never returns** (worker stop) → `stop()` returns at the cap and logs "at: Grocy worker"; **continuous mode without a door sensor** → health warning with the switch-to-door steps.
-  - One-off macOS CI job: `test_just_bought.py` + `test_shutdown.py` ×50.
+  - One-off macOS CI job: `test_just_bought.py` + `test_shutdown.py` ×50 → **1150 passed in 240 s**, no hang (job removed before merging).
   - Firmware host tests: TX power step-up (15 → 16, 18.5 → 19, cap 26; a module accepting ≥ 18.5 dBm ends at 19 after 4 steps).
 - **v0.4.4** (389 pytest tests incl. 14 browser tests; coverage 93%; ruff, mypy --strict, yamllint clean):
   - `tests/test_allowance.py` (8): **allowance of 2: two new tags add nothing, the third adds 1, inside the window**; the cereal example (count 3, Tag N, 2 more linked, all 5 arrive → Grocy 5); **expiry at 7 days** (1 min before: matched; after: the new tag's add is sent; "1 booked unit still to tag"); only a new tag's first arrival uses it (a returning tag adds; a tag linked while present is matched at linking); **Tag them fills it** (topped up, twice → still 2; arrivals add nothing; a 3rd box adds); **migration from 0.4.3** (`booked_credits` → `allowances`, same expiry, once); **lowering with a fridge entry consumes only Pantry stock** (consume with `location_id` 1, `spoiled` false, no inventory call); **Pantry shortfall** (review drop 5, pantry holds 2 → consumed 2, `shortfall` 3, `elsewhere` 2).

@@ -61,32 +61,6 @@ jobs:
           "tests/test_door_reading.py::test_sweep_now_during_continuous_then_resumes"
           --count=200 -x -p no:randomly
 
-  # One-off for 0.4.5 (removed again before merging): the Just bought tests
-  # 50× on macOS, where 0.4.3's main run hung in a teardown (Hub.stop waiting
-  # for a timer loop that had lost its cancellation).
-  macos-just-bought-50:
-    name: Just bought repeat ×50 (macOS)
-    runs-on: macos-latest
-    timeout-minutes: 40
-    defaults:
-      run:
-        working-directory: pantry-hub
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
-          cache: pip
-          cache-dependency-path: pantry-hub/pyproject.toml
-      - run: pip install -e ".[dev]"
-      - name: tests/test_just_bought.py × 50 (+ the shutdown tests)
-        env:
-          PANTRY_HUB_HANG_DUMP_S: "60"
-        run: >-
-          python -m pytest -q -o faulthandler_timeout=300
-          tests/test_just_bought.py tests/test_shutdown.py
-          --count=50 -p no:randomly
-
   # Browser smoke test of the web UI (Playwright + Chromium): every tab at
   # 390×844 and 1280×800, light and dark, no console errors, no horizontal
   # scroll, refetch on visibility/pageshow/focus, the door check flow.
