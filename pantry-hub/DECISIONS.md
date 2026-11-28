@@ -3,6 +3,78 @@
 Decisions taken while building a release, one line of reason each, so they
 can be reviewed and reverted. Newest release first.
 
+## 0.4.3: Unload + Stock-take
+
+1. **Long-press = hold 6 s.** "Hold 1–6 s" already syncs the Kroger cart, so
+   Stock-take takes a hold of at least 6 s (fires while still held). Double-
+   click now waits 0.4 s (was 0.2 s) after the second press so a triple-click
+   isn't read as a double-click; a single click waits 0.4 s too.
+2. **Single click** leaves Unload / Stock-take; in Kroger and link mode it
+   still prints the list. The same gesture again (triple-click in Unload,
+   6 s hold in Stock-take) also leaves.
+3. **Colours**: Unload slow green; Stock-take slow amber (2.5 s pulse) —
+   the in-stock session keeps its normal-speed amber in link mode, so the
+   speed tells them apart.
+4. **Station ↔ hub**: the station publishes `mode_state` on every change and
+   `scan` for each barcode; the web UI sends `mode` to the station used last
+   (else `kroger_scanner`). Both sides time out after 3 minutes; the station
+   doesn't echo hub commands back.
+5. **A scan's mode comes from the scanner** (station message / web call), so
+   a scan arriving after the hub's session timed out still counts (and
+   restarts the session).
+6. **Unload rows**: one open row per barcode, +1 per scan (max 99), source
+   `unload`, product resolved at scan time; Not tagging books without price,
+   note "Pantry Hub: unloaded groceries".
+7. **Unknown barcodes** go to the existing "needs a product" list (no row).
+8. **Untracked items (Kroger Restock v0.17.3)**: event
+   `kroger_restock_untracked_items` `{order_ref, untracked_count,
+   pickup_window, received_at, config_entry_id}` (once per order at pickup,
+   only when > 0) and, for a pickup while Pantry Hub was down,
+   `untracked_orders` in `recent_received` (read at start and on every
+   reconnect). An order is remembered once by `order_ref` (event and
+   catch-up don't double it); the last 10 are kept. The prompt is for the
+   newest order picked up in the last 6 hours and says **"about N"** (the
+   count is a net difference); it disappears at 0, and further scans are
+   still accepted. Unload scans in that window are tied to the order
+   (`order_ref` on the unload row) and count down — except a product
+   Kroger Restock tracked in the same order (a Just bought row with that
+   `order_ref`, also when checked off by hand), which isn't untracked. The
+   sensor `sensor.<store>_untracked_items_in_last_order` is found by its
+   `order_ref` attribute in `GET /api/states` (never hard-coded) and adds
+   "40 items in the order, 37 already in Just bought". Older Kroger Restock
+   (no event, no `untracked_orders`): nothing shown, nothing logged.
+9. **Unload / Stock-take work without Kroger Restock** (and without the HA
+   API): only Grocy is needed; the Kroger lookup is skipped.
+10. **Stock-take counts untagged units**; a product's target is counted +
+    linked tags present. Products not counted appear in the review only if
+    Grocy has pantry stock that the tags don't explain (all-tagged products
+    that agree with Grocy are skipped, as asked).
+11. **"Set" keeps other locations**: Grocy's inventory sets a product's total,
+    so Pantry Hub sends `total − pantry + target`. (Grocy decides which entries
+    a decrease removes; it may take from another location if the pantry has
+    none of the right best-before dates.)
+12. **"Add as purchases"** adds only positive differences (no price, note
+    "Pantry Hub stock-take"); negative differences are reported, not
+    consumed. "Gone" applies an inventory correction in either mode.
+13. **Tag N only after Apply**, and the counted units are recorded as booked
+    (the Not-tagging 7-day rule), so the first arrival of a tagged counted
+    unit adds nothing. Known side effect: a *new* unit of the same product
+    tagged within those 7 days is also matched (same as Not tagging).
+14. **Grocy-only stock "Tag them"** links as already in stock (exact; no
+    7-day credit needed). The list reads `GET /stock/locations/<id>/entries`,
+    cached 60 s and refreshed in the background.
+15. **ZXing 0.21.3** (`@zxing/library`, Apache-2.0, 336 KB) is bundled and
+    loaded only when `BarcodeDetector` is missing; notice in
+    `THIRD_PARTY_NOTICES.md`. Typed codes are never deduplicated; camera reads
+    of the same code within 2.5 s are.
+16. **One session at a time** (Unload or Stock-take, from any source); a new
+    start replaces the old one. A stock-take's counts survive restarts (DB);
+    the scanning session doesn't.
+17. **Sidebar freshness (item 6)**: already fixed in 0.4.0; confirmed by a new
+    browser test that loads the page in an iframe the way the HA sidebar
+    does, removes and re-adds it, toggles visibility and goes back/forward.
+    No code change was needed.
+
 ## 0.4.2: Kroger Restock contract fix
 
 Checked against Kroger Restock v0.17.2 as installed (verified live on

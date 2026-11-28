@@ -253,7 +253,9 @@ async def test_no_ha_api_means_no_picture_feature(
     r = Rig(tmp_path, grocy, None, clock)
     await r.start()
     try:
-        assert r.h.pictures is None and r.h.just_bought is None
+        # Kroger parts off; Unload / Stock-take still work with Grocy alone.
+        assert r.h.ha_api is None and r.h.ha_events is None
+        assert r.h.scans is not None
         assert "Kroger Restock" in r.h.fetch_missing_pictures()
         async with WebClient(r.h) as c:
             state = await c.state()

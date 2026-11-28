@@ -197,22 +197,123 @@ function boughtRow(r, state, ui) {
 <div class="actions"><button class="btn primary" type="button" data-action="post" data-path="/bought/tag" data-row="${r.id}">Tag them</button><button class="btn" type="button" data-action="skip-toggle" data-row="${r.id}" aria-expanded="${skipOpen}">Not tagging</button></div>${skip}</li>`;
 }
 
+function scanSession(state, mode) {
+  const sc = state.scan;
+  return sc && sc.session && sc.session.mode === mode ? sc.session : null;
+}
+
+function lastScan(state, mode) {
+  const last = state.scan && state.scan.last;
+  if (!last || last.mode !== mode) return "";
+  const cls = last.status === "error" || last.status === "unknown_barcode" ? "error-text" : "sub";
+  return `<p class="${cls}" role="status" aria-live="polite">${esc(last.message)}</p>`;
+}
+
+function untrackedDetail(u) {
+  const parts = [];
+  if (u.item_count != null && u.tracked_units != null) parts.push(`${u.item_count} items in the order, ${u.tracked_units} already in Just bought`);
+  if (u.pickup_window) parts.push(`picked up ${u.pickup_window}`);
+  parts.push("Kroger Restock couldn't match these; scan them as you put them away");
+  return esc(parts.join(" · "));
+}
+
 export function justBought(state, ui) {
   const jb = state.just_bought;
-  if (!jb || !jb.available) return "";
+  const sc = state.scan || {};
+  if (!jb || (!jb.available && !sc.available)) return "";
   const fresh = jb.rows.filter((r) => !r.older);
   const older = jb.rows.filter((r) => r.older);
   const s = jb.session;
   const session = s
     ? `<div class="session" role="status" aria-live="polite"><span class="title">Tap each ${esc(s.product)} on the station</span><span class="sub">${esc(s.text)}${s.skipped ? ` · ${plural(s.skipped, "tag")} skipped (already linked)` : ""}</span></div>`
     : "";
-  if (!fresh.length && !older.length && !session) return "";
-  const head = `<div class="section-head"><h2>Just bought · ${plural(jb.to_tag, "item")} to tag</h2></div>`;
+  const unloading = scanSession(state, "unload");
+  const u = jb.untracked;
+  const untracked =
+    u && !unloading
+      ? `<div class="untracked"><span class="title">About ${plural(u.remaining, "more item")} from your Kroger order — start unloading</span><span class="sub">${untrackedDetail(u)}</span><button class="btn primary" type="button" data-action="scan-start" data-mode="unload">Start unloading</button></div>`
+      : "";
+  let unload = "";
+  if (sc.available) {
+    unload = unloading
+      ? `<div class="unloading" role="status" aria-live="polite"><span class="title">Unloading${u ? ` · about ${plural(u.remaining, "item")} left from your Kroger order` : ""}</span><span class="sub">Scan each item${unloading.station ? ` at the ${esc(unloading.station)} station (green pulse)` : ""} or with your phone. ${plural(unloading.scans, "scan")} so far; stops after 3 minutes without a scan.</span>${lastScan(state, "unload")}<div class="actions"><button class="btn primary" type="button" data-action="scan-open" data-mode="unload">Scan barcode</button><button class="btn" type="button" data-action="scan-stop">Stop unloading</button></div></div>`
+      : `<div class="actions"><button class="btn" type="button" data-action="scan-start" data-mode="unload">Start unloading</button><button class="btn" type="button" data-action="scan-open" data-mode="unload">Scan barcode</button></div>`;
+  }
+  const head = `<div class="section-head"><h2>Just bought${jb.to_tag ? ` · ${plural(jb.to_tag, "item")} to tag` : ""}</h2></div>`;
   const list = fresh.length ? `<ul class="list" role="list">${fresh.map((r) => boughtRow(r, state, ui)).join("")}</ul>` : "";
   const old = older.length
     ? `<details class="older-group"${ui.olderOpen ? " open" : ""}><summary data-action="older-toggle">Older · ${older.length}</summary><ul class="list" role="list">${older.map((r) => boughtRow(r, state, ui)).join("")}</ul></details>`
     : "";
-  return head + session + list + old;
+  return head + untracked + session + unload + list + old;
+}
+
+// Stock-take (Tags tab) --------------------------------------------------------
+
+function fmt(n) {
+  return Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100);
+}
+
+function signed(n) {
+  if (n > 0) return `+${fmt(n)}`;
+  return fmt(n);
+}
+
+export function stocktakeCard(state) {
+  const st = state.stocktake;
+  if (!st) return "";
+  const head = `<div class="section-head"><h2>Stock-take</h2></div>`;
+  if (!st.phase) {
+    return `${head}<div class="card stack"><p class="sub">Count what's already in the pantry: scan each unit's barcode once (or scan once and type how many). Tagged items are counted by the reader, so only count the untagged ones. At the end you review the numbers before anything changes in Grocy.</p><div class="actions"><button class="btn primary" type="button" data-action="scan-start" data-mode="stocktake">Start stock-take</button></div><p class="sub">On the station: hold the button for 6 seconds (slow amber pulse).</p></div>`;
+  }
+  if (st.phase === "counting") {
+    const counting = scanSession(state, "stocktake");
+    const rows = st.counts
+      .map(
+        (r) => `<li class="item"><form class="row count-form" data-form="count" data-epc="${r.product_id}"><span class="grow"><span class="title">${esc(r.product_name)}</span></span><label class="qty-field"><span class="visually-hidden">How many ${esc(r.product_name)}</span><input class="input" name="counted" type="number" min="0" max="999" inputmode="numeric" value="${r.scanned}"></label><button class="btn" type="submit">Save</button></form></li>`,
+      )
+      .join("");
+    const list = rows ? `<ul class="list" role="list">${rows}</ul>` : `<p class="sub">Nothing counted yet.</p>`;
+    const where = counting
+      ? `Scanning${counting.station ? ` at the ${esc(counting.station)} station (slow amber pulse)` : ""}; stops after 3 minutes without a scan.`
+      : `Scanning paused. Start again to keep counting.`;
+    return `${head}<div class="card stack"><span class="title">Counting · ${plural(st.counts.length, "product")}</span><span class="sub">${where}</span>${lastScan(state, "stocktake")}${list}<div class="actions"><button class="btn primary" type="button" data-action="scan-open" data-mode="stocktake">Scan barcode</button>${counting ? "" : `<button class="btn" type="button" data-action="scan-start" data-mode="stocktake">Resume scanning</button>`}<button class="btn primary" type="button" data-action="post" data-path="/stocktake/finish">Finish stock-take</button><button class="btn" type="button" data-action="post" data-path="/stocktake/close" data-confirm="Cancel this stock-take? The counts are thrown away; Grocy isn't changed.">Cancel</button></div></div>`;
+  }
+  const applied = st.phase === "applied";
+  const rows = st.review
+    .map((r) => {
+      const diff = r.difference === 0 ? "—" : signed(r.difference);
+      const tags = r.tags ? ` + ${r.tags} tagged` : "";
+      const counted = r.scanned ? `${r.counted}${tags}` : `not scanned${tags}`;
+      const note = r.applied === "set" ? "Grocy set" : r.applied === "purchase" ? "Purchase added" : r.applied === "gone" ? "Set to gone" : "";
+      const tag =
+        applied && r.scanned && r.to_tag > 0
+          ? `<button class="btn" type="button" data-action="post" data-path="/stocktake/tag" data-product_id="${r.product_id}">Tag ${r.to_tag}</button>`
+          : "";
+      return `<tr${r.scanned ? "" : ' class="unscanned"'}><th scope="row">${esc(r.name)}${note ? `<span class="sub"> · ${note}</span>` : ""}</th><td>${counted}</td><td>${fmt(r.grocy)}</td><td class="${r.difference > 0 ? "pos" : r.difference < 0 ? "neg" : ""}">${diff}</td><td>${tag}</td></tr>`;
+    })
+    .join("");
+  const table = `<div class="table-wrap"><table class="review"><thead><tr><th scope="col">Product</th><th scope="col">Counted</th><th scope="col">Grocy</th><th scope="col">Difference</th><th scope="col"><span class="visually-hidden">Tag</span></th></tr></thead><tbody>${rows || `<tr><td colspan="5">Nothing to review.</td></tr>`}</tbody></table></div>`;
+  if (applied) {
+    return `${head}<div class="card stack"><span class="title">Applied${st.how === "purchase" ? " as purchases" : ""}</span><span class="sub">Tag the counted items now if you like: tap Tag, then tap each item on the station. They won't be added to Grocy again when the reader sees them.</span>${table}<div class="actions"><button class="btn" type="button" data-action="post" data-path="/stocktake/close">Close stock-take</button></div></div>`;
+  }
+  return `${head}<div class="card stack"><span class="title">Review</span><span class="sub">Counted = untagged items you scanned (+ tagged items the reader sees). Grocy = what Grocy has in the pantry now.</span>${table}
+<form class="stack" data-form="apply" data-epc="stocktake">
+<label class="check"><input type="radio" name="how" value="set" checked> Set Grocy to the counts (inventory correction, no fake purchases)</label>
+<label class="check"><input type="radio" name="how" value="purchase"> Add missing items as purchases</label>
+<label class="check"><input type="checkbox" name="gone"> Products I didn't scan are gone</label>
+<div class="actions"><button class="btn primary" type="submit">Apply to Grocy</button><button class="btn" type="button" data-action="post" data-path="/stocktake/close" data-confirm="Cancel this stock-take? Grocy isn't changed.">Cancel</button></div>
+</form></div>`;
+}
+
+export function grocyUntagged(state, ui) {
+  const g = state.grocy_untagged;
+  if (!g || !g.rows.length) return "";
+  const rows = g.rows
+    .map(
+      (r) => `<li class="item row">${pic(r.product_id, state, ui)}<span class="grow"><span class="title">${esc(r.name)}</span><span class="sub">${fmt(r.in_grocy)} in Grocy${r.tagged ? ` · ${r.tagged} tagged` : ""}</span></span><button class="btn" type="button" data-action="post" data-path="/grocy-stock/tag" data-product_id="${r.product_id}">Tag them</button></li>`,
+    )
+    .join("");
+  return `<div class="section-head"><h2>In Grocy, not tagged · ${g.rows.length}</h2></div><p class="sub">Stock Grocy already has in the pantry. Tagging these never adds them again.</p><ul class="list" role="list">${rows}</ul>`;
 }
 
 export function picturesCard(state) {

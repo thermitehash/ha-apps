@@ -313,6 +313,70 @@ under **Older** and are deleted after 30 days; nothing is ever booked by
 itself. The card is hidden when Kroger Restock isn't installed. The linking
 station needs firmware 0.3.0 or later.
 
+### Unloading groceries from elsewhere (Unload)
+
+For anything Kroger Restock doesn't report (the Kroger app, in-store, other
+shops). On the linking station **triple-click** the button: the LED pulses
+slowly green. Or tap **Start unloading** on the Pantry page. Then scan each
+item; scanning the same product again adds 1. On a phone, **Scan barcode**
+opens the camera (or type the barcode).
+
+For each barcode Pantry Hub finds the Grocy product (printed code, UPC-A /
+EAN-13 and Kroger's 13-digit form all match). If Grocy doesn't have it, it
+creates it from Kroger Restock's lookup (name, brand, size, picture), then
+from Grocy's barcode lookup plugin; if neither knows it, the barcode goes to
+"Barcodes without a Grocy product". Unloaded items appear in **Just bought**
+and work like Kroger deliveries: **Tag them**, or **Not tagging** (booked in
+Grocy without a price). Nothing is ever added to the Kroger cart. Unload
+ends after 3 minutes without a scan, with a single click on the station, or
+**Stop unloading**.
+
+With Kroger Restock 0.17.3 or later, a pickup with items it couldn't match
+(bought in the Kroger app or substituted, not on its list) shows "About 12
+more items from your Kroger order — start unloading" on the Just bought card,
+with the order's item count from Kroger Restock's "untracked items in last
+order" sensor. It counts down as you unload within 6 hours of pickup (it's
+"about": Kroger Restock reports a net difference, so it stops at 0 and
+further scans still count as unloaded). Scanning something Kroger Restock
+already tracked in that order doesn't count down. A pickup while Pantry Hub
+was off still shows the prompt when it starts. Older Kroger Restock
+versions show nothing.
+
+The phone camera needs Home Assistant opened over HTTPS (or on the device
+itself); otherwise type the barcode. Browsers without a built-in barcode
+reader use a copy of ZXing that comes with Pantry Hub (no internet needed).
+
+### Stock-take (what's already in the pantry)
+
+For the first setup and any later recount. **Tags → Start stock-take**, or
+hold the station button for **6 seconds** (slow amber pulse). Scan each
+**untagged** unit once, or scan a product once and type how many; tagged
+items are counted by the reader. **Finish stock-take** shows the review: per
+product the counted units (plus tags the reader sees), Grocy's amount in the
+pantry, and the difference. Then:
+
+- **Set Grocy to the counts**: an inventory correction per product (Grocy's
+  inventory, not a purchase), so prices and history aren't faked. Units of
+  that product in other locations are kept.
+- **Add missing items as purchases**: only positive differences are added
+  (no price); surplus in Grocy is left alone.
+
+Products you didn't scan are left alone unless **Products I didn't scan are
+gone** is ticked (then their pantry amount is set to what the tags show,
+usually 0). Products whose every unit is tagged and agree with Grocy don't
+appear: the reader owns them.
+
+After applying, each counted product has **Tag N**: tap it, then tap each
+item on the station. Those items' first reader arrival doesn't add them
+again (like Not tagging, for 7 days).
+
+### In Grocy, not tagged
+
+The Tags page lists products Grocy has in the pantry location with more
+units than tags (for example stock you entered in Grocy by hand), with
+**Tag them**. Those links are "already in stock", so tagging never adds them
+to Grocy again.
+
 ### Product pictures
 
 When a barcode is linked and its Grocy product has no picture, Pantry Hub
@@ -345,6 +409,9 @@ hour before asking again.
 | `pantry_hub/linking/<station>/tag` | station → hub | `{"epc": "...", "rssi": -45.2, "ts": ..., "in_stock"?: true}` |
 | `pantry_hub/linking/<station>/result` | hub → station | `{"status": "linked\|unknown_barcode\|tag_already_linked\|timeout\|error", "product": "...", "message": "..."}`; in a counted session also `"count", "linked", "remaining"` |
 | `pantry_hub/linking/<station>/start` | hub → station | `{"barcode": "...", "count": 3}`: start a counted session (Tag them) |
+| `pantry_hub/linking/<station>/scan` | station → hub | `{"barcode": "...", "mode": "unload\|stocktake", "ts": ...}` (answer on `result`: `added`, `counted`, `unknown_barcode`, `error`) |
+| `pantry_hub/linking/<station>/mode_state` | station → hub | `{"mode": "kroger\|link\|unload\|stocktake"}` after a gesture or timeout |
+| `pantry_hub/linking/<station>/mode` | hub → station | `{"mode": "unload\|stocktake\|off"}` (web UI started / stopped it) |
 | `pantry_hub/pictures/press` | anyone → hub | fetch missing pictures |
 | `pantry_hub/events` | hub → anyone | `{"event_type": "arrived\|departed", "epc", "product", "product_id", "linked", "ts"}` |
 | `pantry_hub/state` | hub → HA (retained) | sensor values |

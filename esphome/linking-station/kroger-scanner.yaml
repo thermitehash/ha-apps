@@ -59,7 +59,7 @@ esphome:
   friendly_name: ${friendly_name}
   project:
     name: thermitehash.pantry_linking_station
-    version: "0.3.0"
+    version: "0.4.0"
   includes:
     - include/link_mode.h
   on_boot:
@@ -140,6 +140,16 @@ mqtt:
               ESP_LOGI("link", "Counted session: %d to go", remaining);
               id(counted_next_tag).execute();
             }
+    # Pantry Hub's web UI started / stopped Unload or Stock-take.
+    - topic: pantry_hub/linking/${station_id}/mode
+      then:
+        - lambda: |-
+            std::string mode = x["mode"] | "";
+            if (link_mode::state().set_mode_from_hub(mode)) {
+              ESP_LOGI("link", "Mode from Pantry Hub: %s", link_mode::state().mode_name());
+              id(touch_link_mode).execute();
+              id(link_idle_led).execute();
+            }
     # Pantry Hub "Just bought" → Tag them: link up to `count` tags, one per
     # tap, to the product with this barcode (same blue pulse as link mode).
     - topic: pantry_hub/linking/${station_id}/start
@@ -192,6 +202,12 @@ uart:
               case link_mode::Action::LINK_BARCODE:
                 id(last_barcode).publish_state(scan.code);
                 id(link_barcode).execute(scan.code);
+                break;
+              case link_mode::Action::UNLOAD_BARCODE:
+              case link_mode::Action::STOCKTAKE_BARCODE:
+                // Never kroger_restock.scan_upc: Pantry Hub only.
+                id(last_barcode).publish_state(scan.code);
+                id(scan_to_hub).execute(scan.code);
                 break;
               case link_mode::Action::SESSION_ON:
                 ESP_LOGI("link", "In-stock session on: links skip the next Grocy add");
@@ -255,6 +271,13 @@ light:
           update_interval: 1s
           min_brightness: 5%
           max_brightness: 35%
+      # Unload (green) and Stock-take (amber): a slower pulse.
+      - pulse:
+          name: slow_pulse
+          transition_length: 2500ms
+          update_interval: 2500ms
+          min_brightness: 5%
+          max_brightness: 40%
 
 text_sensor:
   - platform: template
@@ -277,20 +300,36 @@ binary_sensor:
     filters:
       - delayed_on: 20ms
     on_multi_click:
-      # Double-click: toggle link mode.
+      # Triple-click: Unload mode (again: back to Kroger mode).
       - timing:
           - ON for at most 0.7s
           - OFF for at most 0.35s
           - ON for at most 0.7s
-          - OFF for at least 0.2s
+          - OFF for at most 0.35s
+          - ON for at most 0.7s
+          - OFF for at least 0.4s
         then:
-          - script.execute: toggle_link_mode
-      # Single short press (waits ~350 ms to rule out a double-click): print.
+          - script.execute: { id: button_gesture, gesture: 3 }
+      # Double-click: toggle link mode (waits 0.4 s to rule out a third click).
+      - timing:
+          - ON for at most 0.7s
+          - OFF for at most 0.35s
+          - ON for at most 0.7s
+          - OFF for at least 0.4s
+        then:
+          - script.execute: { id: button_gesture, gesture: 2 }
+      # Single short press (waits ~400 ms to rule out a double-click): print,
+      # or leave Unload / Stock-take.
       - timing:
           - ON for 30ms to 0.7s
-          - OFF for at least 0.35s
+          - OFF for at least 0.4s
         then:
-          - script.execute: print_receipt
+          - script.execute: { id: button_gesture, gesture: 1 }
+      # Hold 6 s: Stock-take mode (again: back to Kroger mode).
+      - timing:
+          - ON for at least 6s
+        then:
+          - script.execute: { id: button_gesture, gesture: 4 }
       # Hold 1–6 s: sync the cart.
       - timing:
           - ON for 1s to 6s
@@ -323,10 +362,13 @@ interval:
       - if:
           condition:
             lambda: |-
-              return link_mode::state().link_mode() && !id(u107).is_scanning() &&
-                     millis() - id(link_last_activity) > ${link_idle_timeout_ms};
+              uint32_t timeout = link_mode::state().idle_timeout_ms();
+              return timeout > 0 && !id(u107).is_scanning() &&
+                     millis() - id(link_last_activity) > timeout;
           then:
-            - logger.log: "Link mode idle for 60 s; back to Kroger mode"
+            - lambda: |-
+                ESP_LOGI("link", "%s mode idle; back to Kroger mode",
+                         link_mode::state().mode_name());
             - script.execute: exit_link_mode
 
 script:
@@ -405,13 +447,82 @@ script:
       - script.execute: touch_link_mode
       - logger.log: "Link mode on"
       - script.execute: link_idle_led
+      - script.execute: publish_mode_state
+
+  # Button gestures (1 single, 2 double, 3 triple, 4 hold 6 s); the mode
+  # logic is link_mode::State::on_click (host-tested).
+  - id: button_gesture
+    mode: queued
+    parameters:
+      gesture: int
+    then:
+      - lambda: |-
+          using link_mode::Click;
+          using link_mode::ClickAction;
+          Click c = gesture == 1 ? Click::SINGLE : gesture == 2 ? Click::DOUBLE
+                  : gesture == 3 ? Click::TRIPLE : Click::LONG;
+          if (c == Click::SINGLE && link_mode::state().mode() != link_mode::Mode::UNLOAD &&
+              link_mode::state().mode() != link_mode::Mode::STOCKTAKE) {
+            id(print_receipt).execute();
+            return;
+          }
+          if (c == Click::DOUBLE) {
+            // Keeps the old exit flash and U107 stop when link mode ends.
+            if (link_mode::state().link_mode()) id(exit_link_mode).execute();
+            else id(enter_link_mode).execute();
+            return;
+          }
+          ClickAction a = link_mode::state().on_click(c);
+          if (a == ClickAction::EXIT_MODE) {
+            id(exit_link_mode).execute();
+            return;
+          }
+          ESP_LOGI("link", "%s mode on", link_mode::state().mode_name());
+          id(touch_link_mode).execute();
+          id(link_idle_led).execute();
+          id(publish_mode_state).execute();
+
+  - id: publish_mode_state
+    then:
+      - if:
+          condition:
+            mqtt.connected:
+          then:
+            - mqtt.publish_json:
+                topic: pantry_hub/linking/${station_id}/mode_state
+                payload: |-
+                  root["mode"] = link_mode::state().mode_name();
+
+  # Unload / Stock-take: the barcode goes to Pantry Hub only (never the
+  # Kroger cart); the hub answers on .../result (green added/counted, amber
+  # unknown barcode, red error).
+  - id: scan_to_hub
+    mode: queued
+    parameters:
+      code: string
+    then:
+      - script.execute: touch_link_mode
+      - if:
+          condition:
+            mqtt.connected:
+          then:
+            - mqtt.publish_json:
+                topic: pantry_hub/linking/${station_id}/scan
+                payload: |-
+                  root["barcode"] = code;
+                  root["mode"] = link_mode::state().mode_name();
+                  root["ts"] = id(ha_time).now().is_valid() ? id(ha_time).now().timestamp : 0;
+          else:
+            - logger.log: "MQTT not connected; scan not sent"
+            - script.execute: { id: show_color, r: 1.0, g: 0.0, b: 0.0 }
 
   - id: exit_link_mode
     then:
       - lambda: |-
           id(u107).stop_scan();
           link_mode::state().exit_link();  // also ends any in-stock session
-      - logger.log: "Link mode off"
+      - logger.log: "Back to Kroger mode"
+      - script.execute: publish_mode_state
       # Visible exit: one quick cyan flash, then LED off (Kroger idle).
       - light.turn_on:
           id: status_led
@@ -435,14 +546,25 @@ script:
     then:
       - if:
           condition:
-            lambda: return link_mode::state().link_mode();
+            lambda: return link_mode::state().idle_color().on && link_mode::state().idle_color().slow;
           then:
             - light.turn_on:
                 id: status_led
                 red: !lambda "return link_mode::state().idle_color().r;"
                 green: !lambda "return link_mode::state().idle_color().g;"
                 blue: !lambda "return link_mode::state().idle_color().b;"
-                effect: link_pulse
+                effect: slow_pulse
+          else:
+            - if:
+                condition:
+                  lambda: return link_mode::state().idle_color().on;
+                then:
+                  - light.turn_on:
+                      id: status_led
+                      red: !lambda "return link_mode::state().idle_color().r;"
+                      green: !lambda "return link_mode::state().idle_color().g;"
+                      blue: !lambda "return link_mode::state().idle_color().b;"
+                      effect: link_pulse
 
   - id: link_barcode
     mode: restart
@@ -475,7 +597,7 @@ script:
       - lambda: |-
           id(u107).stop_scan();
           int beeps = 0;
-          if (status == "linked") {
+          if (status == "linked" || status == "added" || status == "counted") {
             id(show_color).execute(0.0f, 1.0f, 0.0f);        // green
             beeps = 1;
           } else if (status == "unknown_barcode") {

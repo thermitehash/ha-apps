@@ -301,6 +301,9 @@ async def build_state(hub: Hub) -> dict[str, Any]:
         "events": list(reversed(hub.recent_events)),
         "pictures": _pictures(hub),
         "just_bought": await _just_bought(hub),
+        "scan": _scan(hub),
+        "stocktake": await hub.scans.state() if hub.scans else None,
+        "grocy_untagged": _grocy_untagged(hub),
         "resync": _resync(hub),
         "options": {
             "reading_mode": opts.reading_mode,
@@ -352,6 +355,29 @@ def _pictures(hub: Hub) -> dict[str, Any]:
     }
 
 
+def _scan(hub: Hub) -> dict[str, Any]:
+    """Unload / Stock-take session and the last scan's answer."""
+    scans = hub.scans
+    if scans is None:
+        return {"available": False, "session": None, "last": None}
+    last = scans.last_result
+    return {
+        "available": True,
+        "session": scans.session.as_dict() if scans.session else None,
+        "last": last.payload() if last else None,
+        "station": hub.tag_station(),
+    }
+
+
+def _grocy_untagged(hub: Hub) -> dict[str, Any]:
+    """Pantry stock in Grocy without tags (refreshed in the background)."""
+    gu = hub.grocy_untagged
+    if gu is None:
+        return {"rows": [], "error": None}
+    gu.refresh_soon()
+    return {"rows": gu.rows, "error": gu.error}
+
+
 async def _just_bought(hub: Hub) -> dict[str, Any]:
     """Kroger deliveries to tag, plus the running counted session."""
     jb = hub.just_bought
@@ -362,10 +388,17 @@ async def _just_bought(hub: Hub) -> dict[str, Any]:
     ):
         session = counted.progress()
     if jb is None:
-        return {"available": False, "rows": [], "to_tag": 0, "session": session}
+        return {
+            "available": False,
+            "rows": [],
+            "to_tag": 0,
+            "session": session,
+            "untracked": None,
+        }
     rows = await jb.rows()
     return {
         "available": jb.available is True,
+        "untracked": await jb.untracked(),
         "rows": rows,
         "to_tag": sum(r["to_tag"] for r in rows if not r["older"]),
         "station": hub.tag_station(),

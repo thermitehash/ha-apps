@@ -29,6 +29,7 @@ from aiohttp import web
 from ..grocy import GrocyError
 from ..just_bought import JustBoughtError
 from ..linking import normalize_epc
+from ..scanning import ScanError, ScanManager
 from .state import build_state
 
 if TYPE_CHECKING:
@@ -119,6 +120,15 @@ class WebUI:
             "/pictures/fetch": self._fetch_pictures,
             "/bought/tag": self._bought_tag,
             "/bought/skip": self._bought_skip,
+            "/scan/start": self._scan_start,
+            "/scan/stop": self._scan_stop,
+            "/scan": self._scan,
+            "/stocktake/count": self._stocktake_count,
+            "/stocktake/finish": self._stocktake_finish,
+            "/stocktake/apply": self._stocktake_apply,
+            "/stocktake/close": self._stocktake_close,
+            "/stocktake/tag": self._stocktake_tag,
+            "/grocy-stock/tag": self._grocy_stock_tag,
         }
         for path, action in actions.items():
             r.add_post(path, self._action(action))
@@ -282,7 +292,7 @@ class WebUI:
                 )
             try:
                 message = await action(form)
-            except (GrocyError, ValueError, JustBoughtError) as err:
+            except (GrocyError, ValueError, JustBoughtError, ScanError) as err:
                 return web.json_response({"ok": False, "message": f"Failed: {err}"})
             return web.json_response({"ok": True, "message": message})
 
@@ -380,6 +390,64 @@ class WebUI:
         )
         self.hub.mark_dirty()
         return message
+
+    # Unload / Stock-take --------------------------------------------------------
+
+    def _scans(self) -> ScanManager:
+        if self.hub.scans is None:
+            raise ValueError("Unload and stock-take need Grocy")
+        return self.hub.scans
+
+    @staticmethod
+    def _int(form: dict[str, str], key: str) -> int:
+        try:
+            return int(form.get(key, ""))
+        except ValueError as err:
+            raise ValueError(f"missing {key}") from err
+
+    async def _scan_start(self, form: dict[str, str]) -> str:
+        mode = form.get("mode", "unload")
+        session = await self._scans().start(mode)  # type: ignore[arg-type]
+        where = f" on the {session.station} station" if session.station else ""
+        if mode == "stocktake":
+            return f"Stock-take started{where}: scan each unit once"
+        return f"Unloading{where}: scan each item"
+
+    async def _scan_stop(self, form: dict[str, str]) -> str:
+        await self._scans().stop()
+        return "Stopped"
+
+    async def _scan(self, form: dict[str, str]) -> str:
+        result = await self._scans().scan(form.get("barcode"), form.get("mode") or None)
+        if result.status == "error":
+            raise ScanError(result.message)
+        return result.message
+
+    async def _stocktake_count(self, form: dict[str, str]) -> str:
+        counted = self._int(form, "counted")
+        await self._scans().set_count(self._int(form, "product_id"), counted)
+        return f"Counted {counted}"
+
+    async def _stocktake_finish(self, form: dict[str, str]) -> str:
+        rows = await self._scans().finish()
+        return f"Review {len(rows)} product{'s' if len(rows) != 1 else ''}"
+
+    async def _stocktake_apply(self, form: dict[str, str]) -> str:
+        gone = form.get("gone", "").strip().lower() in ("on", "true", "1")
+        message = await self._scans().apply(form.get("how", ""), gone=gone)
+        if self.hub.grocy_untagged is not None:
+            self.hub.grocy_untagged.invalidate()
+        return message
+
+    async def _stocktake_close(self, form: dict[str, str]) -> str:
+        await self._scans().close_stocktake()
+        return "Stock-take closed"
+
+    async def _stocktake_tag(self, form: dict[str, str]) -> str:
+        return await self.hub.tag_stocktake(self._int(form, "product_id"))
+
+    async def _grocy_stock_tag(self, form: dict[str, str]) -> str:
+        return await self.hub.tag_grocy_stock(self._int(form, "product_id"))
 
     async def _set_inverted(self, form: dict[str, str]) -> str:
         value = form.get("inverted", "").strip().lower()

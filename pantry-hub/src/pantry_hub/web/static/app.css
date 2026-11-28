@@ -254,3 +254,22 @@ details[open] > summary::before { content: "▾"; }
 .older-group summary { cursor: pointer; color: var(--muted); padding: var(--sp-2) 0; }
 .session { border-radius: var(--r-sm); background: var(--ph-sage-tint); padding: 14px; display: flex; flex-direction: column; gap: 4px; }
 .session .title { font-weight: 600; }
+
+/* Unload, stock-take, camera scanner (0.4.3) */
+.unloading, .untracked { border-radius: var(--r-sm); background: var(--ph-sage-tint); padding: 14px; display: flex; flex-direction: column; gap: 6px; }
+.untracked { background: var(--ph-clay-tint); }
+.unloading .title, .untracked .title { font-weight: 600; }
+.qty-field .input { width: 5.5em; }
+.count-form { gap: var(--sp-2); align-items: center; }
+.table-wrap { overflow-x: auto; margin: 0 calc(-1 * var(--sp-1)); }
+table.review { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+table.review th, table.review td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--ph-line); vertical-align: middle; }
+table.review td:nth-child(2), table.review td:nth-child(3), table.review td:nth-child(4) { text-align: right; white-space: nowrap; }
+table.review tr.unscanned th { font-weight: 400; color: var(--muted); }
+table.review td.pos { color: var(--ok); }
+table.review td.neg { color: var(--problem); }
+.scanner { position: fixed; inset: 0; background: rgba(0, 0, 0, .6); display: flex; align-items: flex-end; justify-content: center; z-index: 50; }
+.scanner-box { background: var(--card); width: 100%; max-width: 560px; border-radius: var(--r-md) var(--r-md) 0 0; padding: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-2); max-height: 100dvh; overflow-y: auto; }
+.scanner-box h2 { margin: 0; font-size: var(--fs-lg, 20px); }
+.scanner-video { width: 100%; aspect-ratio: 4 / 3; background: #000; border-radius: var(--r-sm); object-fit: cover; }
+@media (min-width: 720px) { .scanner { align-items: center; } .scanner-box { border-radius: var(--r-md); } }

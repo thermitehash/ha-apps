@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.4.3
+
+- **Unload**: get groceries bought outside Kroger Restock (the Kroger app, in
+  a store, another shop) into Pantry Hub. Start it with a **triple-click** on
+  the linking station (slow green pulse) or **Start unloading** on the Pantry
+  page, then scan each item. Each scan finds the Grocy product (any form of
+  the barcode), or creates it from Kroger Restock's lookup (name, brand, size,
+  picture), else from Grocy's barcode lookup, else lists it under "needs a
+  product". Items land in **Just bought** (one row per barcode, +1 per scan)
+  and work like Kroger deliveries: **Tag them** or **Not tagging** (booked
+  without a price). Unload never adds anything to the Kroger cart. It ends
+  after 3 minutes without a scan, with a single click, or **Stop unloading**.
+- **Phone scanner**: **Scan barcode** uses the phone camera (the browser's
+  barcode reader, or a bundled reader on browsers without one; nothing is
+  loaded from the internet). Typing the barcode always works too. The camera
+  needs Home Assistant opened over HTTPS.
+- **Stock-take** for what's already in the pantry: **Start stock-take** on
+  the Tags page, or hold the station button for 6 seconds (slow amber pulse).
+  Scan each untagged unit once, or scan once and type how many. **Finish**
+  shows a review (counted, Grocy, difference); **Set Grocy to the counts**
+  books an inventory correction (no fake purchases or prices), **Add missing
+  items as purchases** adds only what's missing. Products you didn't scan are
+  left alone unless you tick "Products I didn't scan are gone". After
+  applying, **Tag N** tags the counted items; their first reader arrival
+  doesn't add them again.
+- **In Grocy, not tagged** (Tags page): stock Grocy already has in the
+  pantry without tags, with **Tag them**. Tagging it never adds it again.
+- With Kroger Restock 0.17.3 or later, after a pickup the Just bought card
+  shows "About 12 more items from your Kroger order — start unloading" (items
+  Kroger Restock couldn't match), with the order's item count. It counts down
+  as you unload within 6 hours of pickup, ignores products Kroger Restock
+  already tracked in that order, and also appears for a pickup that happened
+  while Pantry Hub was down. Older Kroger Restock versions: no prompt.
+- Linking station firmware 0.4.0: triple-click Unload, hold 6 s Stock-take,
+  single click leaves them; double-click (link mode) now waits 0.4 s to rule
+  out a third click. Reflash to use the station for Unload / Stock-take; the
+  phone scanner works without it.
+- Checked again: opening Pantry Hub from the sidebar shows current data at
+  once (new browser test with the page in a Home Assistant-style iframe).
+
 ## 0.4.2
 
 Fixes the Kroger Restock integration. **0.4.1's product pictures and Just

@@ -96,6 +96,74 @@ int main() {
   d.start_counted(1);
   assert(d.in_stock() && d.counted());
 
+  // Unload (triple-click): slow green pulse; scans never reach the cart.
+  State u;
+  assert(u.on_click(Click::TRIPLE) == ClickAction::UNLOAD_ON);
+  assert(u.unload() && !u.link_mode() && std::string(u.mode_name()) == "unload");
+  Rgb green = u.idle_color();
+  assert(green.on && green.slow && green.g == 1.0f && green.r == 0.0f);
+  assert(u.on_scan(upc) == Action::UNLOAD_BARCODE);
+  assert(u.on_scan(upc) != Action::KROGER_SCAN);
+  assert(u.on_scan(card) == Action::CARD_OUTSIDE_LINK && !u.in_stock());
+  assert(u.idle_timeout_ms() == 180000);
+  // A single click leaves it (instead of printing).
+  assert(u.on_click(Click::SINGLE) == ClickAction::EXIT_MODE);
+  assert(u.mode() == Mode::KROGER && u.on_scan(upc) == Action::KROGER_SCAN);
+  assert(u.on_click(Click::SINGLE) == ClickAction::PRINT);  // Kroger: prints
+  // Triple-click again also leaves.
+  u.on_click(Click::TRIPLE);
+  assert(u.on_click(Click::TRIPLE) == ClickAction::EXIT_MODE && !u.unload());
+  // Idle timeout: exit_link() back to Kroger.
+  u.on_click(Click::TRIPLE);
+  u.exit_link();
+  assert(u.mode() == Mode::KROGER && u.idle_timeout_ms() == 0);
+
+  // Stock-take (long-press): slow amber pulse, distinct from the in-stock
+  // session's amber (which is a normal-speed pulse in link mode).
+  State t;
+  assert(t.on_click(Click::LONG) == ClickAction::STOCKTAKE_ON && t.stocktake());
+  Rgb slow_amber = t.idle_color();
+  assert(slow_amber.on && slow_amber.slow && slow_amber.r == 1.0f);
+  assert(t.on_scan(upc) == Action::STOCKTAKE_BARCODE);
+  assert(std::string(t.mode_name()) == "stocktake");
+  assert(t.on_click(Click::LONG) == ClickAction::EXIT_MODE && !t.stocktake());
+  State session;
+  session.enter_link();
+  session.on_scan(card);
+  assert(session.in_stock() && !session.idle_color().slow);
+
+  // Double-click from Unload goes to link mode; again → Kroger.
+  State d2;
+  d2.on_click(Click::TRIPLE);
+  assert(d2.on_click(Click::DOUBLE) == ClickAction::LINK_ON && d2.link_mode());
+  assert(d2.on_click(Click::DOUBLE) == ClickAction::LINK_OFF);
+  assert(d2.mode() == Mode::KROGER && std::string(d2.mode_name()) == "kroger");
+
+  // Pantry Hub's mode command.
+  State h;
+  assert(h.set_mode_from_hub("unload") && h.unload());
+  assert(!h.set_mode_from_hub("unload"));  // already there
+  assert(h.set_mode_from_hub("stocktake") && h.stocktake());
+  assert(h.set_mode_from_hub("off") && h.mode() == Mode::KROGER);
+  h.enter_link();
+  assert(!h.set_mode_from_hub("off") && h.link_mode());  // "off" spares link mode
+  assert(!h.set_mode_from_hub("party"));
+
+  // Tag N during a stock-take: counted session, then back to Stock-take.
+  State tn;
+  tn.on_click(Click::LONG);
+  assert(tn.start_counted(2) && tn.link_mode() && tn.counted());
+  assert(tn.on_scan(upc) == Action::LINK_BARCODE);  // a barcode cancels resume
+  assert(!tn.counted());
+  tn.exit_link();
+  tn.on_click(Click::LONG);
+  tn.start_counted(1);
+  assert(!tn.on_result("linked", 0));
+  assert(tn.stocktake());  // resumed
+  tn.on_click(Click::TRIPLE);
+  tn.start_counted(1);
+  assert(!tn.on_result("timeout", 1) && tn.unload());
+
   // The firmware's single shared instance.
   assert(&state() == &state());
   state().enter_link();

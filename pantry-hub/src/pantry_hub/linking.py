@@ -118,6 +118,8 @@ class _Counted:
     window_opened: float | None = None
     task: asyncio.Task[None] | None = None
     ended: str = ""
+    #: Units already counted by Grocy (Grocy stock tagged from the Tags page).
+    in_stock: bool = False
 
     def progress(self) -> dict[str, Any]:
         """For the web UI: ``2 of 3 linked``."""
@@ -338,8 +340,11 @@ class LinkingManager:
         count: int,
         *,
         on_each: Callable[[Link], Awaitable[None]] | None = None,
+        in_stock: bool = False,
     ) -> None:
         """Link up to ``count`` tags to ``product`` at ``station``.
+
+        ``in_stock``: Grocy already counts these units (no add on arrival).
 
         Replaces any session on that station. The caller tells the station to
         enter link mode (``linking/<station>/start``).
@@ -358,6 +363,7 @@ class LinkingManager:
             count=count,
             last_tap=asyncio.get_running_loop().time(),
             on_each=on_each,
+            in_stock=in_stock,
         )
         self._sessions[station] = s
         self.counted = s
@@ -447,7 +453,7 @@ class LinkingManager:
             default_best_before_days=s.product.default_best_before_days,
             station=s.station,
         )
-        in_stock = await self.booked_match(link)
+        in_stock = s.in_stock or await self.booked_match(link)
         created, op_id = await self.store.create_link(
             link,
             location_id=self.location_id,

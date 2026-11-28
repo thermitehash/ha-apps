@@ -601,6 +601,7 @@ async def test_rows_from_041_database_get_rebuilt_barcode(tmp_path: Path) -> Non
         (row,) = await store.received()
         assert row.barcode is None and row.upc == BEANS_KROGER
         assert row.grocy_barcode == BEANS
-        assert await store.get_meta("schema_version") == "4"
+        assert row.source == "kroger"  # 0.4.3 column, NULL in old rows
+        assert await store.get_meta("schema_version") == "5"
     finally:
         await store.close()
