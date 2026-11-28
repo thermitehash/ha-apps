@@ -26,7 +26,10 @@ from .barcodes import from_kroger_upc
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+#: Booked units (stock-take, Not tagging, Grocy-only stock) wait this long
+#: for their tags.
+ALLOWANCE_S = 7 * 86400.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -116,6 +119,13 @@ CREATE TABLE IF NOT EXISTS stocktake (
     tagged INTEGER NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS allowances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    units INTEGER NOT NULL,
+    booked_at REAL NOT NULL,
+    source TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS booked_credits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id INTEGER NOT NULL,
@@ -126,10 +136,12 @@ CREATE TABLE IF NOT EXISTS booked_credits (
 
 #: Columns added after schema v1 (v0.1.0): table → (column, type).
 _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
-    "links": [("skip_add_cycle", "INTEGER")],
     "ops": [("resolution", "TEXT")],
     # 0.4.2: the printed barcode (with check digit) next to Kroger's upc.
     "received": [("barcode", "TEXT"), ("source", "TEXT")],
+    # 0.4.4: 1 = linked, its first reader arrival not seen yet (NULL: seen,
+    # or linked before 0.4.4).
+    "links": [("skip_add_cycle", "INTEGER"), ("fresh", "INTEGER")],
 }
 
 OpKind = Literal["add", "consume"]
@@ -234,6 +246,9 @@ class ArrivalResult:
     link: Link | None
     add_op_id: int | None
     skipped_in_stock: bool = False
+    #: The first arrival of a newly tagged unit used up one booked unit
+    #: (stock-take, Not tagging, Grocy-only stock): nothing added.
+    matched_booked: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +420,7 @@ class Store:
             for name, kind in columns:
                 if name not in have:
                     await self._exec(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+        await self._migrate_credits()
         await self._exec(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -520,7 +536,7 @@ class Store:
                 cycle = 1 if row is None else int(row["cycle"])
                 link = await self._get_link(epc)
                 op_id: int | None = None
-                skipped = False
+                skipped = matched = False
                 if link is None:
                     await self._exec(
                         "INSERT INTO unlinked (epc, first_seen, last_seen) "
@@ -529,8 +545,12 @@ class Store:
                         (epc, now, now),
                     )
                 elif link.skip_add_cycle == cycle:
+                    await self._clear_fresh(epc)
                     await self._insert_skipped_add(link, cycle, location_id, now)
                     skipped = True
+                elif await self._first_arrival_uses_allowance(link, now):
+                    await self._insert_skipped_add(link, cycle, location_id, now)
+                    skipped = matched = True
                 else:
                     op_id = await self._insert_op(
                         key=add_key(epc, cycle),
@@ -547,8 +567,43 @@ class Store:
                 await self._rollback()
                 raise
         return ArrivalResult(
-            cycle=cycle, link=link, add_op_id=op_id, skipped_in_stock=skipped
+            cycle=cycle,
+            link=link,
+            add_op_id=op_id,
+            skipped_in_stock=skipped,
+            matched_booked=matched,
         )
+
+    async def _clear_fresh(self, epc: str) -> None:
+        await self._exec("UPDATE links SET fresh = NULL WHERE epc = ?", (epc,))
+
+    async def _first_arrival_uses_allowance(self, link: Link, now: float) -> bool:
+        """First arrival of a newly tagged unit: use one booked unit if any.
+
+        Only a link's first arrival counts (later cycles add as usual). The
+        caller is inside a transaction.
+        """
+        row = await self._one("SELECT fresh FROM links WHERE epc = ?", (link.epc,))
+        if row is None or row["fresh"] != 1:
+            return False
+        await self._clear_fresh(link.epc)
+        return await self._take_allowance(link.product_id, now)
+
+    async def _take_allowance(self, product_id: int, now: float) -> bool:
+        await self._exec(
+            "DELETE FROM allowances WHERE booked_at < ? OR units <= 0",
+            (now - ALLOWANCE_S,),
+        )
+        row = await self._one(
+            "SELECT id FROM allowances WHERE product_id = ? ORDER BY booked_at LIMIT 1",
+            (product_id,),
+        )
+        if row is None:
+            return False
+        await self._exec(
+            "UPDATE allowances SET units = units - 1 WHERE id = ?", (row["id"],)
+        )
+        return True
 
     async def _insert_skipped_add(
         self, link: Link, cycle: int, location_id: int, now: float
@@ -676,8 +731,8 @@ class Store:
 
     async def _write_link(self, link: Link) -> None:
         await self._exec(
-            f"INSERT OR REPLACE INTO links ({_LINK_COLS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT OR REPLACE INTO links ({_LINK_COLS}, fresh) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             (
                 link.epc,
                 link.product_id,
@@ -700,11 +755,16 @@ class Store:
         )
         if row is None or row["state"] != "present" or not row["cycle"]:
             return None
-        if link.skip_add_cycle == int(row["cycle"]):
+        # The tag is already in the pantry: this is its first arrival.
+        if link.skip_add_cycle == int(row["cycle"]) or (
+            await self._first_arrival_uses_allowance(link, link.linked_at)
+        ):
+            await self._clear_fresh(link.epc)
             await self._insert_skipped_add(
                 link, int(row["cycle"]), location_id, link.linked_at
             )
             return None
+        await self._clear_fresh(link.epc)
         return await self._insert_op(
             key=add_key(link.epc, int(row["cycle"])),
             epc=link.epc,
@@ -1198,13 +1258,80 @@ class Store:
                 raise
         return max(int(row["quantity"]) - int(row["tagged"]), 0)
 
-    async def add_booked_credit(self, product_id: int, units: int, at: float) -> None:
-        """Remember units booked in Grocy without a tag (see take_booked_credit)."""
+    async def add_allowance(
+        self,
+        product_id: int,
+        units: int,
+        at: float,
+        source: str,
+        *,
+        top_up: bool = False,
+    ) -> int:
+        """Book ``units`` counted / booked without tags for a product.
+
+        The first reader arrivals of that many newly tagged units add
+        nothing (Grocy already counts them); more tags add stock as usual.
+        Expires after :data:`ALLOWANCE_S`. ``top_up``: only raise the
+        product's remaining allowance to ``units`` (Grocy-only stock, where
+        pressing "Tag them" twice mustn't double it). Returns the remaining.
+        """
         async with self._lock:
+            have = await self._allowance(product_id, at)
+            add = max(units - have, 0) if top_up else units
+            if add > 0:
+                await self._exec(
+                    "INSERT INTO allowances (product_id, units, booked_at, source) "
+                    "VALUES (?, ?, ?, ?)",
+                    (product_id, add, at, source),
+                )
+            return have + max(add, 0)
+
+    async def _allowance(self, product_id: int, now: float) -> int:
+        row = await self._one(
+            "SELECT COALESCE(SUM(units), 0) AS n FROM allowances "
+            "WHERE product_id = ? AND units > 0 AND booked_at >= ?",
+            (product_id, now - ALLOWANCE_S),
+        )
+        return int(row["n"]) if row else 0
+
+    async def allowances(self, now: float) -> dict[int, dict[str, Any]]:
+        """Remaining allowance per product: ``{units, sources, expires}``."""
+        async with self._lock:
+            rows = await self._all(
+                "SELECT product_id, units, booked_at, source FROM allowances "
+                "WHERE units > 0 AND booked_at >= ? ORDER BY booked_at",
+                (now - ALLOWANCE_S,),
+            )
+        out: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            pid = int(r["product_id"])
+            entry = out.setdefault(pid, {"units": 0, "sources": [], "expires": None})
+            entry["units"] += int(r["units"])
+            if r["source"] not in entry["sources"]:
+                entry["sources"].append(r["source"])
+            expires = float(r["booked_at"]) + ALLOWANCE_S
+            entry["expires"] = max(entry["expires"] or 0.0, expires)
+        return out
+
+    async def allowance_units(self, now: float) -> dict[int, int]:
+        """Remaining allowance units per product (tests, logs)."""
+        return {pid: a["units"] for pid, a in (await self.allowances(now)).items()}
+
+    async def _migrate_credits(self) -> None:
+        """0.4.3 booked windows → 0.4.4 allowances (same units and dates)."""
+        rows = await self._all(
+            "SELECT product_id, units, booked_at FROM booked_credits WHERE units > 0"
+        )
+        for r in rows:
             await self._exec(
-                "INSERT INTO booked_credits (product_id, units, booked_at) "
-                "VALUES (?, ?, ?)",
-                (product_id, units, at),
+                "INSERT INTO allowances (product_id, units, booked_at, source) "
+                "VALUES (?, ?, ?, 'migrated')",
+                (r["product_id"], r["units"], r["booked_at"]),
+            )
+        await self._exec("DELETE FROM booked_credits")
+        if rows:
+            _LOGGER.info(
+                "Moved %d booked window(s) from 0.4.3 to tag allowances", len(rows)
             )
 
     async def reopen_received(self, row_id: int) -> None:
@@ -1223,46 +1350,6 @@ class Store:
             n = cur.rowcount
             await cur.close()
         return n
-
-    async def take_booked_credit(
-        self, product_id: int, now: float, window_s: float
-    ) -> bool:
-        """Use one unit booked without a tag in the last ``window_s`` seconds.
-
-        Expired credits are dropped. True: the new link's arrival must not
-        add stock again (Grocy already counts the unit).
-        """
-        async with self._lock:
-            await self._begin()
-            try:
-                await self._exec(
-                    "DELETE FROM booked_credits WHERE booked_at < ? OR units <= 0",
-                    (now - window_s,),
-                )
-                row = await self._one(
-                    "SELECT id FROM booked_credits WHERE product_id = ? "
-                    "ORDER BY booked_at LIMIT 1",
-                    (product_id,),
-                )
-                if row is not None:
-                    await self._exec(
-                        "UPDATE booked_credits SET units = units - 1 WHERE id = ?",
-                        (row["id"],),
-                    )
-                await self._commit()
-            except BaseException:
-                await self._rollback()
-                raise
-        return row is not None
-
-    async def booked_credits(self) -> dict[int, int]:
-        """Remaining booked units per product (for the web UI / tests)."""
-        async with self._lock:
-            rows = await self._all(
-                "SELECT product_id, SUM(units) AS n FROM booked_credits "
-                "WHERE units > 0 GROUP BY product_id"
-            )
-        return {int(r["product_id"]): int(r["n"]) for r in rows}
 
     async def add_unload_scan(
         self,

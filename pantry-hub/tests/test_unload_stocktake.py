@@ -411,15 +411,38 @@ async def test_stocktake_set_uses_inventory_and_leaves_unscanned_alone(
     assert state["phase"] == "applied"
     # Inventory corrections, not purchases: no /add calls, prices untouched.
     assert grocy.count_calls("POST", "/add") == n_add
+    # Raising (Apples 2 → 3): an inventory correction.
     inv = [(path, body) for m, path, body in grocy.calls if path.endswith("/inventory")]
-    assert len(inv) == 2
-    assert all(body["note"] == "Pantry Hub stock-take" for _, body in inv)
+    assert inv == [
+        (
+            f"/api/stock/products/{p['a'].id}/inventory",
+            {"new_amount": 3.0, "location_id": 1, "note": "Pantry Hub stock-take"},
+        )
+    ]
+    # Lowering (Beans 5 → 2): consumed from the Pantry only (0.4.4).
+    eaten = [
+        (path, body)
+        for m, path, body in grocy.calls
+        if path.endswith("/consume") and body.get("note") == "Pantry Hub stock-take"
+    ]
+    assert eaten == [
+        (
+            f"/api/stock/products/{p['b'].id}/consume",
+            {
+                "amount": 3,
+                "transaction_type": "consume",
+                "spoiled": False,
+                "location_id": 1,
+                "note": "Pantry Hub stock-take",
+            },
+        )
+    ]
     assert grocy.amount(p["a"].id) == 3
     assert grocy.amount(p["b"].id) == 2
     assert grocy.amount(p["b"].id, location_id=2) == 1  # fridge kept
     assert grocy.amount(p["c"].id) == 4  # not scanned: untouched by default
     assert rig.store is not None
-    assert await rig.store.booked_credits() == {p["a"].id: 3, p["b"].id: 2}
+    assert await rig.store.allowance_units(rig.clock()) == {p["a"].id: 3, p["b"].id: 2}
 
 
 async def test_stocktake_purchase_and_gone(
@@ -491,7 +514,7 @@ async def test_tag_from_stocktake_no_double_count(
     await rig.idle()
     assert grocy.amount(p["a"].id) == 3
     assert rig.store is not None
-    assert await rig.store.booked_credits() == {}
+    assert await rig.store.allowance_units(rig.clock()) == {}
 
 
 async def test_grocy_only_stock_listed_as_untagged_rows(

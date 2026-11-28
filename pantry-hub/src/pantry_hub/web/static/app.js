@@ -57,6 +57,7 @@ const LAYOUTS = {
 <div id="s-linked"></div>
 </section>
 <section id="s-grocy-untagged" class="stack" aria-label="In Grocy, not tagged"></section>
+<section id="s-allowances" class="stack" aria-label="Waiting for tags"></section>
 <section id="s-failed" class="stack" aria-label="Failed Grocy updates"></section>
 <section id="s-needs" class="stack" aria-label="Barcodes without a Grocy product"></section>`,
   settings: () => `
@@ -105,6 +106,7 @@ function slotsFor(tab) {
       "s-stocktake": () => V.stocktakeCard(state),
       "s-unlinked": () => V.unlinkedCards(state, ui),
       "s-grocy-untagged": () => V.grocyUntagged(state, ui),
+      "s-allowances": () => V.allowanceList(state, ui),
       "s-linked": () => V.linkedList(state, ui),
       "s-failed": () => V.failedOps(state),
       "s-needs": () => V.needsProduct(state),

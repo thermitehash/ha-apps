@@ -14,10 +14,11 @@ unit, so the add of its current (or next) pantry arrival is skipped.
 ``timeout`` or ``error``.
 
 Linking never changes Grocy stock: if the item then goes into the pantry, the
-normal arrival flow adds it (no double counting). One exception keeps that
-true: a unit booked in Grocy without a tag ("Just bought" → Not tagging) and
-then linked within a week is marked "already in stock", so its arrival is
-matched against the booked unit instead of adding again.
+normal arrival flow adds it (no double counting). Units booked in Grocy
+without a tag (Not tagging, a stock-take, Grocy-only stock) are a per-product
+allowance that the *first arrivals* of newly tagged units use up (see
+:meth:`Store.add_allowance`); that happens in the arrival bookkeeping, not
+here.
 
 A *counted* session (Just bought → Tag them) is started by the hub, not by a
 barcode scan: the hub publishes ``start`` so the station enters link mode,
@@ -48,8 +49,6 @@ _LOGGER = logging.getLogger(__name__)
 TAG_TIMEOUT_S = 15.0
 #: Counted session: seconds without a tap before it ends.
 COUNTED_IDLE_S = 60.0
-#: A unit booked without a tag matches a link made within this many seconds.
-BOOKED_MATCH_S = 7 * 86400.0
 RSSI_WINDOW_S = 1.0
 STATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 EPC_RE = re.compile(r"^(?:[0-9A-F]{4}){1,31}$")
@@ -158,7 +157,6 @@ def _decode(payload: bytes) -> dict[str, Any] | None:
 
 PublishFn = Callable[[str, LinkResult], Awaitable[None]]
 LinkedFn = Callable[[Link, int | None], Awaitable[None]]
-MatchedFn = Callable[[Link], None]
 
 
 class LinkingManager:
@@ -177,7 +175,6 @@ class LinkingManager:
         tag_timeout: float = TAG_TIMEOUT_S,
         rssi_window: float = RSSI_WINDOW_S,
         counted_idle: float = COUNTED_IDLE_S,
-        on_booked_match: MatchedFn | None = None,
     ) -> None:
         """Create."""
         self.store = store
@@ -190,7 +187,6 @@ class LinkingManager:
         self.tag_timeout = tag_timeout
         self.rssi_window = rssi_window
         self.counted_idle = counted_idle
-        self.on_booked_match = on_booked_match
         self._sessions: dict[str, _Session | _Counted] = {}
         #: Most recent successful link (for ``sensor.pantry_hub_last_link``).
         self.last_link: Link | None = None
@@ -198,22 +194,6 @@ class LinkingManager:
         self.last_station: str | None = None
         #: Last counted session (kept after it ends, for "2 of 3 linked").
         self.counted: _Counted | None = None
-
-    async def booked_match(self, link: Link) -> bool:
-        """Use a unit booked without a tag for ``link``'s product, if any."""
-        if not await self.store.take_booked_credit(
-            link.product_id, self.clock(), BOOKED_MATCH_S
-        ):
-            return False
-        _LOGGER.info(
-            "Tag %s matched a %s unit already booked in Grocy: its arrival "
-            "won't add stock again",
-            link.epc,
-            link.product_name,
-        )
-        if self.on_booked_match is not None:
-            self.on_booked_match(link)
-        return True
 
     def active(self, station: str) -> bool:
         """Whether ``station`` has a session waiting for a tag."""
@@ -453,7 +433,7 @@ class LinkingManager:
             default_best_before_days=s.product.default_best_before_days,
             station=s.station,
         )
-        in_stock = s.in_stock or await self.booked_match(link)
+        in_stock = s.in_stock
         created, op_id = await self.store.create_link(
             link,
             location_id=self.location_id,
@@ -585,7 +565,7 @@ class LinkingManager:
             default_best_before_days=product.default_best_before_days,
             station=station,
         )
-        in_stock = session.in_stock or await self.booked_match(link)
+        in_stock = session.in_stock
         created, op_id = await self.store.create_link(
             link,
             location_id=self.location_id,

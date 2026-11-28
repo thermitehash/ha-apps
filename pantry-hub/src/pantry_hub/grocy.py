@@ -482,6 +482,22 @@ class GrocyClient:
         body = await self._request("GET", f"/stock/locations/{location_id}/entries")
         return self._entries(body, 0)
 
+    async def consume_amount(
+        self, product_id: int, amount: float, *, location_id: int, note: str
+    ) -> None:
+        """Consume ``amount`` units from ``location_id`` only (not spoiled)."""
+        await self._request(
+            "POST",
+            f"/stock/products/{product_id}/consume",
+            json={
+                "amount": amount,
+                "transaction_type": "consume",
+                "spoiled": False,
+                "location_id": location_id,
+                "note": note,
+            },
+        )
+
     async def inventory(
         self, product_id: int, new_amount: float, *, location_id: int, note: str
     ) -> None:

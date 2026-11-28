@@ -114,6 +114,10 @@ class ReviewRow:
     scanned: bool  # counted in this stock-take (else: only in Grocy)
     tagged_after: int = 0
     applied: str | None = None  # what Apply did ("set", "purchase", "gone", None)
+    #: Lowering: units Apply couldn't remove because the pantry had fewer.
+    shortfall: float = 0.0
+    #: Units Grocy shows in other locations (never touched by Apply).
+    elsewhere: float = 0.0
 
     @property
     def target(self) -> int:
@@ -139,6 +143,8 @@ class ReviewRow:
             "applied": self.applied,
             "tagged_after": self.tagged_after,
             "to_tag": max(self.counted - self.tagged_after, 0),
+            "shortfall": self.shortfall,
+            "elsewhere": self.elsewhere,
         }
 
 
@@ -170,6 +176,8 @@ class StockTakeState:
                         "scanned": r.scanned,
                         "tagged_after": r.tagged_after,
                         "applied": r.applied,
+                        "shortfall": r.shortfall,
+                        "elsewhere": r.elsewhere,
                     }
                     for r in self.review
                 ],
@@ -511,7 +519,7 @@ class ScanManager:
             for row in st.review:
                 if row.scanned:
                     if how == "set" and row.difference != 0:
-                        await self._set_pantry(row.product_id, row.grocy, row.target)
+                        await self._set_pantry(row)
                         row.applied = "set"
                         changed += 1
                     elif how == "purchase" and row.difference > 0:
@@ -527,11 +535,11 @@ class ScanManager:
                     if row.counted:
                         # Counted units are in Grocy now: a tag linked to one
                         # of them within 7 days must not add it again.
-                        await self.store.add_booked_credit(
-                            row.product_id, row.counted, now
+                        await self.store.add_allowance(
+                            row.product_id, row.counted, now, "stocktake"
                         )
                 elif gone and row.grocy > row.target:
-                    await self._set_pantry(row.product_id, row.grocy, row.target)
+                    await self._set_pantry(row)
                     row.applied = "gone"
                     changed += 1
         except GrocyError as err:
@@ -543,15 +551,35 @@ class ScanManager:
         verb = "Set" if how == "set" else "Added purchases for"
         return f"{verb} {changed} product{'s' if changed != 1 else ''} in Grocy"
 
-    async def _set_pantry(self, product_id: int, pantry: float, target: int) -> None:
-        """Inventory correction so the *pantry* holds ``target`` (other places kept)."""
-        total = sum(e.amount for e in await self.grocy.entries(product_id))
-        await self.grocy.inventory(
-            product_id,
-            max(total - pantry + target, 0.0),
-            location_id=self.location_id,
-            note=STOCKTAKE_NOTE,
-        )
+    async def _set_pantry(self, row: ReviewRow) -> None:
+        """Make the *pantry* hold ``row.target``; other locations are never touched.
+
+        Raising: an inventory correction (new total = total + missing; the
+        added units go to the pantry). Lowering: consume from the pantry
+        location explicitly (not spoiled); if the pantry holds less than the
+        drop, only what's there, and the rest is reported on the row.
+        """
+        entries = await self.grocy.entries(row.product_id)
+        total = sum(e.amount for e in entries)
+        pantry = sum(e.amount for e in entries if e.location_id == self.location_id)
+        row.elsewhere = total - pantry
+        drop = row.grocy - row.target  # what the review promised to remove
+        if drop < 0:
+            missing = row.target - pantry
+            if missing > 0:
+                await self.grocy.inventory(
+                    row.product_id,
+                    total + missing,
+                    location_id=self.location_id,
+                    note=STOCKTAKE_NOTE,
+                )
+            return
+        take = min(drop, pantry)
+        if take > 0:
+            await self.grocy.consume_amount(
+                row.product_id, take, location_id=self.location_id, note=STOCKTAKE_NOTE
+            )
+        row.shortfall = drop - take
 
     def tag_count(self, product_id: int) -> int:
         """Units "Tag N" offers for a product (counted, not yet tagged)."""
