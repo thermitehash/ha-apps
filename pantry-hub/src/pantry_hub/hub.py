@@ -1128,7 +1128,7 @@ class Hub:
         products = await self.store.linked_products()
         for row in await self.store.received(include_done=True):
             if row.grocy_product_id is not None:
-                products.setdefault(row.grocy_product_id, row.upc)
+                products.setdefault(row.grocy_product_id, row.grocy_barcode)
         if not self.pictures.start_backfill(products):
             _LOGGER.info("Picture backfill already running")
 

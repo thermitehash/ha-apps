@@ -123,6 +123,18 @@ def issues_for(state: dict[str, Any]) -> list[Issue]:
                 "Fix",
             )
         )
+    pictures = state.get("pictures") or {}
+    if pictures.get("auth_failed"):
+        found.append(
+            Issue(
+                "warn",
+                "Kroger Restock needs you to sign in again",
+                "Product pictures are paused. Sign in to Kroger again in Home "
+                "Assistant (Kroger Restock), then tap Fetch missing pictures.",
+                "settings",
+                "Open",
+            )
+        )
     for port in reader["dead_ports"]:
         found.append(
             Issue(
@@ -320,7 +332,14 @@ def _pictures(hub: Hub) -> dict[str, Any]:
     """Kroger Restock product pictures: availability + backfill progress."""
     pics = hub.pictures
     if pics is None:
-        return {"available": False, "running": False, "text": None, "versions": {}}
+        return {
+            "available": False,
+            "running": False,
+            "text": None,
+            "versions": {},
+            "auth_failed": False,
+            "status": "Kroger Restock not found.",
+        }
     p = pics.progress
     started = p.running or p.finished_at is not None
     return {
@@ -328,6 +347,8 @@ def _pictures(hub: Hub) -> dict[str, Any]:
         "running": p.running,
         "text": p.text() if started else None,
         "versions": {str(k): v for k, v in pics.versions.items()},
+        "auth_failed": pics.auth_failed,
+        "status": pics.status_line(),
     }
 
 
@@ -368,9 +389,10 @@ def _diagnostics(hub: Hub, s: dict[str, Any], door_mode: bool) -> list[list[str]
         ["MQTT", _yn(mqtt.connected if mqtt else None, unknown="off")],
     ]
     pics = hub.pictures
-    if pics is None or pics.available is False:
-        rows.append(["Product pictures", "Kroger Restock not found."])
-    elif pics.available:
+    line = "Kroger Restock not found." if pics is None else pics.status_line()
+    if line:
+        rows.append(["Product pictures", line])
+    elif pics is not None and pics.available:
         rows.append(["Product pictures", "from Kroger Restock"])
     if door_mode:
         rows += [

@@ -3,6 +3,39 @@
 Decisions taken while building a release, one line of reason each, so they
 can be reviewed and reverted. Newest release first.
 
+## 0.4.2: Kroger Restock contract fix
+
+Checked against Kroger Restock v0.17.2 as installed (verified live on
+Nov 27).
+
+1. **`upc` key, code passed as is.** `lookup_product` gets `{"upc": <barcode
+   as scanned / stored in Grocy>}`; Kroger Restock normalizes UPC-A, EAN-13,
+   UPC-E and padding. `product_id` and `config_entry_id` aren't sent (one
+   Kroger Restock entry assumed).
+2. **Unknown `reason` values** (anything but not_found, plu_code,
+   not_a_product_barcode, rate_limited, auth_failed) are treated as a failure
+   worth retrying, not as "no picture".
+3. **Rate limit**: no lookup for 1 h after `rate_limited`, from links and the
+   backfill alike; a backfill stops at the first one ("Stopped: Kroger rate
+   limit, try again in an hour"); a link-time fetch waits out the hour, then
+   tries once more. Not remembered as "no picture".
+4. **`auth_failed`** stops lookups until a person taps **Fetch missing
+   pictures** (or the app restarts); it's shown in Details, in Settings →
+   Product pictures and as a health issue ranked last but one (before dead
+   antenna ports), so the banner shows it only when nothing more urgent is
+   wrong.
+5. **Barcode for Grocy** = `barcode` when sent, else `upc` with its check
+   digit rebuilt (leading zeros stripped; ≤ 11 digits → UPC-A, 12 → EAN-13).
+   Stored next to Kroger's `upc` and `product_id` (new `received.barcode`
+   column; 0.4.1 rows are rebuilt on read).
+6. **Matching order** before creating a product: the printed code, its
+   UPC-A / EAN-13 twin, then Kroger's 13-digit form. UPC-E isn't expanded
+   (Kroger Restock always sends the full code).
+7. **0.4.1 duplicates aren't cleaned up automatically**: merging products is
+   a Grocy decision (stock, history). A Just bought row from 0.4.1 that
+   already points at a duplicate keeps it; the changelog says how to spot
+   them.
+
 ## 0.4.1: Kroger Restock pictures + Just bought
 
 Built against the Part A contract (`lookup_product`, `recent_received`, the
@@ -17,10 +50,10 @@ Built against the Part A contract (`lookup_product`, `recent_received`, the
 2. **"Is Kroger Restock there?"** = the action is listed by `GET /api/services`,
    cached 10 min, so installing it later is picked up without a restart.
 3. **`recent_received` response shape.** Accepts `{"items": [...]}` or
-   `{"received": [...]}`; the contract names the fields of an item but not the
-   wrapper. One-line change if Part A uses another key.
-4. **Price is per unit.** Booked as Grocy's `price` (per stock unit). If Kroger
-   Restock reports line totals, divide by `quantity_received` there or here.
+   `{"received": [...]}`. *Confirmed in 0.4.2: v0.17.2 answers
+   `{"days": N, "items": [...]}`.*
+4. **Price is per unit.** Booked as Grocy's `price` (per stock unit).
+   *Confirmed in 0.4.2.*
 5. **Pictures only for barcode links.** A web relink by `#id` has no barcode,
    so no lookup. Backfill covers products Pantry Hub has linked or seen in
    Just bought, using the link's barcode or the product's first Grocy barcode.
