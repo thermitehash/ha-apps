@@ -2,7 +2,7 @@
 - App version: 0.4.2 (Kroger Restock contract fix; 0.1.0–0.3.1 in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4, 0.4.0 in PR #5, 0.4.1 in PR #6, 0.4.2 in PR #7) · linking station firmware 0.3.0 (unchanged)
 - Branches: PR #7 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `86c7b85`, the merge of PR #6 (0.4.1). Merging PR #7 publishes 0.4.2. Checked against Kroger Restock v0.17.2 (verified live in HA on Nov 27).
 - aiochainway version used: v0.4.0 (unchanged).
-- Date / PR / Commit / CI (per job): 2026-11-28 / PR #7 / CI_PENDING (0.4.1: PR #6 at `8ca8e63`, all green, merged as `86c7b85`)
+- Date / PR / Commit / CI (per job): 2026-11-28 / PR #7 / `231ef0e` / all green: HA app linter, yamllint, Ruff + mypy, ESPHome linking station, Version bump, Pytest (ubuntu-latest), Pytest (macos-latest), Sweep-now repeat ×200 (macOS), UI smoke (Playwright), Prepare, Build amd64, Build aarch64 (multi-arch manifest skipped on PRs). 0.4.1: PR #6 at `8ca8e63`, all green, merged as `86c7b85`.
 
 ## Summary
 **v0.4.2, Kroger Restock contract fix** (0.4.1's picture fetching and Just bought matching didn't work against the real Kroger Restock v0.17.2):
