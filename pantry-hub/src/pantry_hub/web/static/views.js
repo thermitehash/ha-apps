@@ -209,6 +209,14 @@ function lastScan(state, mode) {
   return `<p class="${cls}" role="status" aria-live="polite">${esc(last.message)}</p>`;
 }
 
+function untrackedDetail(u) {
+  const parts = [];
+  if (u.item_count != null && u.tracked_units != null) parts.push(`${u.item_count} items in the order, ${u.tracked_units} already in Just bought`);
+  if (u.pickup_window) parts.push(`picked up ${u.pickup_window}`);
+  parts.push("Kroger Restock couldn't match these; scan them as you put them away");
+  return esc(parts.join(" · "));
+}
+
 export function justBought(state, ui) {
   const jb = state.just_bought;
   const sc = state.scan || {};
@@ -223,12 +231,12 @@ export function justBought(state, ui) {
   const u = jb.untracked;
   const untracked =
     u && !unloading
-      ? `<div class="untracked"><span class="title">${plural(u.remaining, "more item")} from your Kroger order</span><button class="btn primary" type="button" data-action="scan-start" data-mode="unload">Start unloading</button></div>`
+      ? `<div class="untracked"><span class="title">About ${plural(u.remaining, "more item")} from your Kroger order — start unloading</span><span class="sub">${untrackedDetail(u)}</span><button class="btn primary" type="button" data-action="scan-start" data-mode="unload">Start unloading</button></div>`
       : "";
   let unload = "";
   if (sc.available) {
     unload = unloading
-      ? `<div class="unloading" role="status" aria-live="polite"><span class="title">Unloading${u ? ` · ${plural(u.remaining, "item")} left from your Kroger order` : ""}</span><span class="sub">Scan each item${unloading.station ? ` at the ${esc(unloading.station)} station (green pulse)` : ""} or with your phone. ${plural(unloading.scans, "scan")} so far; stops after 3 minutes without a scan.</span>${lastScan(state, "unload")}<div class="actions"><button class="btn primary" type="button" data-action="scan-open" data-mode="unload">Scan barcode</button><button class="btn" type="button" data-action="scan-stop">Stop unloading</button></div></div>`
+      ? `<div class="unloading" role="status" aria-live="polite"><span class="title">Unloading${u ? ` · about ${plural(u.remaining, "item")} left from your Kroger order` : ""}</span><span class="sub">Scan each item${unloading.station ? ` at the ${esc(unloading.station)} station (green pulse)` : ""} or with your phone. ${plural(unloading.scans, "scan")} so far; stops after 3 minutes without a scan.</span>${lastScan(state, "unload")}<div class="actions"><button class="btn primary" type="button" data-action="scan-open" data-mode="unload">Scan barcode</button><button class="btn" type="button" data-action="scan-stop">Stop unloading</button></div></div>`
       : `<div class="actions"><button class="btn" type="button" data-action="scan-start" data-mode="unload">Start unloading</button><button class="btn" type="button" data-action="scan-open" data-mode="unload">Scan barcode</button></div>`;
   }
   const head = `<div class="section-head"><h2>Just bought${jb.to_tag ? ` · ${plural(jb.to_tag, "item")} to tag` : ""}</h2></div>`;

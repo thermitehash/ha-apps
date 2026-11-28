@@ -313,6 +313,7 @@ class Hub:
                 tags_present=self.tags_present,
                 publish_mode=self._publish_station_mode,
                 on_unload=self.just_bought.note_unload,
+                unload_order=self.just_bought.unload_order,
                 on_change=self.mark_dirty,
                 clock=wall,
                 **scan_kwargs,

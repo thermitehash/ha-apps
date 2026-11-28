@@ -15,7 +15,7 @@ from pantry_hub.store import Link
 from .conftest import BrokerHandle, FakeClock, eventually
 from .fake_grocy import Entry, FakeGrocy
 from .fake_ha import TOKEN, FakeHomeAssistant
-from .fake_kroger import FakeKroger
+from .fake_kroger import FakeKroger, item
 from .rig import Observer, Rig
 from .web_client import WebClient
 
@@ -172,45 +172,114 @@ async def test_unload_row_tag_them_counted_session(
     assert observer.last(RESULT)["remaining"] == 1
 
 
-async def test_untracked_items_count_down(
+async def _untracked(rig: Rig, remaining: int | None) -> bool:
+    assert rig.h.just_bought is not None
+    u = await rig.h.just_bought.untracked()
+    return (
+        (u is None)
+        if remaining is None
+        else (u is not None and u["remaining"] == remaining)
+    )
+
+
+async def test_untracked_event_countdown_with_order_link(
     rig: Rig, ha: FakeHomeAssistant, grocy: FakeGrocy, clock: FakeClock
 ) -> None:
     grocy.add_product("Coke", [COKE])
+    grocy.add_product("Beans", ["011110428509"])
+    kroger = FakeKroger(ha)
+    # A tracked item of the same order, checked off by hand in Kroger Restock.
+    kroger.recent = [
+        item(
+            item_id="it-1",
+            barcode="011110428509",
+            received_at=iso(clock() - 700),
+            order_ref="ORD-9",
+        )
+    ]
     await start(rig, ha)
-    await ha.fire_event(
-        "kroger_restock_untracked_items",
-        {"count": 3, "picked_up_at": iso(clock() - 600), "order_ref": "ORD-9"},
-    )
-    jb = rig.h.just_bought
-    assert jb is not None
+    await eventually(lambda: _untracked(rig, None))
+    order = kroger.untracked_order("ORD-9", 3, iso(clock() - 600))
+    await kroger.fire_untracked(order)
     await eventually(lambda: _untracked(rig, 3))
     async with WebClient(rig.h) as c:
-        state = await c.state()
-        assert state["just_bought"]["untracked"]["remaining"] == 3
+        u = (await c.state())["just_bought"]["untracked"]
+        assert u["order_ref"] == "ORD-9" and u["count"] == 3
+        assert u["pickup_window"] == "Fri 4:00–5:00 PM"
+        # Found by its order_ref, not a hard-coded entity id.
+        assert (u["item_count"], u["tracked_units"]) == (40, 37)
         await c.post("/scan", barcode=COKE, mode="unload")
         await c.post("/scan", barcode=COKE, mode="unload")
+        assert (await c.state())["just_bought"]["untracked"]["remaining"] == 1
+        # A product Kroger Restock tracked in this order isn't untracked.
+        await c.post("/scan", barcode="011110428509", mode="unload")
         assert (await c.state())["just_bought"]["untracked"]["remaining"] == 1
         # Stock-take scans don't count down.
         await c.post("/scan", barcode=COKE, mode="stocktake")
         assert (await c.state())["just_bought"]["untracked"]["remaining"] == 1
-        # More than 6 hours after pickup: scans no longer count, card gone.
-        clock.advance(6 * 3600)
+        # The last one: the prompt goes; extra scans are still taken.
         await c.post("/scan", barcode=COKE, mode="unload")
         assert (await c.state())["just_bought"]["untracked"] is None
-    # The countdown reaches zero → hidden.
-    await ha.fire_event("kroger_restock_untracked_items", {"count": 1})
-    await eventually(lambda: _untracked(rig, 1))
+        reply = await c.post("/scan", barcode=COKE, mode="unload")
+        assert reply["ok"] and reply["message"] == "Just bought: Coke ×4"
+    rows = {(r["name"], r["quantity"]) for r in await unload_rows(rig)}
+    assert rows == {("Coke", 4), ("Beans", 1)}
+    assert rig.store is not None
+    assert await rig.store.unload_scans("ORD-9") == 4  # Coke rows tied to it
+    # The event repeated (or reported again by the catch-up): counted once.
+    await kroger.fire_untracked(order)
+    await asyncio.sleep(0.1)
+    assert await _untracked(rig, None)
+    # More than 6 hours after pickup a new order's scans don't reach it.
+    clock.advance(6 * 3600)
+    assert await rig.h.just_bought.unload_order(clock(), COKE) is None  # type: ignore[union-attr]
+
+
+async def test_untracked_caught_up_after_restart(
+    tmp_path: Path,
+    grocy: FakeGrocy,
+    broker: BrokerHandle,
+    clock: FakeClock,
+    ha: FakeHomeAssistant,
+) -> None:
+    """A pickup while Pantry Hub was down still shows the prompt."""
+    kroger = FakeKroger(ha)
+    kroger.untracked_order("ORD-7", 12, iso(clock() - 1800), sensor=None)
+    r = Rig(tmp_path, grocy, broker, clock)
+    try:
+        await start(r, ha)
+        await eventually(lambda: _untracked(r, 12))
+        async with WebClient(r.h) as c:
+            u = (await c.state())["just_bought"]["untracked"]
+        assert u["order_ref"] == "ORD-7" and u["item_count"] is None
+    finally:
+        await r.stop()
+        r.close()
+
+
+async def test_older_kroger_restock_no_untracked_prompt(
+    rig: Rig,
+    ha: FakeHomeAssistant,
+    grocy: FakeGrocy,
+    clock: FakeClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    grocy.add_product("Coke", [COKE])
+    kroger = FakeKroger(ha, version="0.17.2")  # no untracked_orders field
+    kroger.recent = [item(item_id="it-1", barcode=COKE, received_at=iso(clock()))]
+    await start(rig, ha)
+    await eventually(lambda: len(ha.rest("kroger_restock", "recent_received")) == 1)
     async with WebClient(rig.h) as c:
-        await c.post("/scan", barcode=COKE, mode="unload")
+        assert (await c.post("/scan", barcode=COKE, mode="unload"))["ok"]
         assert (await c.state())["just_bought"]["untracked"] is None
-    # Malformed payloads are ignored quietly.
-    await ha.fire_event("kroger_restock_untracked_items", {"count": "lots"})
-
-
-async def _untracked(rig: Rig, remaining: int) -> bool:
-    assert rig.h.just_bought is not None
-    u = await rig.h.just_bought.untracked()
-    return u is not None and u["remaining"] == remaining
+    # Odd events (count 0, missing fields) are ignored quietly.
+    for bad in ({"order_ref": "X", "untracked_count": 0}, {"untracked_count": 3}, {}):
+        await ha.fire_event("kroger_restock_untracked_items", bad)
+    await asyncio.sleep(0.1)
+    assert await _untracked(rig, None)
+    assert not [
+        r for r in caplog.records if r.levelno >= 30 and "untracked" in r.getMessage()
+    ]
 
 
 async def test_session_idle_timeout_and_station_sync(

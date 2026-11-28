@@ -331,10 +331,16 @@ Grocy without a price). Nothing is ever added to the Kroger cart. Unload
 ends after 3 minutes without a scan, with a single click on the station, or
 **Stop unloading**.
 
-If Kroger Restock reports order items it couldn't match
-(`kroger_restock_untracked_items`, from its next release), the card shows
-"12 more items from your Kroger order" with **Start unloading**; it counts
-down as unload scans arrive within 6 hours of pickup.
+With Kroger Restock 0.17.3 or later, a pickup with items it couldn't match
+(bought in the Kroger app or substituted, not on its list) shows "About 12
+more items from your Kroger order — start unloading" on the Just bought card,
+with the order's item count from Kroger Restock's "untracked items in last
+order" sensor. It counts down as you unload within 6 hours of pickup (it's
+"about": Kroger Restock reports a net difference, so it stops at 0 and
+further scans still count as unloaded). Scanning something Kroger Restock
+already tracked in that order doesn't count down. A pickup while Pantry Hub
+was off still shows the prompt when it starts. Older Kroger Restock
+versions show nothing.
 
 The phone camera needs Home Assistant opened over HTTPS (or on the device
 itself); otherwise type the barcode. Browsers without a built-in barcode

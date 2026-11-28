@@ -1265,16 +1265,27 @@ class Store:
         return {int(r["product_id"]): int(r["n"]) for r in rows}
 
     async def add_unload_scan(
-        self, *, barcode: str, product_id: int, name: str, now: float
+        self,
+        *,
+        barcode: str,
+        product_id: int,
+        name: str,
+        now: float,
+        order_ref: str | None = None,
     ) -> Received:
-        """One Unload scan: +1 on the open unload row for ``barcode``, or a new row."""
+        """One Unload scan: +1 on the open unload row for ``barcode``, or a new row.
+
+        ``order_ref``: the Kroger order whose untracked items this scan is
+        part of (rows of different orders aren't merged).
+        """
         async with self._lock:
             await self._begin()
             try:
                 row = await self._one(
                     "SELECT id FROM received WHERE source = 'unload' "
-                    "AND barcode = ? AND done_at IS NULL ORDER BY id DESC LIMIT 1",
-                    (barcode,),
+                    "AND barcode = ? AND order_ref IS ? AND done_at IS NULL "
+                    "ORDER BY id DESC LIMIT 1",
+                    (barcode, order_ref),
                 )
                 if row is not None:
                     row_id = int(row["id"])
@@ -1286,8 +1297,8 @@ class Store:
                 else:
                     cur = await self._conn.execute(
                         "INSERT INTO received (item_id, received_at, upc, barcode, "
-                        "source, name, quantity, stored_at, grocy_product_id) "
-                        "VALUES (?, ?, '', ?, 'unload', ?, 1, ?, ?)",
+                        "source, name, quantity, stored_at, grocy_product_id, "
+                        "order_ref) VALUES (?, ?, '', ?, 'unload', ?, 1, ?, ?, ?)",
                         (
                             f"unload:{barcode}:{now:.3f}",
                             iso(now),
@@ -1295,6 +1306,7 @@ class Store:
                             name,
                             now,
                             product_id,
+                            order_ref,
                         ),
                     )
                     row_id = int(cur.lastrowid or 0)
@@ -1308,6 +1320,16 @@ class Store:
                 raise
         assert got is not None
         return _received(got)
+
+    async def unload_scans(self, order_ref: str) -> int:
+        """Unload scans tied to a Kroger order (its untracked items)."""
+        async with self._lock:
+            row = await self._one(
+                "SELECT COALESCE(SUM(quantity), 0) AS n FROM received "
+                "WHERE source = 'unload' AND order_ref = ?",
+                (order_ref,),
+            )
+        return int(row["n"]) if row else 0
 
     # Stock-take ----------------------------------------------------------------
 

@@ -29,7 +29,7 @@ import logging
 import time
 from typing import Any
 
-from .barcodes import grocy_barcode
+from .barcodes import grocy_barcode, variants
 from .grocy import GrocyClient, GrocyError, Product
 from .ha_api import HomeAssistantApi, HomeAssistantApiError
 from .pictures import DOMAIN, PictureService
@@ -229,8 +229,15 @@ class JustBought:
         for entry in items if isinstance(items, list) else []:
             if isinstance(entry, dict) and await self.ingest(entry):
                 new += 1
+        # v0.17.3+: orders with untracked items (absent before: skipped).
+        orders = response.get("untracked_orders")
+        added = 0
+        for order in orders if isinstance(orders, list) else []:
+            if isinstance(order, dict) and await self._add_untracked(order):
+                added += 1
         if new:
             _LOGGER.info("Just bought: caught up %d item(s)", new)
+        if new or added:
             self._changed()
         return new
 
@@ -241,71 +248,150 @@ class JustBought:
             self._changed()
         return n
 
-    # Untracked items (Kroger Restock's next release) -----------------------------
+    # Untracked items (Kroger Restock v0.17.3+) ----------------------------------
+    #
+    # Event `kroger_restock_untracked_items` {order_ref, untracked_count,
+    # pickup_window, received_at, config_entry_id}: once per order, at pickup,
+    # only when untracked_count > 0. Catch-up: `untracked_orders` in
+    # kroger_restock.recent_received. The count is a net difference (items
+    # removed in the Kroger app can hide ones added there), so the page says
+    # "about N"; the countdown stops at 0 and further scans are still taken.
+    # Older Kroger Restock versions send neither: nothing is shown.
 
     async def on_untracked(self, data: dict[str, Any]) -> None:
-        """Handle ``kroger_restock_untracked_items``: N order items to unload.
-
-        The payload isn't published yet; read: ``count`` (or ``untracked_count``,
-        or the length of ``items``), the pickup time from ``picked_up_at`` /
-        ``pickup_at`` / ``received_at`` / the event's ``time_fired`` (else now),
-        and ``order_ref``.
-        """
-        raw = data.get("count", data.get("untracked_count"))
-        if raw is None and isinstance(data.get("items"), list):
-            raw = len(data["items"])
-        count = _number(raw)
-        if count is None or count < 0:
-            _LOGGER.warning("Ignoring a malformed %s payload", UNTRACKED_EVENT)
-            return
-        now = self.clock()
-        at = now
-        for key in ("picked_up_at", "pickup_at", "received_at", "time_fired"):
-            value = data.get(key)
-            if isinstance(value, str):
-                at = min(received_epoch(value, now), now)
-                break
-        state = {
-            "count": int(count),
-            "at": at,
-            "order_ref": _text(data.get("order_ref"), 100),
-            "scanned": 0,
-        }
-        await self.store.set_meta("untracked", json.dumps(state))
-        _LOGGER.info("Kroger order: %d item(s) to unload by hand", int(count))
-        self._changed()
-
-    async def _untracked(self) -> dict[str, Any] | None:
-        raw = await self.store.get_meta("untracked")
-        if not raw:
-            return None
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return None
-        return data if isinstance(data, dict) else None
-
-    async def note_unload(self, now: float) -> None:
-        """Count down the untracked items for an Unload scan within 6 h of pickup."""
-        data = await self._untracked()
-        if data is None:
-            return
-        at = float(data.get("at", 0))
-        if at <= now <= at + UNTRACKED_WINDOW_S and data["scanned"] < data["count"]:
-            data["scanned"] += 1
-            await self.store.set_meta("untracked", json.dumps(data))
+        """Handle ``kroger_restock_untracked_items`` (one order)."""
+        if await self._add_untracked(data):
             self._changed()
 
+    async def _add_untracked(self, data: dict[str, Any]) -> bool:
+        """Remember one order's untracked count; False if invalid or known."""
+        order_ref = _text(data.get("order_ref"), 100)
+        count = _number(data.get("untracked_count"))
+        received = _text(data.get("received_at"), 40)
+        if not order_ref or count is None or count < 1:
+            return False
+        now = self.clock()
+        orders = await self._orders()
+        if order_ref in orders:
+            return False  # the event and the catch-up both report it: once
+        at = min(received_epoch(received, now), now) if received else now
+        orders[order_ref] = {
+            "count": int(count),
+            "at": at,
+            "pickup_window": _text(data.get("pickup_window"), 100),
+        }
+        # Keep the last few orders only.
+        for old in sorted(orders, key=lambda o: orders[o]["at"])[:-10]:
+            del orders[old]
+        await self.store.set_meta("untracked_orders", json.dumps(orders))
+        _LOGGER.info(
+            "Kroger order %s: about %d item(s) to unload by hand", order_ref, int(count)
+        )
+        await self._find_sensor(order_ref)
+        return True
+
+    async def _orders(self) -> dict[str, dict[str, Any]]:
+        raw = await self.store.get_meta("untracked_orders")
+        try:
+            data = json.loads(raw) if raw else {}
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def _find_sensor(self, order_ref: str) -> None:
+        """Find Kroger Restock's "untracked items in last order" sensor.
+
+        Not hard-coded (``sensor.<store>_untracked_items_in_last_order``):
+        the sensor whose ``order_ref`` attribute is this order. Its
+        ``item_count`` / ``tracked_units`` are shown with the prompt.
+        """
+        if self.ha is None:
+            return
+        try:
+            states = await self.ha.states()
+        except HomeAssistantApiError as err:
+            _LOGGER.debug("Couldn't read Home Assistant states: %s", err)
+            return
+        for st in states:
+            entity = st.get("entity_id")
+            attrs = st.get("attributes") or {}
+            if (
+                isinstance(entity, str)
+                and entity.startswith("sensor.")
+                and entity.endswith("_untracked_items_in_last_order")
+                and attrs.get("order_ref") == order_ref
+            ):
+                await self.store.set_meta("untracked_sensor", entity)
+                return
+
+    async def _active_order(self, now: float) -> tuple[str, dict[str, Any]] | None:
+        """Return the newest order picked up within the last 6 hours, if any."""
+        best: tuple[str, dict[str, Any]] | None = None
+        for ref, order in (await self._orders()).items():
+            at = float(order.get("at", 0))
+            if at <= now <= at + UNTRACKED_WINDOW_S and (
+                best is None or at > float(best[1]["at"])
+            ):
+                best = (ref, order)
+        return best
+
+    async def unload_order(self, now: float, barcode: str) -> str | None:
+        """Order an Unload scan belongs to (its untracked items), if any.
+
+        A scan of a product that Kroger Restock tracked in that order (a
+        Just bought row with the same order_ref, also when checked off by
+        hand) isn't one of the untracked items: no order, no countdown.
+        """
+        active = await self._active_order(now)
+        if active is None:
+            return None
+        ref = active[0]
+        forms = set(variants(barcode))
+        for row in await self.store.received(include_done=True):
+            if (
+                row.source == "kroger"
+                and row.order_ref == ref
+                and forms & set(variants(row.grocy_barcode))
+            ):
+                return None
+        return ref
+
+    async def note_unload(self, now: float) -> None:
+        """Refresh the page after an Unload scan (the countdown reads the rows)."""
+        self._changed()
+
     async def untracked(self) -> dict[str, Any] | None:
-        """``{count, remaining, until}`` while items are left to unload."""
-        data = await self._untracked()
-        if data is None:
+        """Return the prompt for the active order while items are left (about N)."""
+        now = self.clock()
+        active = await self._active_order(now)
+        if active is None:
             return None
-        until = float(data.get("at", 0)) + UNTRACKED_WINDOW_S
-        remaining = int(data.get("count", 0)) - int(data.get("scanned", 0))
-        if remaining <= 0 or self.clock() > until:
+        ref, order = active
+        scanned = await self.store.unload_scans(ref)
+        remaining = max(int(order["count"]) - scanned, 0)
+        if remaining == 0:
             return None
-        return {"count": int(data["count"]), "remaining": remaining, "until": until}
+        out: dict[str, Any] = {
+            "order_ref": ref,
+            "count": int(order["count"]),
+            "scanned": scanned,
+            "remaining": remaining,
+            "until": float(order["at"]) + UNTRACKED_WINDOW_S,
+            "pickup_window": order.get("pickup_window"),
+            "item_count": None,
+            "tracked_units": None,
+        }
+        sensor = await self.store.get_meta("untracked_sensor")
+        if sensor and self.ha is not None:
+            try:
+                st = await self.ha.state(sensor)
+            except HomeAssistantApiError:
+                st = None
+            attrs = (st or {}).get("attributes") or {}
+            if attrs.get("order_ref") == ref:
+                out["item_count"] = attrs.get("item_count")
+                out["tracked_units"] = attrs.get("tracked_units")
+        return out
 
     # Rows ----------------------------------------------------------------------
 

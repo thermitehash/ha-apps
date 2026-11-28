@@ -43,6 +43,8 @@ class FakeHomeAssistant:
         app = web.Application()
         app.router.add_get("/api/websocket", self._ws)
         app.router.add_get("/api/services", self._services)
+        app.router.add_get("/api/states", self._states)
+        app.router.add_get("/api/states/{entity_id}", self._state)
         app.router.add_post("/api/services/{domain}/{service}", self._call)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
@@ -98,6 +100,24 @@ class FakeHomeAssistant:
     def _authorized(self, request: web.Request) -> None:
         if request.headers.get("Authorization") != f"Bearer {TOKEN}":
             raise web.HTTPUnauthorized()
+
+    def _state_json(self, entity_id: str) -> dict[str, Any]:
+        return {
+            "entity_id": entity_id,
+            "state": self.states[entity_id],
+            "attributes": self.attributes.get(entity_id, {}),
+        }
+
+    async def _states(self, request: web.Request) -> web.Response:
+        self._authorized(request)
+        return web.json_response([self._state_json(e) for e in self.states])
+
+    async def _state(self, request: web.Request) -> web.Response:
+        self._authorized(request)
+        entity_id = request.match_info["entity_id"]
+        if entity_id not in self.states:
+            raise web.HTTPNotFound(text='{"message": "Entity not found."}')
+        return web.json_response(self._state_json(entity_id))
 
     async def _services(self, request: web.Request) -> web.Response:
         self._authorized(request)

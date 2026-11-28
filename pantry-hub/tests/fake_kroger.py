@@ -12,6 +12,19 @@
 * Items / ``kroger_restock_received`` events: ``item_id, upc, barcode,
   product_id, name, brand, size, image_url, quantity_received, price,
   received_at, order_ref, config_entry_id``; ``price`` is per unit.
+
+v0.17.3 adds untracked items:
+
+* Event ``kroger_restock_untracked_items`` ``{order_ref, untracked_count,
+  pickup_window, received_at, config_entry_id}``, once per order at pickup,
+  only when ``untracked_count > 0``.
+* ``recent_received`` also returns ``untracked_orders`` (same shape per
+  order) and ``untracked_count``.
+* Sensor ``sensor.<store>_untracked_items_in_last_order`` (state: the count;
+  attributes ``order_ref, item_count, tracked_units, pickup_window, status,
+  received_at``).
+
+``FakeKroger(ha, version="0.17.2")`` leaves all of that out.
 """
 
 from __future__ import annotations
@@ -37,8 +50,11 @@ def kroger13(code: str) -> str:
 class FakeKroger:
     """Registers Kroger Restock's actions on a :class:`FakeHomeAssistant`."""
 
-    def __init__(self, ha: FakeHomeAssistant) -> None:
+    def __init__(self, ha: FakeHomeAssistant, version: str = "0.17.3") -> None:
         self.ha = ha
+        self.version = version
+        #: v0.17.3: orders with untracked items (recent_received).
+        self.untracked_orders: list[dict[str, Any]] = []
         #: Kroger 13-digit code → product fields.
         self.products: dict[str, dict[str, Any]] = {}
         #: Kroger 13-digit code → ``reason`` of a found:false answer.
@@ -90,7 +106,49 @@ class FakeKroger:
         return {"found": True, "query": query, "cached": False, **product}
 
     async def _recent(self, data: dict[str, Any]) -> dict[str, Any]:
-        return {"days": self.days, "items": list(self.recent)}
+        out: dict[str, Any] = {"days": self.days, "items": list(self.recent)}
+        if self.version >= "0.17.3":
+            out["untracked_orders"] = list(self.untracked_orders)
+            out["untracked_count"] = sum(
+                o["untracked_count"] for o in self.untracked_orders
+            )
+        return out
+
+    def untracked_order(
+        self,
+        order_ref: str,
+        count: int,
+        received_at: str,
+        *,
+        sensor: str | None = "sensor.kroger_mt_zion_untracked_items_in_last_order",
+        item_count: int = 40,
+    ) -> dict[str, Any]:
+        """Record a pickup with untracked items (catch-up list + sensor)."""
+        order = {
+            "order_ref": order_ref,
+            "untracked_count": count,
+            "pickup_window": "Fri 4:00–5:00 PM",
+            "received_at": received_at,
+            "config_entry_id": CONFIG_ENTRY,
+        }
+        self.untracked_orders.append(order)
+        if sensor:
+            self.ha.add_entity(
+                sensor,
+                str(count),
+                order_ref=order_ref,
+                item_count=item_count,
+                tracked_units=item_count - count,
+                pickup_window=order["pickup_window"],
+                status="picked_up",
+                received_at=received_at,
+                friendly_name="Kroger Mt Zion Untracked items in last order",
+            )
+        return order
+
+    async def fire_untracked(self, order: dict[str, Any]) -> None:
+        """The event v0.17.3 fires at pickup."""
+        await self.ha.fire_event("kroger_restock_untracked_items", dict(order))
 
 
 def item(

@@ -26,12 +26,23 @@ can be reviewed and reverted. Newest release first.
    `unload`, product resolved at scan time; Not tagging books without price,
    note "Pantry Hub: unloaded groceries".
 7. **Unknown barcodes** go to the existing "needs a product" list (no row).
-8. **Untracked items payload is a guess** (Kroger Restock hasn't released it):
-   event `kroger_restock_untracked_items` with `count` (or
-   `untracked_count`, or `items` list length), pickup time from
-   `picked_up_at` / `pickup_at` / `received_at` / `time_fired`. Only Unload
-   scans count down, only within 6 h of pickup; a new event replaces the
-   previous count. If it never fires nothing shows.
+8. **Untracked items (Kroger Restock v0.17.3)**: event
+   `kroger_restock_untracked_items` `{order_ref, untracked_count,
+   pickup_window, received_at, config_entry_id}` (once per order at pickup,
+   only when > 0) and, for a pickup while Pantry Hub was down,
+   `untracked_orders` in `recent_received` (read at start and on every
+   reconnect). An order is remembered once by `order_ref` (event and
+   catch-up don't double it); the last 10 are kept. The prompt is for the
+   newest order picked up in the last 6 hours and says **"about N"** (the
+   count is a net difference); it disappears at 0, and further scans are
+   still accepted. Unload scans in that window are tied to the order
+   (`order_ref` on the unload row) and count down — except a product
+   Kroger Restock tracked in the same order (a Just bought row with that
+   `order_ref`, also when checked off by hand), which isn't untracked. The
+   sensor `sensor.<store>_untracked_items_in_last_order` is found by its
+   `order_ref` attribute in `GET /api/states` (never hard-coded) and adds
+   "40 items in the order, 37 already in Just bought". Older Kroger Restock
+   (no event, no `untracked_orders`): nothing shown, nothing logged.
 9. **Unload / Stock-take work without Kroger Restock** (and without the HA
    API): only Grocy is needed; the Kroger lookup is skipped.
 10. **Stock-take counts untagged units**; a product's target is counted +

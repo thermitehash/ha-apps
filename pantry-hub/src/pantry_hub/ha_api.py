@@ -116,6 +116,23 @@ class HomeAssistantApi:
         self._services, self._services_at = found, now
         return found
 
+    async def states(self) -> list[dict[str, Any]]:
+        """Every entity state (``GET /api/states``)."""
+        body = await self._request("GET", "/states")
+        return (
+            [s for s in body if isinstance(s, dict)] if isinstance(body, list) else []
+        )
+
+    async def state(self, entity_id: str) -> dict[str, Any] | None:
+        """One entity's state (None if it doesn't exist)."""
+        try:
+            body = await self._request("GET", f"/states/{entity_id}")
+        except HomeAssistantApiError as err:
+            if "HTTP 404" in str(err):
+                return None
+            raise
+        return body if isinstance(body, dict) else None
+
     async def has_service(self, domain: str, service: str) -> bool:
         """Whether the action exists (False when HA can't be asked)."""
         try:

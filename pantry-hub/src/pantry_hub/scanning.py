@@ -221,6 +221,7 @@ class ScanManager:
         tags_present: TagsFn,
         publish_mode: PublishFn | None = None,
         on_unload: Callable[[float], Awaitable[None]] | None = None,
+        unload_order: Callable[[float, str], Awaitable[str | None]] | None = None,
         on_change: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.time,
         idle_s: float = IDLE_S,
@@ -238,6 +239,7 @@ class ScanManager:
         self.tags_present = tags_present
         self.publish_mode = publish_mode
         self.on_unload = on_unload
+        self.unload_order = unload_order
         self.on_change = on_change
         self.clock = clock
         self.idle_s = idle_s
@@ -371,8 +373,17 @@ class ScanManager:
 
     async def _unload(self, product: Product, barcode: str) -> ScanResult:
         now = self.clock()
+        order = (
+            await self.unload_order(now, barcode)
+            if self.unload_order is not None
+            else None
+        )
         row = await self.store.add_unload_scan(
-            barcode=barcode, product_id=product.id, name=product.name, now=now
+            barcode=barcode,
+            product_id=product.id,
+            name=product.name,
+            now=now,
+            order_ref=order,
         )
         if self.on_unload is not None:
             await self.on_unload(now)

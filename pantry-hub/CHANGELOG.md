@@ -27,9 +27,12 @@
   doesn't add them again.
 - **In Grocy, not tagged** (Tags page): stock Grocy already has in the
   pantry without tags, with **Tag them**. Tagging it never adds it again.
-- With the next Kroger Restock release, the Just bought card shows "12 more
-  items from your Kroger order" (items Kroger Restock couldn't match),
-  counting down as you unload them within 6 hours of pickup.
+- With Kroger Restock 0.17.3 or later, after a pickup the Just bought card
+  shows "About 12 more items from your Kroger order — start unloading" (items
+  Kroger Restock couldn't match), with the order's item count. It counts down
+  as you unload within 6 hours of pickup, ignores products Kroger Restock
+  already tracked in that order, and also appears for a pickup that happened
+  while Pantry Hub was down. Older Kroger Restock versions: no prompt.
 - Linking station firmware 0.4.0: triple-click Unload, hold 6 s Stock-take,
   single click leaves them; double-click (link mode) now waits 0.4 s to rule
   out a third click. Reflash to use the station for Unload / Stock-take; the
