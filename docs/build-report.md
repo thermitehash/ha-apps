@@ -2,7 +2,7 @@
 - App version: 0.4.3 (Unload + Stock-take; 0.1.0–0.3.1 in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4, 0.4.0 in PR #5, 0.4.1 in PR #6, 0.4.2 in PR #7, 0.4.3 in PR #8) · linking station firmware 0.4.0
 - Branches: PR #8 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `fd2507b`, the merge of PR #7 (0.4.2). Merging PR #8 publishes 0.4.3.
 - aiochainway version used: v0.4.0 (unchanged).
-- Date / PR / Commit / CI (per job): 2026-11-28 / PR #8 / CI_PENDING (0.4.2: PR #7 at `6edabab`, all green, merged as `fd2507b`)
+- Date / PR / Commit / CI (per job): 2026-11-28 / PR #8 / `d713d9e` / all green: HA app linter, yamllint, Ruff + mypy, ESPHome linking station (firmware 0.4.0 config + compile), Version bump, Pytest (ubuntu-latest), Pytest (macos-latest), Sweep-now repeat ×200 (macOS), UI smoke (Playwright), Prepare, Build amd64, Build aarch64 (multi-arch manifest skipped on PRs). First commit `88101b7` was all green too. 0.4.2: PR #7 at `6edabab`, merged as `fd2507b`.
 
 ## Summary
 **v0.4.3, Unload + Stock-take** (groceries bought outside Kroger Restock, and what's already in the pantry):
