@@ -53,6 +53,25 @@ def test_hub_reads_the_field_the_firmware_sends() -> None:
 def test_session_ends_with_link_mode() -> None:
     exit_block = YAML.split("- id: exit_link_mode", 1)[1].split("\n  - id:", 1)[0]
     assert "link_mode::state().exit_link()" in exit_block
+    # exit_link() goes back to Kroger mode from any mode (0.4.3: also from
+    # Unload / Stock-take) and always ends the in-stock session.
     assert re.search(
-        r"void exit_link\(\) \{\s*link_ = false;\s*in_stock_ = false;", HEADER
+        r"void exit_link\(\) \{\s*mode_ = Mode::KROGER;\s*in_stock_ = false;", HEADER
+    )
+
+
+def test_unload_and_stocktake_never_reach_the_kroger_cart() -> None:
+    """0.4.3: scans in Unload / Stock-take go to Pantry Hub, not scan_upc."""
+    scanner = YAML.split("- id: scanner_uart", 1)[1].split("- id: u107_uart", 1)[0]
+    unload = scanner.split("case link_mode::Action::UNLOAD_BARCODE:", 1)[1]
+    unload = unload.split("break;", 1)[0]
+    assert "id(scan_to_hub).execute" in unload
+    assert "send_scan" not in unload
+    scan_block = YAML.split("- id: scan_to_hub", 1)[1].split("\n  - id:", 1)[0]
+    assert "pantry_hub/linking/${station_id}/scan" in scan_block
+    assert "kroger_restock" not in scan_block
+    assert "topic: pantry_hub/linking/${station_id}/mode\n" in YAML
+    assert "pantry_hub/linking/${station_id}/mode_state" in YAML
+    assert re.search(
+        r"if \(mode_ == Mode::UNLOAD\) return Action::UNLOAD_BARCODE;", HEADER
     )

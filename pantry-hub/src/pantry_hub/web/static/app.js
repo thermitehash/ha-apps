@@ -1,6 +1,7 @@
 // Pantry Hub web UI: routing, live updates, actions, door check flow.
 import { readBoot, Api, Poller } from "./api.js?v=__VERSION__";
 import * as V from "./views.js?v=__VERSION__";
+import { openScanner } from "./scanner.js?v=__VERSION__";
 
 const boot = readBoot();
 const api = new Api(boot);
@@ -47,6 +48,7 @@ const LAYOUTS = {
 <section id="s-bought" class="stack" aria-label="Just bought"></section>
 <section id="s-items" class="stack" aria-label="In the pantry"></section>`,
   tags: () => `
+<section id="s-stocktake" class="stack" aria-label="Stock-take"></section>
 <section id="s-unlinked" class="stack" aria-label="Not linked yet"></section>
 <section class="stack" aria-labelledby="linked-h">
 <div class="section-head"><h2 id="linked-h">Linked</h2></div>
@@ -54,6 +56,7 @@ const LAYOUTS = {
 <input id="tag-search" class="input" type="search" placeholder="Search linked tags" autocomplete="off" enterkeyhint="search"></label>
 <div id="s-linked"></div>
 </section>
+<section id="s-grocy-untagged" class="stack" aria-label="In Grocy, not tagged"></section>
 <section id="s-failed" class="stack" aria-label="Failed Grocy updates"></section>
 <section id="s-needs" class="stack" aria-label="Barcodes without a Grocy product"></section>`,
   settings: () => `
@@ -99,7 +102,9 @@ function slotsFor(tab) {
   }
   if (tab === "tags") {
     return {
+      "s-stocktake": () => V.stocktakeCard(state),
       "s-unlinked": () => V.unlinkedCards(state, ui),
+      "s-grocy-untagged": () => V.grocyUntagged(state, ui),
       "s-linked": () => V.linkedList(state, ui),
       "s-failed": () => V.failedOps(state),
       "s-needs": () => V.needsProduct(state),
@@ -400,8 +405,15 @@ root.addEventListener("click", async (event) => {
     }
   } else if (action === "post") {
     const fields = {};
-    for (const key of ["epc", "op", "barcode", "row"]) if (el.dataset[key]) fields[key] = el.dataset[key];
+    if (el.dataset.confirm && !window.confirm(el.dataset.confirm)) return;
+    for (const key of ["epc", "op", "barcode", "row", "product_id", "mode"]) if (el.dataset[key]) fields[key] = el.dataset[key];
     await act(el.dataset.path, fields, el);
+  } else if (action === "scan-start") {
+    await act("/scan/start", { mode: el.dataset.mode }, el);
+  } else if (action === "scan-stop") {
+    await act("/scan/stop", {}, el);
+  } else if (action === "scan-open") {
+    openCamera(el.dataset.mode);
   } else if (action === "skip-toggle") {
     toggle(ui.skipOpen, el.dataset.row);
   } else if (action === "older-toggle") {
@@ -446,7 +458,39 @@ async function act(path, fields, el) {
   }
 }
 
+function openCamera(mode) {
+  const title = mode === "stocktake" ? "Stock-take: scan each item" : "Unload: scan each item";
+  openScanner({
+    title,
+    zxingUrl: api.url(`/static/zxing.min.js?v=${boot.version}`),
+    async onCode(code) {
+      const res = await api.post("/scan", { barcode: code, mode });
+      poller.now();
+      return res;
+    },
+    onClose: () => poller.now(),
+  });
+}
+
 root.addEventListener("submit", async (event) => {
+  const count = event.target.closest("form[data-form='count']");
+  if (count) {
+    event.preventDefault();
+    await act("/stocktake/count", { product_id: count.dataset.epc, counted: count.elements.counted.value }, count.querySelector("button"));
+    return;
+  }
+  const apply = event.target.closest("form[data-form='apply']");
+  if (apply) {
+    event.preventDefault();
+    const how = apply.querySelector("input[name='how']:checked").value;
+    const gone = apply.elements.gone.checked;
+    const msg = how === "set"
+      ? `Set Grocy to the counted amounts${gone ? " and mark unscanned products as gone" : ""}?`
+      : `Add the missing items to Grocy as purchases${gone ? " and mark unscanned products as gone" : ""}?`;
+    if (!window.confirm(msg)) return;
+    await act("/stocktake/apply", { how, gone: gone ? "on" : "" }, apply.querySelector("button[type=submit]"));
+    return;
+  }
   const skip = event.target.closest("form[data-form='skip']");
   if (skip) {
     event.preventDefault();

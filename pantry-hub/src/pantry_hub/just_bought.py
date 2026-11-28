@@ -24,19 +24,25 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import logging
 import time
 from typing import Any
 
-from .barcodes import grocy_barcode, variants
+from .barcodes import grocy_barcode
 from .grocy import GrocyClient, GrocyError, Product
 from .ha_api import HomeAssistantApi, HomeAssistantApiError
-from .pictures import DOMAIN, PictureError, PictureService
+from .pictures import DOMAIN, PictureService
+from .products import ProductResolver
 from .store import Link, Received, Store
 
 _LOGGER = logging.getLogger(__name__)
 
 EVENT_TYPE = "kroger_restock_received"
+#: Kroger Restock (next release): order items it can't match, to unload by hand.
+UNTRACKED_EVENT = "kroger_restock_untracked_items"
+#: Unload scans this long after pickup count down the untracked items.
+UNTRACKED_WINDOW_S = 6 * 3600.0
 RECENT_SERVICE = "recent_received"
 OLDER_AFTER_S = 14 * 86400.0
 PURGE_AFTER_S = 30 * 86400.0
@@ -152,6 +158,7 @@ class JustBought:
         self.ha = ha
         self.pictures = pictures
         self.location_id = location_id
+        self.resolver = ProductResolver(grocy, pictures, location_id=location_id)
         self.clock = clock
         self.on_change = on_change
         #: Whether ``kroger_restock.recent_received`` exists (None: not asked).
@@ -234,6 +241,72 @@ class JustBought:
             self._changed()
         return n
 
+    # Untracked items (Kroger Restock's next release) -----------------------------
+
+    async def on_untracked(self, data: dict[str, Any]) -> None:
+        """Handle ``kroger_restock_untracked_items``: N order items to unload.
+
+        The payload isn't published yet; read: ``count`` (or ``untracked_count``,
+        or the length of ``items``), the pickup time from ``picked_up_at`` /
+        ``pickup_at`` / ``received_at`` / the event's ``time_fired`` (else now),
+        and ``order_ref``.
+        """
+        raw = data.get("count", data.get("untracked_count"))
+        if raw is None and isinstance(data.get("items"), list):
+            raw = len(data["items"])
+        count = _number(raw)
+        if count is None or count < 0:
+            _LOGGER.warning("Ignoring a malformed %s payload", UNTRACKED_EVENT)
+            return
+        now = self.clock()
+        at = now
+        for key in ("picked_up_at", "pickup_at", "received_at", "time_fired"):
+            value = data.get(key)
+            if isinstance(value, str):
+                at = min(received_epoch(value, now), now)
+                break
+        state = {
+            "count": int(count),
+            "at": at,
+            "order_ref": _text(data.get("order_ref"), 100),
+            "scanned": 0,
+        }
+        await self.store.set_meta("untracked", json.dumps(state))
+        _LOGGER.info("Kroger order: %d item(s) to unload by hand", int(count))
+        self._changed()
+
+    async def _untracked(self) -> dict[str, Any] | None:
+        raw = await self.store.get_meta("untracked")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def note_unload(self, now: float) -> None:
+        """Count down the untracked items for an Unload scan within 6 h of pickup."""
+        data = await self._untracked()
+        if data is None:
+            return
+        at = float(data.get("at", 0))
+        if at <= now <= at + UNTRACKED_WINDOW_S and data["scanned"] < data["count"]:
+            data["scanned"] += 1
+            await self.store.set_meta("untracked", json.dumps(data))
+            self._changed()
+
+    async def untracked(self) -> dict[str, Any] | None:
+        """``{count, remaining, until}`` while items are left to unload."""
+        data = await self._untracked()
+        if data is None:
+            return None
+        until = float(data.get("at", 0)) + UNTRACKED_WINDOW_S
+        remaining = int(data.get("count", 0)) - int(data.get("scanned", 0))
+        if remaining <= 0 or self.clock() > until:
+            return None
+        return {"count": int(data["count"]), "remaining": remaining, "until": until}
+
     # Rows ----------------------------------------------------------------------
 
     async def rows(self) -> list[dict[str, Any]]:
@@ -253,6 +326,7 @@ class JustBought:
                     "price": r.price,
                     "received_at": r.received_at,
                     "product_id": r.grocy_product_id,
+                    "source": r.source,
                     "older": now - r.stored_at >= OLDER_AFTER_S,
                 }
             )
@@ -272,7 +346,7 @@ class JustBought:
             except GrocyError:
                 pass  # deleted in Grocy: look it up again
         try:
-            product = await self._find(row.grocy_barcode)
+            product = await self.resolver.find(row.grocy_barcode)
             if product is None:
                 product = await self._create(row)
         except GrocyError as err:
@@ -280,41 +354,16 @@ class JustBought:
         await self.store.set_received_product(row.id, product.id)
         return product
 
-    async def _find(self, barcode: str) -> Product | None:
-        """Grocy product with this barcode in any of its forms.
-
-        The printed code, its UPC-A / EAN-13 twin and Kroger's 13-digit
-        zero-padded form are all tried before a new product is created, so a
-        product stored either way is found and not duplicated.
-        """
-        for code in variants(barcode):
-            product: Product | None = await self.grocy.product_by_barcode(code)
-            if product is not None:
-                return product
-        return None
-
     async def _create(self, row: Received) -> Product:
-        name, brand, size = row.name, row.brand, row.size
-        barcode = row.grocy_barcode
-        try:
-            info = await self.pictures.lookup(barcode)
-        except PictureError as err:  # the lookup only improves the name
-            _LOGGER.info("Product lookup for a new Grocy product failed: %s", err)
-            info = None
-        if info and info.get("found"):
-            name = _text(info.get("name")) or name
-            brand = _text(info.get("brand")) or brand
-            size = _text(info.get("size"), 64) or size
-        description = " · ".join(v for v in (brand, size) if v)
-        product: Product = await self.grocy.create_product(
-            name,
-            barcode=barcode,  # printed form, with check digit
-            location_id=self.location_id,
-            description=description,
+        barcode = row.grocy_barcode  # printed form, with check digit
+        info = (
+            await self.resolver.kroger_info(barcode)
+            if self.pictures.blocked() is None
+            else None
         )
-        _LOGGER.info("Created Grocy product %r for a Kroger delivery", name)
-        self.pictures.on_link(product.id, barcode)
-        return product
+        return await self.resolver.create(
+            barcode, name=row.name, brand=row.brand, size=row.size, info=info
+        )
 
     async def tag(self, row_id: int, start: StartFn) -> Product:
         """Tag them: resolve the product and start a counted session."""
@@ -350,7 +399,11 @@ class JustBought:
                 units,
                 location_id=self.location_id,
                 price=row.price,
-                note=f"Pantry Hub: Kroger delivery {row.order_ref or row.item_id}",
+                note=(
+                    "Pantry Hub: unloaded groceries"
+                    if row.source == "unload"
+                    else f"Pantry Hub: Kroger delivery {row.order_ref or row.item_id}"
+                ),
             )
         except GrocyError as err:
             await self.store.reopen_received(row.id)

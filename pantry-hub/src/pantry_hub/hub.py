@@ -38,6 +38,7 @@ from .discovery import (
     STATE_TOPIC,
     SWEEP_COMMAND_TOPIC,
     discovery_payload,
+    linking_mode_topic,
     linking_result_topic,
     linking_start_topic,
 )
@@ -52,8 +53,8 @@ from .homeassistant import (
     door_candidates,
     fetch_states,
 )
-from .just_bought import EVENT_TYPE, JustBought
-from .linking import LinkingManager, LinkResult, best_before_for
+from .just_bought import EVENT_TYPE, UNTRACKED_EVENT, JustBought
+from .linking import STATION_ID_RE, LinkingManager, LinkResult, best_before_for
 from .mqtt import MqttLink
 from .pictures import RETRY_DELAYS_S, PictureService
 from .presence import Door, PresenceConfig, PresenceEvent, PresenceMachine
@@ -66,7 +67,9 @@ from .reader import (
 )
 from .reader_config import ReaderConfig
 from .reading import Activity, Plan, ReadingConfig, ReadingPlanner
+from .scanning import ScanManager
 from .store import Link, Received, Store, iso
+from .untagged import GrocyUntagged
 from .worker import GrocyWorker
 
 _LOGGER = logging.getLogger(__name__)
@@ -146,6 +149,7 @@ class Hub:
         picture_spacing_s: float | None = None,
         counted_idle: float | None = None,
         ha_backoff_s: float = 2.0,
+        scan_idle_s: float | None = None,
     ) -> None:
         """Create; call :meth:`start`."""
         door_mode = options.reading_mode == "door"
@@ -256,14 +260,17 @@ class Hub:
             clock=wall,
             **linking_kwargs,
         )
-        # Kroger Restock: product pictures + "Just bought" (needs the HA API
-        # and a real Grocy client; skipped silently otherwise).
+        # Kroger Restock (pictures, deliveries) needs the HA API; Unload and
+        # Stock-take only need a real Grocy client.
         self.ha_api: HomeAssistantApi | None = None
         self.pictures: PictureService | None = None
         self.just_bought: JustBought | None = None
         self.ha_events: HomeAssistantEvents | None = None
-        if ha_token and isinstance(backend, GrocyClient):
-            self.ha_api = HomeAssistantApi(rest_url_from_ws(self.ha_url), ha_token)
+        self.scans: ScanManager | None = None
+        self.grocy_untagged: GrocyUntagged | None = None
+        if isinstance(backend, GrocyClient):
+            if ha_token:
+                self.ha_api = HomeAssistantApi(rest_url_from_ws(self.ha_url), ha_token)
             picture_kwargs: dict[str, Any] = {}
             if picture_spacing_s is not None:
                 picture_kwargs["spacing_s"] = picture_spacing_s
@@ -285,13 +292,38 @@ class Hub:
                 clock=wall,
                 on_change=self.mark_dirty,
             )
-            self.ha_events = HomeAssistantEvents(
-                self.ha_url,
-                ha_token,
-                EVENT_TYPE,
-                self.just_bought.on_event,
-                on_connect=self._on_ha_events_connect,
-                min_backoff=ha_backoff_s,
+            if ha_token:
+                self.ha_events = HomeAssistantEvents(
+                    self.ha_url,
+                    ha_token,
+                    EVENT_TYPE,
+                    self.just_bought.on_event,
+                    on_connect=self._on_ha_events_connect,
+                    extra={UNTRACKED_EVENT: self.just_bought.on_untracked},
+                    min_backoff=ha_backoff_s,
+                )
+            scan_kwargs: dict[str, Any] = {}
+            if scan_idle_s is not None:
+                scan_kwargs["idle_s"] = scan_idle_s
+            self.scans = ScanManager(
+                store,
+                backend,
+                self.just_bought.resolver,
+                location_id=options.grocy_location_id,
+                tags_present=self.tags_present,
+                publish_mode=self._publish_station_mode,
+                on_unload=self.just_bought.note_unload,
+                on_change=self.mark_dirty,
+                clock=wall,
+                **scan_kwargs,
+            )
+            self.scans.default_station = self.tag_station
+            self.grocy_untagged = GrocyUntagged(
+                backend,
+                location_id=options.grocy_location_id,
+                tags_present=self.tags_present,
+                names=self._product_names,
+                monotonic=monotonic,
             )
         self.reader = ReaderHealth()
         self.listener: UR4UdpListener | None = None
@@ -402,8 +434,11 @@ class Hub:
             self._loops.append(
                 asyncio.create_task(self._probe_loop(), name="pantry_hub.probe")
             )
+        if self.scans is not None:
+            await self.scans.load()
         if self.ha_events is not None:
             self.ha_events.start()
+        if self.just_bought is not None:
             self._loops.append(
                 asyncio.create_task(
                     self._housekeeping_loop(), name="pantry_hub.housekeeping"
@@ -431,6 +466,8 @@ class Hub:
         await self.linking.close()
         if self.ha_events is not None:
             await self.ha_events.stop()
+        if self.grocy_untagged is not None:
+            await self.grocy_untagged.close()
         if self.pictures is not None:
             await self.pictures.close()
         if self.ha_api is not None:
@@ -878,6 +915,8 @@ class Hub:
                 if now - last_touch >= TOUCH_EVERY_S:
                     last_touch = now
                     await self._flush_seen()
+                if self.scans is not None:
+                    await self.scans.check_idle()
                 await self.publish_state()
             except Exception:
                 _LOGGER.exception("Error in the hub timer")
@@ -1060,7 +1099,16 @@ class Hub:
                 await self.linking.handle_barcode(station, payload)
             elif kind == "tag":
                 await self.linking.handle_tag(station, payload)
-            return  # our own "result" / "start" messages come back here too
+            elif kind == "scan":
+                await self._station_scan(station, payload)
+            elif (
+                kind == "mode_state"
+                and self.scans is not None
+                and STATION_ID_RE.fullmatch(station)
+            ):
+                self.linking.last_station = station
+                await self.scans.on_station_mode(station, payload)
+            return  # our own result / start / mode messages come back here too
         if topic == PICTURES_COMMAND_TOPIC:
             message = self.fetch_missing_pictures()
             _LOGGER.info("Fetch missing pictures (MQTT): %s", message)
@@ -1110,6 +1158,112 @@ class Hub:
         )
         self.mark_dirty()
 
+    # Unload / Stock-take --------------------------------------------------------
+
+    async def tags_present(self) -> dict[int, int]:
+        """Linked tags in the pantry now, per Grocy product."""
+        present = set(self.machine.in_pantry())
+        out: dict[int, int] = {}
+        for link in await self.store.links():
+            if link.epc in present:
+                out[link.product_id] = out.get(link.product_id, 0) + 1
+        return out
+
+    async def _product_names(self, ids: list[int]) -> dict[int, str]:
+        names = {lk.product_id: lk.product_name for lk in await self.store.links()}
+        for pid in ids:
+            if pid not in names:
+                try:
+                    names[pid] = (await self.backend.product(pid)).name
+                except GrocyError:
+                    continue
+        return names
+
+    async def _publish_station_mode(
+        self, station: str, payload: dict[str, Any]
+    ) -> None:
+        if self.mqtt is not None:
+            await self.mqtt.publish(
+                linking_mode_topic(station), json.dumps(payload), qos=1, queue=False
+            )
+
+    async def _station_scan(self, station: str, payload: bytes) -> None:
+        if self.scans is None or not STATION_ID_RE.fullmatch(station):
+            return
+        self.linking.last_station = station
+        try:
+            data = json.loads(payload)
+        except UnicodeDecodeError, ValueError:
+            data = None
+        if not isinstance(data, dict):
+            data = {}
+        mode = data.get("mode") if isinstance(data.get("mode"), str) else None
+        result = await self.scans.scan(data.get("barcode"), mode, source=station)
+        if self.mqtt is not None:
+            await self.mqtt.publish(
+                linking_result_topic(station),
+                json.dumps(result.payload()),
+                qos=1,
+                queue=False,
+            )
+        if self.grocy_untagged is not None:
+            self.grocy_untagged.invalidate()
+
+    async def tag_stocktake(self, product_id: int) -> str:
+        """Tag N for a stock-take row (counted session, booked units matched)."""
+        if self.scans is None:
+            raise ValueError("Stock-take needs Grocy")
+        count = self.scans.tag_count(product_id)
+        product = await self.backend.product(product_id)
+        station = self.tag_station()
+        scans = self.scans
+
+        async def each(link: Link) -> None:
+            await scans.tagged_one(product_id)
+
+        await self._start_counted(station, product, count, each)
+        return f"Tap each {product.name} on the {station} station ({count} to tag)"
+
+    async def tag_grocy_stock(self, product_id: int) -> str:
+        """Tag them for Grocy-only stock: links are "already in stock"."""
+        if self.grocy_untagged is None:
+            raise ValueError("Needs Grocy")
+        await self.grocy_untagged.refresh()
+        count = self.grocy_untagged.count(product_id)
+        if count < 1:
+            raise ValueError("Every unit Grocy has is tagged")
+        product = await self.backend.product(product_id)
+        station = self.tag_station()
+        untagged = self.grocy_untagged
+
+        async def each(link: Link) -> None:
+            untagged.invalidate()
+
+        await self._start_counted(station, product, count, each, in_stock=True)
+        return f"Tap each {product.name} on the {station} station ({count} to tag)"
+
+    async def _start_counted(
+        self,
+        station: str,
+        product: Product,
+        count: int,
+        each: Callable[[Link], Coroutine[Any, Any, None]],
+        *,
+        in_stock: bool = False,
+    ) -> None:
+        barcode = await self.backend.first_barcode(product.id) or ""  # type: ignore[attr-defined]
+        await self.linking.start_counted(
+            station, product, barcode, count, on_each=each, in_stock=in_stock
+        )
+        if self.mqtt is not None:
+            await self.mqtt.publish(
+                linking_start_topic(station),
+                json.dumps({"barcode": barcode, "count": count}),
+                qos=1,
+                queue=False,
+            )
+        self.mark_dirty()
+
     # Kroger Restock ------------------------------------------------------------
 
     async def _on_ha_events_connect(self) -> None:
@@ -1118,7 +1272,7 @@ class Hub:
 
     def fetch_missing_pictures(self) -> str:
         """Start the picture backfill (web UI / MQTT); return a message."""
-        if self.pictures is None:
+        if self.pictures is None or self.ha_api is None:
             return "Product pictures need Kroger Restock and the Home Assistant API"
         self._spawn(self._backfill(), "pantry_hub.picture_backfill_start")
         return "Fetching missing pictures"

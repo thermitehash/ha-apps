@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 import logging
 from pathlib import Path
 import sqlite3
-from typing import Literal
+from typing import Any, Literal
 
 import aiosqlite
 
@@ -26,7 +26,7 @@ from .barcodes import from_kroger_upc
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS received (
     received_at TEXT NOT NULL,
     upc TEXT NOT NULL,
     barcode TEXT,
+    source TEXT,
     kroger_product_id TEXT,
     name TEXT NOT NULL,
     brand TEXT,
@@ -107,6 +108,14 @@ CREATE TABLE IF NOT EXISTS received (
     done_at REAL,
     UNIQUE (item_id, received_at)
 );
+CREATE TABLE IF NOT EXISTS stocktake (
+    product_id INTEGER PRIMARY KEY,
+    product_name TEXT NOT NULL,
+    barcode TEXT,
+    scanned INTEGER NOT NULL DEFAULT 0,
+    tagged INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS booked_credits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id INTEGER NOT NULL,
@@ -120,7 +129,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "links": [("skip_add_cycle", "INTEGER")],
     "ops": [("resolution", "TEXT")],
     # 0.4.2: the printed barcode (with check digit) next to Kroger's upc.
-    "received": [("barcode", "TEXT")],
+    "received": [("barcode", "TEXT"), ("source", "TEXT")],
 }
 
 OpKind = Literal["add", "consume"]
@@ -323,6 +332,8 @@ class Received:
     #: Printed barcode with check digit, as Grocy stores it (None in rows
     #: stored by 0.4.1: rebuilt from ``upc``).
     barcode: str | None = None
+    #: "kroger" (delivery) or "unload" (scanned at home).
+    source: str = "kroger"
 
     @property
     def grocy_barcode(self) -> str:
@@ -338,7 +349,7 @@ class Received:
 _RECEIVED_COLS = (
     "id, item_id, received_at, upc, kroger_product_id, name, brand, size, "
     "image_url, quantity, price, order_ref, stored_at, grocy_product_id, tagged, "
-    "done_at, barcode"
+    "done_at, barcode, source"
 )
 
 
@@ -361,6 +372,7 @@ def _received(row: sqlite3.Row) -> Received:
         tagged=int(row["tagged"]),
         done_at=row["done_at"],
         barcode=row["barcode"],
+        source=row["source"] or "kroger",
     )
 
 
@@ -1251,3 +1263,100 @@ class Store:
                 "WHERE units > 0 GROUP BY product_id"
             )
         return {int(r["product_id"]): int(r["n"]) for r in rows}
+
+    async def add_unload_scan(
+        self, *, barcode: str, product_id: int, name: str, now: float
+    ) -> Received:
+        """One Unload scan: +1 on the open unload row for ``barcode``, or a new row."""
+        async with self._lock:
+            await self._begin()
+            try:
+                row = await self._one(
+                    "SELECT id FROM received WHERE source = 'unload' "
+                    "AND barcode = ? AND done_at IS NULL ORDER BY id DESC LIMIT 1",
+                    (barcode,),
+                )
+                if row is not None:
+                    row_id = int(row["id"])
+                    await self._exec(
+                        "UPDATE received SET quantity = MIN(quantity + 1, 99), "
+                        "grocy_product_id = ? WHERE id = ?",
+                        (product_id, row_id),
+                    )
+                else:
+                    cur = await self._conn.execute(
+                        "INSERT INTO received (item_id, received_at, upc, barcode, "
+                        "source, name, quantity, stored_at, grocy_product_id) "
+                        "VALUES (?, ?, '', ?, 'unload', ?, 1, ?, ?)",
+                        (
+                            f"unload:{barcode}:{now:.3f}",
+                            iso(now),
+                            barcode,
+                            name,
+                            now,
+                            product_id,
+                        ),
+                    )
+                    row_id = int(cur.lastrowid or 0)
+                    await cur.close()
+                got = await self._one(
+                    f"SELECT {_RECEIVED_COLS} FROM received WHERE id = ?", (row_id,)
+                )
+                await self._commit()
+            except BaseException:
+                await self._rollback()
+                raise
+        assert got is not None
+        return _received(got)
+
+    # Stock-take ----------------------------------------------------------------
+
+    async def stocktake_clear(self) -> None:
+        """Forget the stock-take counts."""
+        async with self._lock:
+            await self._exec("DELETE FROM stocktake")
+
+    async def stocktake_add(
+        self, product_id: int, name: str, barcode: str | None, now: float, n: int = 1
+    ) -> int:
+        """Count ``n`` more units of a product; return its new count."""
+        async with self._lock:
+            await self._exec(
+                "INSERT INTO stocktake (product_id, product_name, barcode, scanned, "
+                "updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(product_id) DO UPDATE "
+                "SET scanned = MAX(scanned + excluded.scanned, 0), "
+                "updated_at = excluded.updated_at",
+                (product_id, name, barcode, n, now),
+            )
+            row = await self._one(
+                "SELECT scanned FROM stocktake WHERE product_id = ?", (product_id,)
+            )
+        return int(row["scanned"]) if row else 0
+
+    async def stocktake_set(self, product_id: int, scanned: int, now: float) -> bool:
+        """Set a product's counted units (typed in the web UI)."""
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE stocktake SET scanned = ?, updated_at = ? WHERE product_id = ?",
+                (max(scanned, 0), now, product_id),
+            )
+            ok = cur.rowcount == 1
+            await cur.close()
+        return ok
+
+    async def stocktake_tagged(self, product_id: int) -> None:
+        """One counted unit of this product got a tag."""
+        async with self._lock:
+            await self._exec(
+                "UPDATE stocktake SET tagged = tagged + 1 WHERE product_id = ?",
+                (product_id,),
+            )
+
+    async def stocktake_rows(self) -> list[dict[str, Any]]:
+        """Return the counted products, by name."""
+        async with self._lock:
+            rows = await self._all(
+                "SELECT product_id, product_name, barcode, scanned, tagged "
+                "FROM stocktake ORDER BY product_name COLLATE NOCASE"
+            )
+        return [dict(r) for r in rows]

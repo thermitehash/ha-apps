@@ -475,6 +475,29 @@ class GrocyClient:
     async def entries(self, product_id: int) -> list[StockEntry]:
         """Return current stock entries of ``product_id``."""
         body = await self._request("GET", f"/stock/products/{product_id}/entries")
+        return self._entries(body, product_id)
+
+    async def location_entries(self, location_id: int) -> list[StockEntry]:
+        """Return every stock entry at ``location_id`` (all products)."""
+        body = await self._request("GET", f"/stock/locations/{location_id}/entries")
+        return self._entries(body, 0)
+
+    async def inventory(
+        self, product_id: int, new_amount: float, *, location_id: int, note: str
+    ) -> None:
+        """Inventory correction: set the product's total stock to ``new_amount``.
+
+        Not a purchase or consume: Grocy books the difference as an inventory
+        correction (added units go to ``location_id``).
+        """
+        await self._request(
+            "POST",
+            f"/stock/products/{product_id}/inventory",
+            json={"new_amount": new_amount, "location_id": location_id, "note": note},
+        )
+
+    @staticmethod
+    def _entries(body: Any, product_id: int) -> list[StockEntry]:
         if not isinstance(body, list):
             raise GrocyError(f"unexpected entries payload: {body!r}")
         out: list[StockEntry] = []

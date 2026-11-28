@@ -23,6 +23,11 @@ def linking_result_topic(station: str) -> str:
     return f"{PREFIX}/linking/{station}/result"
 
 
+def linking_mode_topic(station: str) -> str:
+    """Topic that puts a station into Unload / Stock-take (or back)."""
+    return f"{PREFIX}/linking/{station}/mode"
+
+
 def linking_start_topic(station: str) -> str:
     """Topic that puts a station into a counted link session."""
     return f"{PREFIX}/linking/{station}/start"

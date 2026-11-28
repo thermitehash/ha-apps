@@ -161,6 +161,7 @@ class HomeAssistantEvents:
         on_event: EventFn,
         *,
         on_connect: ConnectFn | None = None,
+        extra: dict[str, EventFn] | None = None,
         min_backoff: float = 2.0,
         max_backoff: float = 120.0,
     ) -> None:
@@ -170,6 +171,8 @@ class HomeAssistantEvents:
         self.event_type = event_type
         self.on_event = on_event
         self.on_connect = on_connect
+        #: More event types to follow on the same connection (no catch-up).
+        self.extra = dict(extra or {})
         self.min_backoff = min_backoff
         self.max_backoff = max_backoff
         self.connected = False
@@ -204,16 +207,20 @@ class HomeAssistantEvents:
                 ):
                     await _authenticate(ws, self._token)
                     self.connected = True
-                    sub_id = next(self._ids)
-                    await ws.send_json(
-                        {
-                            "id": sub_id,
-                            "type": "subscribe_events",
-                            "event_type": self.event_type,
-                        }
-                    )
+                    handlers = {self.event_type: self.on_event, **self.extra}
+                    subs: dict[int, tuple[str, EventFn]] = {}
+                    for event_type, handler in handlers.items():
+                        sub_id = next(self._ids)
+                        subs[sub_id] = (event_type, handler)
+                        await ws.send_json(
+                            {
+                                "id": sub_id,
+                                "type": "subscribe_events",
+                                "event_type": event_type,
+                            }
+                        )
                     failures = 0
-                    await self._listen(ws, sub_id)
+                    await self._listen(ws, subs)
             except (aiohttp.ClientError, OSError, TimeoutError, ValueError) as err:
                 _LOGGER.warning("Home Assistant events websocket: %s", err)
             finally:
@@ -224,7 +231,11 @@ class HomeAssistantEvents:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stopping.wait(), delay)
 
-    async def _listen(self, ws: aiohttp.ClientWebSocketResponse, sub_id: int) -> None:
+    async def _listen(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        subs: dict[int, tuple[str, EventFn]],
+    ) -> None:
         async for msg in ws:
             if msg.type is not aiohttp.WSMsgType.TEXT:
                 break
@@ -232,20 +243,25 @@ class HomeAssistantEvents:
                 data = json.loads(msg.data)
             except ValueError:
                 continue
-            if data.get("id") != sub_id:
+            sub = subs.get(data.get("id"))
+            if sub is None:
                 continue
+            event_type, handler = sub
             if data.get("type") == "result":
                 if not data.get("success", False):
                     raise ValueError(f"subscribe_events refused: {data.get('error')}")
-                self.subscribed.set()
-                if self.on_connect is not None:
-                    await self._guard(self.on_connect())
+                if event_type == self.event_type:
+                    self.subscribed.set()
+                    if self.on_connect is not None:
+                        await self._guard(self.on_connect())
                 continue
             event = data.get("event")
             if data.get("type") == "event" and isinstance(event, dict):
                 payload = event.get("data")
                 if isinstance(payload, dict):
-                    await self._guard(self.on_event(payload))
+                    if "time_fired" in event and "time_fired" not in payload:
+                        payload = {**payload, "time_fired": event["time_fired"]}
+                    await self._guard(handler(payload))
 
     @staticmethod
     async def _guard(coro: Awaitable[None]) -> None:

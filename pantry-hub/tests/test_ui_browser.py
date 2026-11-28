@@ -460,3 +460,159 @@ async def test_pictures_and_just_bought(
     )
     await page.close()
     assert stack.errors == []
+
+
+# v0.4.3: sidebar freshness, Unload, camera scanner, stock-take ----------------
+
+
+async def test_sidebar_panel_shows_latest_state(stack: Stack) -> None:
+    """Opening Pantry Hub from the HA sidebar: current data, no pull-to-refresh.
+
+    Home Assistant shows an app in an iframe that it removes when you switch
+    to another panel and creates again when you come back; the companion app
+    also hides / shows the page when it goes to the background.
+    """
+    assert stack.proxy is not None and stack.rig.store is not None
+    page = await stack.browser.new_page(viewport={"width": 390, "height": 844})
+    page.on("pageerror", lambda e: stack.errors.append(f"pageerror: {e}"))
+    url = stack.proxy.url
+    await page.set_content(
+        f'<div id="panel"><iframe id="app" src="{url}" style="width:390px;height:800px"></iframe></div>'
+    )
+    frame = page.frame_locator("#app")
+    await frame.locator("text=Black beans").wait_for(timeout=5000)
+    # Something changes while the panel is closed…
+    await page.evaluate("() => document.getElementById('app').remove()")
+    await stack.rig.store.add_needs_product("4242", "kitchen", time.time())
+    # …and the panel is opened again: the latest state at once (well inside
+    # the 3 s poll), with no reload or pull-to-refresh.
+    t0 = time.monotonic()
+    await page.evaluate(
+        f"""() => {{
+          const f = document.createElement('iframe');
+          f.id = 'app'; f.src = {url!r}; f.style = 'width:390px;height:800px';
+          document.getElementById('panel').append(f);
+        }}"""
+    )
+    await frame.locator("text=1 barcode needs a Grocy product").wait_for(timeout=2500)
+    assert time.monotonic() - t0 < 2.5
+    # The companion app goes to the background and comes back: the page
+    # refreshes when it becomes visible (polling slowed down so only the
+    # visibility event can explain the update).
+    app = page.frame(url=lambda u: stack.proxy is not None and stack.proxy.prefix in u)
+    assert app is not None
+    await app.evaluate("() => { window.__pantryHub.poller.visibleMs = 600000; }")
+    await app.wait_for_timeout(400)
+    await stack.rig.store.add_needs_product("4343", "kitchen", time.time())
+    await app.wait_for_timeout(400)
+    assert await frame.locator("text=2 barcodes need a Grocy product").count() == 0
+    await app.evaluate(
+        """() => {
+          Object.defineProperty(document, 'hidden', {value: false, configurable: true});
+          document.dispatchEvent(new Event('visibilitychange'));
+        }"""
+    )
+    await frame.locator("text=2 barcodes need a Grocy product").wait_for(timeout=1500)
+    # Back/forward (bfcache or not): still the latest state.
+    await page.goto(url)
+    await page.wait_for_selector("text=2 barcodes need a Grocy product")
+    await page.goto("about:blank")
+    await stack.rig.store.add_needs_product("4444", "kitchen", time.time())
+    await page.go_back()
+    await page.wait_for_selector("text=3 barcodes need a Grocy product", timeout=2500)
+    await page.close()
+    assert stack.errors == []
+
+
+def _session(hub: Any) -> Any:
+    """The hub's scan session (a function, so mypy doesn't keep its narrowing)."""
+    return hub.scans.session
+
+
+async def test_unload_with_phone_scanner(stack: Stack, tmp_path: Path) -> None:
+    hub = stack.rig.h
+    assert hub.scans is not None
+    page = await stack.page("phone")
+    await page.wait_for_selector("#s-bought >> text=Just bought")
+    zxing_requests: list[str] = []
+    page.on(
+        "request", lambda r: zxing_requests.append(r.url) if "zxing" in r.url else None
+    )
+    await page.click("#s-bought button:has-text('Start unloading')")
+    await page.wait_for_selector("text=Unloading")
+    assert hub.scans.session is not None and hub.scans.session.mode == "unload"
+    await page.click("#s-bought button:has-text('Scan barcode')")
+    await page.wait_for_selector(".scanner[role='dialog']")
+    # Headless Chromium has no BarcodeDetector and no camera: the bundled
+    # ZXing loads from the app (never a CDN) and typing works.
+    await page.wait_for_function("() => !!window.ZXing", timeout=5000)
+    assert zxing_requests and all(
+        stack.proxy is not None and stack.proxy.prefix in u for u in zxing_requests
+    )
+    await page.fill(".scanner input[name='code']", "0001")
+    await page.click(".scanner button:has-text('Add')")
+    await page.wait_for_selector(".scanner-status >> text=Just bought: Black beans ×1")
+    await page.fill(".scanner input[name='code']", "0001")
+    await page.click(".scanner button:has-text('Add')")
+    await page.wait_for_selector(".scanner-status >> text=Just bought: Black beans ×2")
+    await page.screenshot(path=str(shots_dir(tmp_path) / "phone-unload-scanner.png"))
+    await page.click(".scanner button:has-text('Done')")
+    await page.wait_for_selector("#s-bought >> text=×2 of 2 to tag")
+    await no_horizontal_scroll(page)
+    await page.screenshot(
+        path=str(shots_dir(tmp_path) / "phone-unload.png"), full_page=True
+    )
+    await page.click("#s-bought button:has-text('Stop unloading')")
+    await page.wait_for_selector("#s-bought button:has-text('Start unloading')")
+    assert not await page.locator("text=Stop unloading").count()
+    assert (await stack.rig.h.scans.state())["phase"] == ""  # type: ignore[union-attr]
+    assert _session(hub) is None
+    await page.close()
+    stack.errors[:] = [e for e in stack.errors if "NotFoundError" not in e]
+    assert stack.errors == []
+
+
+async def test_stocktake_flow_in_browser(stack: Stack, tmp_path: Path) -> None:
+    from .fake_grocy import Entry
+
+    hub = stack.rig.h
+    grocy = stack.rig.grocy
+    rice = grocy.add_product("Basmati rice", ["7001"])
+    grocy.entries.append(Entry("seedrice", rice.id, 1.0, 1, "seeded", None))
+    assert hub.grocy_untagged is not None
+    await hub.grocy_untagged.refresh()
+    page = await stack.page("phone", tab="tags")
+    # Grocy-only stock is offered for tagging, not duplicated.
+    await page.wait_for_selector("#s-grocy-untagged >> text=Basmati rice")
+    await page.wait_for_selector("#s-grocy-untagged >> text=1 in Grocy")
+    page.on("dialog", lambda d: asyncio.ensure_future(d.accept()))
+    await page.click("#s-stocktake button:has-text('Start stock-take')")
+    await page.wait_for_selector("#s-stocktake >> text=Counting")
+    await page.click("#s-stocktake button:has-text('Scan barcode')")
+    for _ in range(2):
+        await page.fill(".scanner input[name='code']", "7001")
+        await page.click(".scanner button:has-text('Add')")
+        await page.wait_for_timeout(300)
+    await page.wait_for_selector(".scanner-status >> text=Basmati rice — 2 counted")
+    await page.click(".scanner button:has-text('Done')")
+    # Typed quantity.
+    field = page.locator("#s-stocktake form[data-form='count'] input[name='counted']")
+    await field.fill("3")
+    await page.click("#s-stocktake form[data-form='count'] button:has-text('Save')")
+    await page.wait_for_selector("text=Counted 3")
+    await page.click("#s-stocktake button:has-text('Finish stock-take')")
+    await page.wait_for_selector("table.review >> text=Basmati rice")
+    row = page.locator("table.review tr", has_text="Basmati rice")
+    assert "+2" in (await row.text_content() or "")
+    await no_horizontal_scroll(page)
+    await page.screenshot(
+        path=str(shots_dir(tmp_path) / "phone-stocktake-review.png"), full_page=True
+    )
+    await page.click("form[data-form='apply'] button:has-text('Apply to Grocy')")
+    await page.wait_for_selector("#s-stocktake >> text=Applied")
+    assert grocy.amount(rice.id) == 3
+    await page.wait_for_selector("#s-stocktake button:has-text('Tag 3')")
+    await page.click("#s-stocktake button:has-text('Close stock-take')")
+    await page.wait_for_selector("#s-stocktake button:has-text('Start stock-take')")
+    await page.close()
+    assert stack.errors == []

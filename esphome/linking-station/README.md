@@ -49,11 +49,29 @@ the U107. Logs go over USB-CDC (`hardware_uart: USB_SERIAL_JTAG`).
 | LED when idle | off (unchanged) | slow, dim **blue pulse** |
 | Barcode | `kroger_restock.scan_upc` with `source: esphome`, exactly as before | published to `pantry_hub/linking/kroger_scanner/barcode`; the U107 then polls for up to 15 s and publishes the strongest tag to `.../tag` |
 | Result | HA feedback automation: green in cart, amber waiting, blue needs review, red error | hub result on `.../result`: **green** linked, **amber** unknown barcode, **magenta** tag already linked, **red** error/timeout |
-| Short press | print list (after ~350 ms, to tell it from a double-click) | same |
+| Short press | print list (after ~400 ms, to tell it from a double-click) | same |
 | Hold 1–6 s | sync cart | same |
+| Triple-click | Unload mode (below) | Unload mode |
+| Hold 6 s | Stock-take mode (below) | Stock-take mode |
 
 Leaving link mode (by double-click or after 60 s idle) shows one short cyan
 flash, then the LED goes off.
+
+### Unload and Stock-take (firmware 0.4.0+)
+
+| | Unload | Stock-take |
+|---|---|---|
+| Enter | **triple-click**, or Pantry Hub's **Start unloading** | **hold 6 s**, or Pantry Hub's **Start stock-take** |
+| LED when idle | slow **green** pulse | slow **amber** pulse |
+| Barcode | published to `pantry_hub/linking/kroger_scanner/scan` with `"mode": "unload"`; **never** `kroger_restock.scan_upc` | same, `"mode": "stocktake"` |
+| Result | green: added / counted; amber: no product found; red: error | same |
+| Leave | single click, triple-click again, 3 min without a scan, or Pantry Hub | single click, hold 6 s again, 3 min idle, or Pantry Hub |
+
+Every mode change is published to `.../mode_state` (`kroger`, `link`,
+`unload`, `stocktake`); Pantry Hub's web UI sends `.../mode`
+(`unload`, `stocktake`, `off`). Tag N during a stock-take runs a counted
+session and then returns to Stock-take. The mode logic is in
+`include/link_mode.h` (`State::on_click`, host-tested).
 
 ### Counted session (Pantry Hub "Just bought")
 

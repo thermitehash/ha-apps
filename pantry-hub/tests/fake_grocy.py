@@ -108,6 +108,8 @@ class FakeGrocy:
         r.add_get("/api/objects/quantity_units", self.units)
         r.add_post("/api/stock/products/{id}/add", self.add)
         r.add_post("/api/stock/products/{id}/consume", self.consume)
+        r.add_post("/api/stock/products/{id}/inventory", self.inventory)
+        r.add_get("/api/stock/locations/{id}/entries", self.location_entries)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "127.0.0.1", 0)
@@ -317,6 +319,59 @@ class FakeGrocy:
                     "stock_id": stock_id,
                     "transaction_type": "purchase",
                 }
+            ]
+        )
+
+    def total(self, product_id: int) -> float:
+        return sum(e.amount for e in self.entries if e.product_id == product_id)
+
+    async def inventory(self, request: web.Request) -> web.Response:
+        """Set the total amount; like Grocy, an inventory correction."""
+        p = self._pid(request)
+        body: Any = request[BODY]
+        new = float(body["new_amount"])
+        loc = int(body.get("location_id", 1))
+        diff = new - self.total(p.id)
+        if diff > 0:
+            self.entries.append(
+                Entry(
+                    stock_id=f"s{next(self._ids):05d}",
+                    product_id=p.id,
+                    amount=diff,
+                    location_id=loc,
+                    note=str(body.get("note", "")),
+                    best_before_date=None,
+                )
+            )
+        while diff < 0:
+            # Grocy consumes by its default rule; the fake takes the given
+            # location first, then any other.
+            mine = [e for e in self.entries if e.product_id == p.id]
+            mine.sort(key=lambda e: e.location_id != loc)
+            e = mine[0]
+            take = min(e.amount, -diff)
+            e.amount -= take
+            diff += take
+            if e.amount <= 0:
+                self.entries.remove(e)
+        return web.json_response(
+            [{"id": 9, "transaction_type": "inventory-correction"}]
+        )
+
+    async def location_entries(self, request: web.Request) -> web.Response:
+        loc = int(request.match_info["id"])
+        return web.json_response(
+            [
+                {
+                    "id": i,
+                    "stock_id": e.stock_id,
+                    "product_id": e.product_id,
+                    "amount": e.amount,
+                    "location_id": e.location_id,
+                    "note": e.note,
+                }
+                for i, e in enumerate(self.entries)
+                if e.location_id == loc
             ]
         )
 
