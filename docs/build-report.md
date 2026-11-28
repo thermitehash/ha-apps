@@ -2,7 +2,7 @@
 - App version: 0.4.4 (tag allowance + Pantry-only lowering; 0.1.0–0.3.1 in PR #1, 0.3.2 in PR #2, 0.3.3 in PR #3, 0.3.4 in PR #4, 0.4.0 in PR #5, 0.4.1 in PR #6, 0.4.2 in PR #7, 0.4.3 in PR #8, 0.4.4 in PR #9) · linking station firmware 0.4.0 (unchanged)
 - Branches: PR #9 (`claude/kind-ritchie-58v2e4` → `main`) starts from `main` at `968b7f4`, the merge of PR #8 (0.4.3). Merging PR #9 publishes 0.4.4.
 - aiochainway version used: v0.4.0 (unchanged).
-- Date / PR / Commit / CI (per job): 2026-11-28 / PR #9 / CI_PENDING (0.4.3: PR #8 at `722258f`, all green, merged as `968b7f4`)
+- Date / PR / Commit / CI (per job): 2026-11-28 / PR #9 / `e3ef3d9` / all green: HA app linter, yamllint, Ruff + mypy, ESPHome linking station, Version bump, Pytest (ubuntu-latest), Pytest (macos-latest), Sweep-now repeat ×200 (macOS), UI smoke (Playwright), Prepare, Build amd64, Build aarch64 (multi-arch manifest skipped on PRs). 0.4.3: PR #8 at `722258f`, merged as `968b7f4`.
 
 ## Summary
 **v0.4.4, fixes for 0.4.3's known gaps 7.1 and 7.2**:
